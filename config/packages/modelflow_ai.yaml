@@ -1,0 +1,20 @@
+modelflow_ai:
+    providers:
+        google_gemini:
+            enabled: true
+            credentials:
+                api_key: '%env(GOOGLE_API_KEY)%'
+
+    adapters:
+        gemini_chat:
+            enabled: true
+            chat: true
+            completion: false
+            provider: google_gemini
+            model: 'gemini-2.0-flash'
+            priority: 0
+            criteria: []
+            image_to_text: false
+            tools: false
+            stream: false
+            text_to_image: false

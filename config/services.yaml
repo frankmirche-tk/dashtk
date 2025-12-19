@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../vendor/symfony/dependency-injection/Loader/schema/services.schema.json
+
+parameters:
+
+services:
+    _defaults:
+        autowire: true
+        autoconfigure: true
+
+    App\:
+        resource: '../src/'
+
+
+    modelflow.gemini_client_factory:
+        class: ModelflowAi\GoogleGeminiAdapter\ClientFactory
+        factory: ['ModelflowAi\GoogleGeminiAdapter\ClientFactory', 'create']
+        calls:
+            - [withApiKey, ['%env(GOOGLE_API_KEY)%']]
+
+    Gemini\Contracts\ClientContract:
+        factory: ['@modelflow.gemini_client_factory', 'make']

@@ -1,0 +1,26 @@
+{
+    "name": "dashtk-frontend",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "engines": {
+        "node": ">=20.19 || >=22.12"
+    },
+    "scripts": {
+        "dev": "vite",
+        "dev:backend": "symfony server:start -d --no-tls",
+        "stop:backend": "symfony server:stop",
+        "build": "vite build",
+        "preview": "vite preview"
+    },
+    "dependencies": {
+        "axios": "^1.13.2",
+        "vue": "^3.5.22",
+        "vue-router": "^4.3.0"
+    },
+    "devDependencies": {
+        "@vitejs/plugin-vue": "^6.0.1",
+        "vite": "^7.2.1",
+        "vite-plugin-symfony": "^8.2.2"
+    }
+}
