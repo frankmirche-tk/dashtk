@@ -5,15 +5,17 @@ declare(strict_types=1);
 namespace App\Entity;
 
 use ApiPlatform\Metadata\ApiResource;
+use ApiPlatform\Metadata\Delete;
 use ApiPlatform\Metadata\Get;
 use ApiPlatform\Metadata\GetCollection;
-use ApiPlatform\Metadata\Post;
 use ApiPlatform\Metadata\Patch;
+use ApiPlatform\Metadata\Post;
 use ApiPlatform\Metadata\Put;
-use ApiPlatform\Metadata\Delete;
+use App\Repository\SupportSolutionStepRepository;
+use Doctrine\DBAL\Types\Types;
+use Doctrine\ORM\Mapping as ORM;
 use Symfony\Component\Serializer\Attribute\Groups;
 use Symfony\Component\Validator\Constraints as Assert;
-use Doctrine\ORM\Mapping as ORM;
 
 #[ApiResource(
     operations: [
@@ -27,8 +29,7 @@ use Doctrine\ORM\Mapping as ORM;
     normalizationContext: ['groups' => ['solution:read']],
     denormalizationContext: ['groups' => ['solution:write']]
 )]
-
-#[ORM\Entity]
+#[ORM\Entity(repositoryClass: SupportSolutionStepRepository::class)]
 #[ORM\Table(name: 'support_solution_step')]
 #[ORM\UniqueConstraint(name: 'uniq_solution_step', columns: ['solution_id', 'step_no'])]
 class SupportSolutionStep
@@ -39,19 +40,26 @@ class SupportSolutionStep
     #[ORM\Column(type: 'bigint', options: ['unsigned' => true])]
     private ?string $id = null;
 
+    /**
+     * WICHTIG:
+     * - in solution:write, damit POST/PATCH "solution": "/api/support_solutions/12" gesetzt wird
+     */
+    #[Groups(['solution:read', 'solution:write'])]
+    #[Assert\NotNull]
     #[ORM\ManyToOne(targetEntity: SupportSolution::class, inversedBy: 'steps')]
     #[ORM\JoinColumn(name: 'solution_id', referencedColumnName: 'id', nullable: false, onDelete: 'CASCADE')]
-    private SupportSolution $solution;
+    #[Groups(['solution:read', 'solution:write'])]
+    private ?SupportSolution $solution = null;
 
     #[Groups(['solution:read', 'solution:write'])]
     #[Assert\Positive]
     #[ORM\Column(name: 'step_no', type: 'integer')]
-    private int $stepNo;
+    private int $stepNo = 1;
 
     #[Groups(['solution:read', 'solution:write'])]
     #[Assert\NotBlank]
     #[ORM\Column(type: 'text')]
-    private string $instruction;
+    private string $instruction = '';
 
     #[Groups(['solution:read', 'solution:write'])]
     #[ORM\Column(type: 'text', nullable: true)]
@@ -63,8 +71,8 @@ class SupportSolutionStep
 
     public function getId(): ?string { return $this->id; }
 
-    public function getSolution(): SupportSolution { return $this->solution; }
-    public function setSolution(SupportSolution $solution): self { $this->solution = $solution; return $this; }
+    public function getSolution(): ?SupportSolution { return $this->solution; }
+    public function setSolution(?SupportSolution $solution): self { $this->solution = $solution; return $this; }
 
     public function getStepNo(): int { return $this->stepNo; }
     public function setStepNo(int $stepNo): self { $this->stepNo = $stepNo; return $this; }
