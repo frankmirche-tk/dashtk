@@ -57,11 +57,13 @@
 <script setup>
 import axios from 'axios'
 import { ref } from 'vue'
+import { uuid } from '../utils/uuid';
+
 
 const input = ref('')
 const sending = ref(false)
 
-const sessionId = ref(sessionStorage.getItem('sessionId') || crypto.randomUUID())
+const sessionId = ref(sessionStorage.getItem('sessionId') || uuid())
 sessionStorage.setItem('sessionId', sessionId.value)
 
 const messages = ref([
@@ -126,7 +128,7 @@ async function useDbStepsOnly(solutionId) {
 }
 
 function newChat() {
-    sessionId.value = crypto.randomUUID()
+    sessionId.value = uuid()
     sessionStorage.setItem('sessionId', sessionId.value)
 
     messages.value = [

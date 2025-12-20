@@ -105,6 +105,7 @@
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import axios from 'axios'
+import { uuid } from '../utils/uuid';
 
 const route = useRoute()
 const id = computed(() => route.params.id)
@@ -132,7 +133,7 @@ const keywords = ref([]) // [{id?, keyword, weight, _key}]
 const steps = ref([])    // [{id?, stepNo, instruction, expectedResult, nextIfFailed, _key}]
 
 function key() {
-    return crypto.randomUUID()
+    return uuid()
 }
 
 async function loadAll() {
