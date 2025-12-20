@@ -4,35 +4,36 @@ declare(strict_types=1);
 
 namespace App\Entity;
 
+use ApiPlatform\Doctrine\Orm\Filter\BooleanFilter;
+use ApiPlatform\Doctrine\Orm\Filter\OrderFilter;
+use ApiPlatform\Doctrine\Orm\Filter\SearchFilter;
 use ApiPlatform\Metadata\ApiFilter;
 use ApiPlatform\Metadata\ApiResource;
+use ApiPlatform\Metadata\Delete;
 use ApiPlatform\Metadata\Get;
 use ApiPlatform\Metadata\GetCollection;
+use ApiPlatform\Metadata\Patch;
 use ApiPlatform\Metadata\Post;
 use ApiPlatform\Metadata\Put;
-use ApiPlatform\Metadata\Patch;
-use ApiPlatform\Metadata\Delete;
-use ApiPlatform\Doctrine\Orm\Filter\SearchFilter;
-use ApiPlatform\Doctrine\Orm\Filter\OrderFilter;
-use ApiPlatform\Doctrine\Orm\Filter\BooleanFilter;
-use Doctrine\DBAL\Types\Types;
-use Symfony\Component\Serializer\Attribute\Groups;
-use Symfony\Component\Validator\Constraints as Assert;
 use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\Common\Collections\Collection;
 use Doctrine\ORM\Mapping as ORM;
+use Symfony\Component\Serializer\Attribute\Groups;
+use Symfony\Component\Validator\Constraints as Assert;
 
 #[ApiResource(
     operations: [
-        new Get(),
-        new GetCollection(),
-        new Post(),
-        new Put(),
-        new Patch(),
+        // ✅ Liste schlank
+        new GetCollection(normalizationContext: ['groups' => ['solution:list']]),
+
+        // ✅ Detail “deep”
+        new Get(normalizationContext: ['groups' => ['solution:read']]),
+
+        new Post(denormalizationContext: ['groups' => ['solution:write']]),
+        new Put(denormalizationContext: ['groups' => ['solution:write']]),
+        new Patch(denormalizationContext: ['groups' => ['solution:write']]),
         new Delete(),
     ],
-    normalizationContext: ['groups' => ['solution:read']],
-    denormalizationContext: ['groups' => ['solution:write']],
 )]
 #[ApiFilter(SearchFilter::class, properties: [
     'title' => 'partial',
@@ -44,52 +45,55 @@ use Doctrine\ORM\Mapping as ORM;
 #[ApiFilter(OrderFilter::class, properties: ['priority', 'createdAt', 'updatedAt'], arguments: ['orderParameterName' => 'order'])]
 #[ORM\Entity]
 #[ORM\Table(name: 'support_solution')]
+#[ORM\HasLifecycleCallbacks]
 class SupportSolution
 {
-    #[Groups(['solution:read'])]
+    #[Groups(['solution:list', 'solution:read'])]
     #[ORM\Id]
     #[ORM\GeneratedValue]
     #[ORM\Column(type: 'bigint', options: ['unsigned' => true])]
     private ?string $id = null;
 
-    #[Groups(['solution:read', 'solution:write'])]
+    #[Groups(['solution:list', 'solution:read', 'solution:write'])]
     #[Assert\NotBlank]
     #[Assert\Length(max: 255)]
     #[ORM\Column(length: 255)]
-    private string $title;
+    private string $title = '';
 
-    #[Groups(['solution:read', 'solution:write'])]
+    #[Groups(['solution:list', 'solution:read', 'solution:write'])]
     #[Assert\NotBlank]
     #[ORM\Column(type: 'text')]
-    private string $symptoms;
+    private string $symptoms = '';
 
-    #[Groups(['solution:read', 'solution:write'])]
+    #[Groups(['solution:list', 'solution:read', 'solution:write'])]
     #[ORM\Column(name: 'context_notes', type: 'text', nullable: true)]
     private ?string $contextNotes = null;
 
-    #[Groups(['solution:read', 'solution:write'])]
+    #[Groups(['solution:list', 'solution:read', 'solution:write'])]
     #[ORM\Column(type: 'integer', options: ['default' => 0])]
     private int $priority = 0;
 
-    #[Groups(['solution:read', 'solution:write'])]
+    #[Groups(['solution:list', 'solution:read', 'solution:write'])]
     #[ORM\Column(type: 'boolean', options: ['default' => true])]
     private bool $active = true;
 
-    #[Groups(['solution:read'])]
+    #[Groups(['solution:list', 'solution:read'])]
     #[ORM\Column(name: 'created_at', type: 'datetime_immutable')]
     private \DateTimeImmutable $createdAt;
 
-    #[Groups(['solution:read'])]
+    #[Groups(['solution:list', 'solution:read'])]
     #[ORM\Column(name: 'updated_at', type: 'datetime_immutable')]
     private \DateTimeImmutable $updatedAt;
 
     /** @var Collection<int, SupportSolutionKeyword> */
+    // ✅ NICHT in solution:list (sonst Join-Hölle)
     #[Groups(['solution:read', 'solution:write'])]
     #[Assert\Valid]
     #[ORM\OneToMany(mappedBy: 'solution', targetEntity: SupportSolutionKeyword::class, cascade: ['persist', 'remove'], orphanRemoval: true)]
     private Collection $keywords;
 
     /** @var Collection<int, SupportSolutionStep> */
+    // ✅ NICHT in solution:list (sonst Join-Hölle)
     #[Groups(['solution:read', 'solution:write'])]
     #[Assert\Valid]
     #[ORM\OneToMany(mappedBy: 'solution', targetEntity: SupportSolutionStep::class, cascade: ['persist', 'remove'], orphanRemoval: true)]
@@ -148,9 +152,7 @@ class SupportSolution
 
     public function removeKeyword(SupportSolutionKeyword $keyword): self
     {
-        if ($this->keywords->removeElement($keyword)) {
-            // orphanRemoval=true -> DB löscht
-        }
+        $this->keywords->removeElement($keyword);
         return $this;
     }
 
@@ -172,14 +174,12 @@ class SupportSolution
     public function setCreatedAt(\DateTimeImmutable $createdAt): static
     {
         $this->createdAt = $createdAt;
-
         return $this;
     }
 
     public function setUpdatedAt(\DateTimeImmutable $updatedAt): static
     {
         $this->updatedAt = $updatedAt;
-
         return $this;
     }
 }

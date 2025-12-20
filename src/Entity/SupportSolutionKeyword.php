@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\Entity;
 
+use ApiPlatform\Metadata\ApiFilter;
+use ApiPlatform\Doctrine\Orm\Filter\SearchFilter;
+use ApiPlatform\Metadata\ApiProperty;
 use ApiPlatform\Metadata\ApiResource;
 use ApiPlatform\Metadata\Delete;
 use ApiPlatform\Metadata\Get;
@@ -34,6 +37,7 @@ use Symfony\Component\Validator\Constraints as Assert;
 #[ORM\Table(name: 'support_solution_keyword')]
 #[ORM\UniqueConstraint(name: 'uniq_solution_keyword', columns: ['solution_id', 'keyword'])]
 #[UniqueEntity(fields: ['solution', 'keyword'], message: 'Dieses Keyword existiert für diese Solution bereits.')]
+#[ApiFilter(SearchFilter::class, properties: ['solution' => 'exact'])]
 class SupportSolutionKeyword
 {
     #[Groups(['solution:read'])]
@@ -47,7 +51,9 @@ class SupportSolutionKeyword
      * - in write, damit du bei POST/PATCH die Solution per IRI setzen kannst:
      *   "solution": "/api/support_solutions/1"
      */
-    #[Groups(['solution:read', 'solution:write'])]
+    #[ApiProperty(readableLink: false, writableLink: true)]
+    #[Groups(['solution:write'])] // <-- wichtig: NICHT in solution:read
+    #[Assert\NotNull]
     #[ORM\ManyToOne(targetEntity: SupportSolution::class, inversedBy: 'keywords')]
     #[ORM\JoinColumn(name: 'solution_id', referencedColumnName: 'id', nullable: false, onDelete: 'CASCADE')]
     private ?SupportSolution $solution = null;

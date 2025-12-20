@@ -4,6 +4,8 @@
             <h1>DashTK Support Chat</h1>
 
             <div class="actions">
+                <router-link class="btn" to="/kb/new">Neues Thema</router-link>
+                <router-link class="btn" to="/kb">Wissen bearbeiten</router-link>
                 <button class="btn" @click="newChat">Neuer Chat</button>
             </div>
         </header>
@@ -135,6 +137,11 @@ function newChat() {
 </script>
 
 <style scoped>
+.page { padding: 16px; }
+.topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom: 12px; }
+.actions { display:flex; gap:10px; }
+.btn { display:inline-flex; align-items:center; gap:6px; padding:8px 12px; border:1px solid #ccc; border-radius:10px; text-decoration:none; background:white; cursor:pointer; }
+.btn:hover { background:#f7f7f7; }
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }
 .header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .actions { display: flex; gap: 8px; }
