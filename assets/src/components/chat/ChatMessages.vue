@@ -71,16 +71,72 @@ defineEmits(['db-only'])
 .kb { margin-top: 10px; padding: 10px; border: 1px dashed #aaa; border-radius: 10px; background: #fafafa; }
 .kb-title { font-weight: 700; margin-bottom: 6px; }
 .kb-list { margin: 0; padding-left: 18px; }
-.kb-item { margin: 6px 0; }
-.kb-actions { display: flex; gap: 8px; margin-top: 6px; }
+/* KB links */
+.kb-item a{
+    color:#111;
+    text-decoration: none;
+    font-weight: 650;
+}
+.kb-item a:hover{
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+/* Optional: Actions etwas luftiger */
+.kb-actions{
+    display:flex;
+    gap:10px;
+    margin-top:8px;
+}
 
-.btn { border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; padding: 10px 14px; cursor: pointer; }
-.btn.small { padding: 6px 10px; border-radius: 8px; font-size: 13px; }
-.btn.ghost { background: transparent; color: #111; }
+/* Buttons */
+.btn{
+    appearance: none;
+    border: 1px solid #111;
+    background: #111;
+    color: #fff;
+    border-radius: 999px;
+    padding: 9px 14px;
+    font-weight: 650;
+    cursor: pointer;
+    transition: transform .05s ease, background .15s ease, border-color .15s ease, opacity .15s ease;
+    line-height: 1;
+}
+.btn:hover{ background:#000; }
+.btn:active{ transform: translateY(1px); }
+.btn:disabled{ opacity:.55; cursor:not-allowed; }
+
+.btn.small{
+    padding: 7px 12px;
+    font-size: 13px;
+}
+
+/* Ghost-Variante */
+.btn.ghost{
+    background: transparent;
+    color: #111;
+    border-color: #bbb;
+}
+.btn.ghost:hover{
+    border-color:#111;
+    background: rgba(0,0,0,.03);
+}
+
+
+
+/* "Steps API" Link wie Button */
+a.btn{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-decoration: none;
+}
 
 .stepsBox { margin-top: 12px; padding: 10px; border: 1px dashed #ddd; border-radius: 10px; background: #fff; }
 .stepsTitle { font-weight: 700; margin-bottom: 6px; }
 .stepsList { margin: 0; padding-left: 18px; }
-.stepText { }
+.stepText{
+    font-size: 15px;
+    line-height: 1.5;
+}
 .stepMedia { margin-left: 6px; }
 </style>

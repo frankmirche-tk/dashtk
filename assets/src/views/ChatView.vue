@@ -17,7 +17,7 @@
         >
             <template #avatar>
                 <!-- Angebot erscheint nur nach DB-only Auswahl -->
-                <div v-if="pendingGuide && !avatarEnabled" class="avatar-offer">
+                <div v-if="avatarOfferEnabled && pendingGuide && !avatarEnabled" class="avatar-offer">
                     <div class="avatar-offer-title">
                         Möchtest du dazu eine geführte Avatar-Demo?
                     </div>
@@ -70,6 +70,7 @@ function roleLabel(role) {
     return ROLE_LABELS[role] ?? role
 }
 
+const avatarOfferEnabled = true  // Diesen Flag true wenn Avatar gewünscht ist
 const avatarEnabled = ref(false)
 const pendingGuide = ref(null)
 
@@ -147,6 +148,11 @@ async function useDbStepsOnly(solutionId) {
             tts: data.tts ?? 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
             mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
         }
+        // ✅ Offer-Daten erst NACH erfolgreichem Call setzen
+        pendingGuide.value = {
+            tts: data.tts ?? 'Soll ich dir das als Avatar-Demo zeigen?',
+            mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
+        }
         avatarEnabled.value = false
     } finally {
         sending.value = false
@@ -159,6 +165,9 @@ function newChat() {
     sessionStorage.setItem('sessionId', sessionId.value)
     messages.value = [{ role: 'system', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }]
     input.value = ''
+    // ✅ Avatar/Offer komplett reset
+    avatarEnabled.value = false
+    pendingGuide.value = null
 }
 </script>
 
@@ -166,4 +175,51 @@ function newChat() {
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }
 .header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
 .actions { display:flex; gap:8px; }
+.btn{
+    appearance: none;
+    border: 1px solid #111;
+    background: #111;
+    color: #fff;
+    border-radius: 999px;
+    padding: 10px 16px;
+    font-weight: 650;
+    cursor: pointer;
+    transition: transform .05s ease, background .15s ease, border-color .15s ease, opacity .15s ease;
+    line-height: 1;
+}
+.btn:hover{ background:#000; }
+.btn:active{ transform: translateY(1px); }
+.btn:disabled{ opacity:.55; cursor:not-allowed; }
+
+.btn.ghost{
+    background: transparent;
+    color: #111;
+    border-color: #bbb;
+}
+.btn.ghost:hover{
+    border-color:#111;
+    background: rgba(0,0,0,.03);
+}
+
+/* Avatar Offer Box etwas "cardiger" */
+.avatar-offer{
+    margin: 14px 0;
+    border: 1px solid #ddd;
+    border-radius: 14px;
+    padding: 12px 14px;
+    background: #fff;
+    display:flex;
+    justify-content: space-between;
+    align-items:center;
+    gap:12px;
+    box-shadow: 0 1px 0 rgba(0,0,0,.03);
+}
+.avatar-offer-title{
+    font-weight: 750;
+}
+.avatar-offer-actions{
+    display:flex;
+    gap:10px;
+}
+
 </style>
