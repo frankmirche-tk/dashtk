@@ -31,7 +31,7 @@
 
         <div class="chat">
             <div v-for="(m, idx) in messages" :key="idx" class="msg" :class="m.role">
-                <div class="role">{{ m.role }}:</div>
+                <div class="role">{{ roleLabel(m.role) }}:</div>
 
                 <div class="content">
                     <pre class="pre">{{ m.content }}</pre>
@@ -108,6 +108,17 @@ function declineAvatar() {
     pendingGuide.value = null
 }
 
+const ROLE_LABELS = {
+    assistant: 'KI Antwort',
+    system: 'System',
+    user: 'Du',
+}
+
+function roleLabel(role) {
+    return ROLE_LABELS[role] ?? role
+}
+
+
 function onNextStep() {
     // MVP: nur Demo
     messages.value.push({
@@ -121,7 +132,7 @@ async function send() {
     const text = input.value.trim()
     if (!text) return
 
-    messages.value.push({ role: 'Du', content: text })
+    messages.value.push({ role: 'user', content: text })
     input.value = ''
     sending.value = true
 
@@ -191,7 +202,7 @@ function newChat() {
     sessionStorage.setItem('sessionId', sessionId.value)
 
     messages.value = [
-        { role: 'AI Assistant', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }
+        { role: 'assistant', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }
     ]
     input.value = ''
 
