@@ -1,7 +1,7 @@
 <template>
     <div class="wrap">
         <header class="header">
-            <h1>DashTK Support Chat</h1>
+            <h1>Dashboard Support Chat</h1>
 
             <div class="actions">
                 <router-link class="btn" to="/kb/new">Neues Thema</router-link>
@@ -87,7 +87,7 @@ const sessionId = ref(sessionStorage.getItem('sessionId') || uuid())
 sessionStorage.setItem('sessionId', sessionId.value)
 
 const messages = ref([
-    { role: 'system', content: 'Willkommen. Beschreibe dein Druckerproblem.' }
+    { role: 'system', content: 'Willkommen. Beschreibe dein Problem.' }
 ])
 
 // ✅ Avatar Opt-In State
@@ -121,7 +121,7 @@ async function send() {
     const text = input.value.trim()
     if (!text) return
 
-    messages.value.push({ role: 'user', content: text })
+    messages.value.push({ role: 'Du', content: text })
     input.value = ''
     sending.value = true
 
@@ -191,7 +191,7 @@ function newChat() {
     sessionStorage.setItem('sessionId', sessionId.value)
 
     messages.value = [
-        { role: 'system', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }
+        { role: 'AI Assistant', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }
     ]
     input.value = ''
 
