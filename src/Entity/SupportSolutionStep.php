@@ -72,6 +72,42 @@ class SupportSolutionStep
     #[ORM\Column(type: 'text', nullable: true)]
     private ?string $nextIfFailed = null;
 
+    /**
+     * Media (optional) – Pfad unter /public, z.B. guides/solution-12/step-99/step.pdf
+     */
+    #[Groups(['solution:read'])]
+    #[ORM\Column(name: 'media_path', type: 'string', length: 255, nullable: true)]
+    private ?string $mediaPath = null;
+
+    #[Groups(['solution:read'])]
+    #[ORM\Column(name: 'media_original_name', type: 'string', length: 255, nullable: true)]
+    private ?string $mediaOriginalName = null;
+
+    #[Groups(['solution:read'])]
+    #[ORM\Column(name: 'media_mime_type', type: 'string', length: 100, nullable: true)]
+    private ?string $mediaMimeType = null;
+
+    #[Groups(['solution:read'])]
+    #[ORM\Column(name: 'media_size', type: 'integer', nullable: true)]
+    private ?int $mediaSize = null;
+
+    #[Groups(['solution:read'])]
+    #[ORM\Column(name: 'media_updated_at', type: 'datetime_immutable', nullable: true)]
+    private ?\DateTimeImmutable $mediaUpdatedAt = null;
+
+    /**
+     * Bequeme URL für Frontend (nur Anzeige)
+     */
+    #[Groups(['solution:read'])]
+    #[ApiProperty(readable: true, writable: false)]
+    public function getMediaUrl(): ?string
+    {
+        if (!$this->mediaPath) {
+            return null;
+        }
+        return '/' . ltrim($this->mediaPath, '/');
+    }
+
     public function getId(): ?string
     {
         return $this->id;
@@ -129,6 +165,71 @@ class SupportSolutionStep
     public function setNextIfFailed(?string $nextIfFailed): self
     {
         $this->nextIfFailed = $nextIfFailed;
+        return $this;
+    }
+
+    public function getMediaPath(): ?string
+    {
+        return $this->mediaPath;
+    }
+
+    public function setMediaPath(?string $mediaPath): self
+    {
+        $this->mediaPath = $mediaPath;
+        return $this;
+    }
+
+    public function getMediaOriginalName(): ?string
+    {
+        return $this->mediaOriginalName;
+    }
+
+    public function setMediaOriginalName(?string $mediaOriginalName): self
+    {
+        $this->mediaOriginalName = $mediaOriginalName;
+        return $this;
+    }
+
+    public function getMediaMimeType(): ?string
+    {
+        return $this->mediaMimeType;
+    }
+
+    public function setMediaMimeType(?string $mediaMimeType): self
+    {
+        $this->mediaMimeType = $mediaMimeType;
+        return $this;
+    }
+
+    public function getMediaSize(): ?int
+    {
+        return $this->mediaSize;
+    }
+
+    public function setMediaSize(?int $mediaSize): self
+    {
+        $this->mediaSize = $mediaSize;
+        return $this;
+    }
+
+    public function getMediaUpdatedAt(): ?\DateTimeImmutable
+    {
+        return $this->mediaUpdatedAt;
+    }
+
+    public function setMediaUpdatedAt(?\DateTimeImmutable $mediaUpdatedAt): self
+    {
+        $this->mediaUpdatedAt = $mediaUpdatedAt;
+        return $this;
+    }
+
+    public function clearMedia(): self
+    {
+        $this->mediaPath = null;
+        $this->mediaOriginalName = null;
+        $this->mediaMimeType = null;
+        $this->mediaSize = null;
+        $this->mediaUpdatedAt = null;
         return $this;
     }
 }

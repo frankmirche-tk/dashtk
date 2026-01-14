@@ -10,32 +10,19 @@
             </div>
         </header>
 
-        <!-- ✅ Avatar wird NUR gezeigt, wenn User Opt-In gegeben hat -->
-        <AvatarGuide
-            v-if="avatarEnabled && pendingGuide"
-            :tts-text="avatarTtsText"
-            :media-url="avatarMediaUrl"
-            @next="onNextStep"
-        />
-
-        <!-- ✅ Angebot erscheint nur nach DB-only Auswahl -->
-        <div v-if="pendingGuide && !avatarEnabled" class="avatar-offer">
-            <div class="avatar-offer-title">
-                Möchtest du dazu eine geführte Avatar-Demo?
-            </div>
-            <div class="avatar-offer-actions">
-                <button class="btn ghost" @click="declineAvatar">Nein, Steps reichen</button>
-                <button class="btn" @click="acceptAvatar">Ja, Avatar starten</button>
-            </div>
-        </div>
-
         <div class="chat">
-            <div v-for="(m, idx) in messages" :key="idx" class="msg" :class="m.role">
+            <div
+                v-for="(m, idx) in messages"
+                :key="idx"
+                class="msg"
+                :class="m.role"
+            >
                 <div class="role">{{ roleLabel(m.role) }}:</div>
 
                 <div class="content">
                     <pre class="pre">{{ m.content }}</pre>
 
+                    <!-- Treffer aus KB -->
                     <div v-if="m.role === 'assistant' && m.matches?.length" class="kb">
                         <div class="kb-title">Passende SOPs aus der Datenbank:</div>
                         <ul class="kb-list">
@@ -48,12 +35,38 @@
                                     <button class="btn small" @click="useDbStepsOnly(hit.id)">
                                         Nur Steps
                                     </button>
-                                    <a class="btn small ghost" :href="hit.stepsUrl" target="_blank" rel="noreferrer">
+                                    <a
+                                        class="btn small ghost"
+                                        :href="hit.stepsUrl"
+                                        target="_blank"
+                                        rel="noreferrer"
+                                    >
                                         Steps API
                                     </a>
                                 </div>
                             </li>
                         </ul>
+                    </div>
+
+                    <!-- Schritte inkl. Media -->
+                    <div v-if="m.steps && m.steps.length" class="stepsBox">
+                        <div class="stepsTitle">Schritte:</div>
+                        <ol class="stepsList">
+                            <li v-for="s in m.steps" :key="s.id || s.no">
+                                <span class="stepText">{{ s.text }}</span>
+
+                                <span v-if="s.mediaUrl" class="stepMedia">
+                  —
+                  <a
+                      :href="s.mediaUrl"
+                      target="_blank"
+                      rel="noreferrer"
+                  >
+                    {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
+                  </a>
+                </span>
+                            </li>
+                        </ol>
                     </div>
 
                 </div>
@@ -76,10 +89,12 @@
 
 <script setup>
 import axios from 'axios'
-import { ref, computed } from 'vue'
-import AvatarGuide from '@/views/AvatarGuide.vue'
+import { ref } from 'vue'
 import { uuid } from '../utils/uuid'
 
+/* -----------------------
+   State
+------------------------ */
 const input = ref('')
 const sending = ref(false)
 
@@ -90,44 +105,48 @@ const messages = ref([
     { role: 'system', content: 'Willkommen. Beschreibe dein Problem.' }
 ])
 
-// ✅ Avatar Opt-In State
-const avatarEnabled = ref(false)
-
-// ✅ Guide-Daten werden erst gesetzt, wenn DB-only Steps geladen wurden
-const pendingGuide = ref(null) // { tts: string, mediaUrl: string } | null
-
-const avatarTtsText = computed(() => pendingGuide.value?.tts ?? '')
-const avatarMediaUrl = computed(() => pendingGuide.value?.mediaUrl ?? '/guides/print/step1.gif')
-
-function acceptAvatar() {
-    avatarEnabled.value = true
-}
-
-function declineAvatar() {
-    avatarEnabled.value = false
-    pendingGuide.value = null
-}
-
+/* -----------------------
+   Rollenlabels
+------------------------ */
 const ROLE_LABELS = {
     assistant: 'KI Antwort',
     system: 'System',
     user: 'Du',
 }
-
 function roleLabel(role) {
     return ROLE_LABELS[role] ?? role
 }
 
+/* -----------------------
+   Steps normalisieren
+   (dein Backend liefert stepNo + instruction + mediaUrl usw.)
+------------------------ */
+function mapSteps(raw) {
+    if (!Array.isArray(raw)) return []
 
-function onNextStep() {
-    // MVP: nur Demo
-    messages.value.push({
-        role: 'assistant',
-        content: 'Alles klar. Schritt 2 folgt (Demo).',
-        matches: []
-    })
+    return raw
+        .map((s) => ({
+            id: s.id ?? null,
+            no: s.stepNo ?? s.no ?? 0,
+            text: s.instruction ?? s.text ?? '',
+            mediaUrl: normalizeMediaUrl(s.mediaUrl ?? s.mediaPath ?? null),
+            mediaMimeType: s.mediaMimeType ?? null,
+        }))
+        .filter((s) => s.no > 0 && String(s.text).trim().length > 0)
+        .sort((a, b) => a.no - b.no)
 }
 
+function normalizeMediaUrl(v) {
+    if (!v) return null
+    // wenn Backend schon "/guides/..." liefert => ok
+    // wenn "guides/..." liefert => führenden Slash ergänzen
+    const s = String(v)
+    return s.startsWith('/') ? s : '/' + s.replace(/^\/+/, '')
+}
+
+/* -----------------------
+   Normaler Chat
+------------------------ */
 async function send() {
     const text = input.value.trim()
     if (!text) return
@@ -136,33 +155,34 @@ async function send() {
     input.value = ''
     sending.value = true
 
-    // ✅ wichtig: normales Chatten soll keinen Avatar triggern
-    pendingGuide.value = null
-    avatarEnabled.value = false
-
     try {
         const { data } = await axios.post('/api/chat', {
             sessionId: sessionId.value,
-            message: text
+            message: text,
         })
 
         messages.value.push({
             role: 'assistant',
             content: data.answer ?? '[leer]',
-            matches: data.matches ?? []
+            matches: data.matches ?? [],
+            steps: mapSteps(data.steps), // falls Backend steps auch im normalen Flow sendet
         })
     } catch (e) {
         console.error(e)
         messages.value.push({
             role: 'assistant',
             content: 'Fehler beim Senden. Siehe Console/Logs.',
-            matches: []
+            matches: [],
+            steps: [],
         })
     } finally {
         sending.value = false
     }
 }
 
+/* -----------------------
+   Nur Steps (DB-only)
+------------------------ */
 async function useDbStepsOnly(solutionId) {
     sending.value = true
 
@@ -170,47 +190,45 @@ async function useDbStepsOnly(solutionId) {
         const { data } = await axios.post('/api/chat', {
             sessionId: sessionId.value,
             message: '',
-            dbOnlySolutionId: solutionId
+            dbOnlySolutionId: solutionId,
         })
+
+        // Debug: damit du SOFORT siehst, ob Steps im UI ankommen
+        console.log('DB-only steps raw:', data.steps)
 
         messages.value.push({
             role: 'assistant',
             content: data.answer ?? '[leer]',
-            matches: data.matches ?? []
+            matches: data.matches ?? [],
+            steps: mapSteps(data.steps),
         })
-
-        // ✅ Nur jetzt: Avatar-Angebot vorbereiten (aber NICHT sofort anzeigen!)
-        pendingGuide.value = {
-            tts: data.tts ?? 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
-            mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif'
-        }
-        avatarEnabled.value = false
     } catch (e) {
         console.error(e)
         messages.value.push({
             role: 'assistant',
-            content: 'Fehler beim Laden der Steps (DB-only). Siehe Console/Logs.',
-            matches: []
+            content: 'Fehler beim Laden der Steps.',
+            matches: [],
+            steps: [],
         })
     } finally {
         sending.value = false
     }
 }
 
+/* -----------------------
+   Neuer Chat
+------------------------ */
 function newChat() {
     sessionId.value = uuid()
     sessionStorage.setItem('sessionId', sessionId.value)
 
     messages.value = [
-        { role: 'assistant', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }
+        { role: 'system', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }
     ]
     input.value = ''
-
-    // ✅ Avatar reset
-    avatarEnabled.value = false
-    pendingGuide.value = null
 }
 </script>
+
 
 <style scoped>
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }
@@ -220,7 +238,7 @@ function newChat() {
 .chat { border: 1px solid #ddd; border-radius: 12px; padding: 16px; min-height: 360px; background: #fff; }
 .msg { display: grid; grid-template-columns: 110px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid #f1f1f1; }
 .msg:last-child { border-bottom: none; }
-.role { font-weight: 700; text-transform: lowercase; color: #333; }
+.role { font-weight: 700; color: #333; }
 .pre { white-space: pre-wrap; margin: 0; font-family: inherit; }
 
 .composer { display: flex; gap: 10px; margin-top: 14px; }
@@ -251,3 +269,4 @@ function newChat() {
 .avatar-offer-title { font-weight: 700; }
 .avatar-offer-actions { display:flex; gap:10px; }
 </style>
+

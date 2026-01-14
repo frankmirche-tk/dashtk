@@ -93,6 +93,61 @@
                             <textarea class="textarea" v-model="st.nextIfFailed"></textarea>
                         </div>
                     </div>
+
+                    <!-- Media Upload -->
+                    <div class="mediaBox">
+                        <div class="mediaRow">
+                            <div class="mediaLeft">
+                                <div class="mediaTitle">Media (optional)</div>
+
+                                <div v-if="st.mediaUrl" class="mediaExisting">
+                                    <a :href="st.mediaUrl" target="_blank" rel="noreferrer">
+                                        Vorhandene Datei öffnen
+                                        <span v-if="st.mediaMimeType">({{ st.mediaMimeType }})</span>
+                                    </a>
+                                    <div class="mediaMeta" v-if="st.mediaOriginalName">
+                                        {{ st.mediaOriginalName }}
+                                    </div>
+                                </div>
+
+                                <div v-else class="mediaMeta">
+                                    Keine Datei hinterlegt.
+                                </div>
+                            </div>
+
+                            <div class="mediaRight">
+                                <input
+                                    type="file"
+                                    class="file"
+                                    accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,video/mp4"
+                                    @change="onPickFile(st, $event)"
+                                />
+
+                                <div class="row" style="margin-top: 8px;">
+                                    <button class="btn primary"
+                                            :disabled="!st._pendingFile || uploadingStepId === st.id"
+                                            @click="doUpload(st)">
+                                        {{ st.mediaUrl ? 'Austauschen' : 'Upload' }}
+                                    </button>
+
+                                    <button class="btn danger"
+                                            v-if="st.mediaUrl"
+                                            :disabled="uploadingStepId === st.id"
+                                            @click="removeMedia(st)">
+                                        Entfernen
+                                    </button>
+                                </div>
+
+                                <div v-if="uploadingStepId === st.id" class="mediaMeta">
+                                    Upload läuft…
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mediaHint">
+                            Erlaubt: PNG/JPG/WEBP/GIF, PDF, MP4. Empfehlung: kurze GIFs oder PDF für längere Anleitungen.
+                        </div>
+                    </div>
                 </div>
 
                 <div v-if="stMsg" class="ok">{{ stMsg }}</div>
@@ -105,7 +160,7 @@
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import axios from 'axios'
-import { uuid } from '../utils/uuid';
+import { uuid } from '../utils/uuid'
 
 const route = useRoute()
 const id = computed(() => route.params.id)
@@ -121,6 +176,8 @@ const savedMsg = ref('')
 const kwMsg = ref('')
 const stMsg = ref('')
 
+const uploadingStepId = ref(null)
+
 const form = ref({
     title: '',
     symptoms: '',
@@ -130,18 +187,15 @@ const form = ref({
 })
 
 const keywords = ref([]) // [{id?, keyword, weight, _key}]
-const steps = ref([])    // [{id?, stepNo, instruction, expectedResult, nextIfFailed, _key}]
+const steps = ref([])    // [{id?, stepNo, instruction, expectedResult, nextIfFailed, mediaUrl?, mediaMimeType?, mediaOriginalName?, _key, _pendingFile?}]
 
-function key() {
-    return uuid()
-}
+function key() { return uuid() }
 
 async function loadAll() {
     loading.value = true
     error.value = ''
     try {
         const sol = await axios.get(`/api/support_solutions/${id.value}`)
-        // Wenn API Platform deine Felder anders benennt, passe hier an.
         form.value = {
             title: sol.data.title ?? '',
             symptoms: sol.data.symptoms ?? '',
@@ -150,8 +204,6 @@ async function loadAll() {
             active: sol.data.active ?? true,
         }
 
-        // Keywords & Steps separat laden (stabil, vermeidet Join-Probleme)
-        // Du brauchst dafür Filter auf solution_id oder solution IRI. Falls nicht vorhanden: kurz ergänzen.
         const kwRes = await axios.get('/api/support_solution_keywords', {
             params: { solution: `/api/support_solutions/${id.value}` },
         })
@@ -174,6 +226,11 @@ async function loadAll() {
                 instruction: s.instruction ?? '',
                 expectedResult: s.expectedResult ?? '',
                 nextIfFailed: s.nextIfFailed ?? '',
+                // Media-Felder (kommen aus solution:read Groups)
+                mediaUrl: s.mediaUrl ?? null,
+                mediaMimeType: s.mediaMimeType ?? null,
+                mediaOriginalName: s.mediaOriginalName ?? null,
+                _pendingFile: null,
                 _key: key(),
             }))
             .sort((a, b) => a.stepNo - b.stepNo)
@@ -223,12 +280,10 @@ async function saveKeywords() {
     savingKeywords.value = true
     kwMsg.value = ''
     try {
-        // 1) normalisieren & leere entfernen
         const cleaned = keywords.value
             .map(k => ({ ...k, keyword: (k.keyword ?? '').trim() }))
             .filter(k => k.keyword.length > 0)
 
-        // 2) upsert (patch/post)
         for (const k of cleaned) {
             const payload = {
                 solution: `/api/support_solutions/${id.value}`,
@@ -247,7 +302,6 @@ async function saveKeywords() {
             }
         }
 
-        // aktualisierte Liste zurückschreiben (nur cleaned)
         keywords.value = cleaned.map(k => ({ ...k }))
         kwMsg.value = '✅ Keywords gespeichert'
     } catch (e) {
@@ -265,6 +319,10 @@ function addStepRow() {
         instruction: '',
         expectedResult: '',
         nextIfFailed: '',
+        mediaUrl: null,
+        mediaMimeType: null,
+        mediaOriginalName: null,
+        _pendingFile: null,
         _key: key(),
     })
 }
@@ -272,6 +330,8 @@ function addStepRow() {
 async function removeStep(idx) {
     const st = steps.value[idx]
     if (st.id) {
+        // Optional: vorher Media löschen ist nicht zwingend, weil onDelete CASCADE am Step greift,
+        // Datei im FS bleibt aber evtl. liegen. (Kann man später per Cleanup lösen.)
         await axios.delete(`/api/support_solution_steps/${st.id}`)
     }
     steps.value.splice(idx, 1)
@@ -307,16 +367,66 @@ async function saveSteps() {
                 const res = await axios.post('/api/support_solution_steps', payload, {
                     headers: { 'Content-Type': 'application/ld+json' },
                 })
-                s.id = res.data.id
+                // ApiPlatform gibt id evtl. als "@id" (IRI) zurück – robust auslesen:
+                const iri = res.data?.['@id'] || ''
+                const newId = iri ? iri.split('/').pop() : (res.data?.id ?? null)
+                s.id = newId
             }
         }
 
-        steps.value = cleaned.map(s => ({ ...s }))
+        // Nach dem Speichern neu laden, damit media-Felder (falls vorhanden) korrekt rein kommen
+        await loadAll()
         stMsg.value = '✅ Steps gespeichert'
     } catch (e) {
         error.value = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Speichern der Steps'
     } finally {
         savingSteps.value = false
+    }
+}
+
+/** ===== Media Upload (multipart/form-data) ===== */
+function onPickFile(step, ev) {
+    const file = ev.target.files?.[0] ?? null
+    step._pendingFile = file
+}
+
+async function doUpload(step) {
+    if (!step.id || !step._pendingFile) return
+
+    uploadingStepId.value = step.id
+    try {
+        const fd = new FormData()
+        fd.append('file', step._pendingFile)
+
+        // Upload-Endpoint aus dem Backend Controller:
+        const { data } = await axios.post(`/api/support_solution_steps/${step.id}/media`, fd, {
+            headers: { 'Content-Type': 'multipart/form-data' }
+        })
+
+        step.mediaUrl = data.mediaUrl ?? step.mediaUrl
+        step.mediaMimeType = data.mediaMimeType ?? step.mediaMimeType
+        step.mediaOriginalName = data.mediaOriginalName ?? step.mediaOriginalName
+        step._pendingFile = null
+    } catch (e) {
+        error.value = e?.response?.data?.error ?? e?.response?.data?.detail ?? e?.message ?? 'Upload fehlgeschlagen'
+    } finally {
+        uploadingStepId.value = null
+    }
+}
+
+async function removeMedia(step) {
+    if (!step.id) return
+    uploadingStepId.value = step.id
+    try {
+        await axios.delete(`/api/support_solution_steps/${step.id}/media`)
+        step.mediaUrl = null
+        step.mediaMimeType = null
+        step.mediaOriginalName = null
+        step._pendingFile = null
+    } catch (e) {
+        error.value = e?.response?.data?.error ?? e?.response?.data?.detail ?? e?.message ?? 'Löschen fehlgeschlagen'
+    } finally {
+        uploadingStepId.value = null
     }
 }
 
@@ -339,4 +449,15 @@ loadAll()
 .kwRow { display: grid; grid-template-columns: 1fr 100px 60px; gap: 10px; align-items: center; }
 .stepCard { border: 1px dashed #ddd; border-radius: 14px; padding: 12px; margin: 10px 0; }
 label { display:block; margin: 8px 0 4px; font-weight: 600; }
+
+.mediaBox { margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee; }
+.mediaRow { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+.mediaTitle { font-weight: 700; margin-bottom: 6px; }
+.mediaExisting a { color: #111; text-decoration: underline; }
+.mediaMeta { font-size: 12px; color: #666; margin-top: 6px; }
+.mediaHint { font-size: 12px; color: #666; margin-top: 10px; }
+.file { width: 100%; }
+@media (max-width: 900px) {
+    .mediaRow { grid-template-columns: 1fr; }
+}
 </style>

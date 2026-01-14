@@ -38,9 +38,7 @@
                     <button class="btn primary" :disabled="saving || createdSolutionId" @click="createSolution">
                         {{ createdSolutionId ? `✅ Angelegt (#${createdSolutionId})` : 'SupportSolution anlegen' }}
                     </button>
-                    <span class="hint" v-if="createdSolutionId">
-            Jetzt Keywords & Steps hinzufügen.
-          </span>
+                    <span class="hint" v-if="createdSolutionId">Jetzt Keywords & Steps hinzufügen.</span>
                 </div>
 
                 <p class="error" v-if="errors.solution">{{ errors.solution }}</p>
@@ -79,6 +77,8 @@
 
                 <div class="hint">
                     Steps werden mit <code>stepNo</code> gespeichert (1..n). Empfehlung: klare Aktion + erwartetes Ergebnis + nächster Schritt falls fehlgeschlagen.
+                    <br>
+                    Optional kannst du pro Step eine Datei hochladen (Bild/GIF/PDF/MP4). Diese wird später als „Bildhilfe / PDF“ angezeigt.
                 </div>
 
                 <div class="steps">
@@ -101,6 +101,13 @@
                                 <textarea class="textarea" v-model.trim="s.nextIfFailed" rows="2" placeholder="Wenn es nicht klappt: was als nächstes?" />
                             </div>
                         </div>
+
+                        <!-- Media Upload erst NACH dem Speichern (wenn Step-ID existiert) -->
+                        <div class="media" v-if="createdSolutionId">
+                            <div class="media-hint">
+                                Media pro Step: erst „Steps speichern“, dann kannst du Upload/Replace machen (da Step-ID benötigt wird).
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -112,7 +119,13 @@
                 </div>
 
                 <p class="error" v-if="errors.steps">{{ errors.steps }}</p>
-                <p class="ok" v-if="saved.steps">✅ Steps gespeichert</p>
+                <p class="ok" v-if="saved.steps">✅ Steps gespeichert – jetzt kannst du im Edit-Mode Media hochladen.</p>
+
+                <div v-if="saved.steps" class="row" style="margin-top: 10px;">
+                    <router-link class="btn primary" :to="`/kb/${createdSolutionId}`">
+                        Jetzt Steps + Media bearbeiten
+                    </router-link>
+                </div>
             </section>
         </div>
 
@@ -136,16 +149,8 @@ import { ref, reactive } from 'vue'
 const saving = ref(false)
 const createdSolutionId = ref(null)
 
-const errors = reactive({
-    solution: '',
-    keywords: '',
-    steps: '',
-})
-
-const saved = reactive({
-    keywords: false,
-    steps: false,
-})
+const errors = reactive({ solution: '', keywords: '', steps: '' })
+const saved = reactive({ keywords: false, steps: false })
 
 const solution = reactive({
     title: '',
@@ -155,16 +160,10 @@ const solution = reactive({
     active: true,
 })
 
-const keywords = ref([
-    { keyword: '', weight: 5 },
-])
-
-const steps = ref([
-    { stepNo: 1, instruction: '', expectedResult: '', nextIfFailed: '' },
-])
+const keywords = ref([{ keyword: '', weight: 5 }])
+const steps = ref([{ stepNo: 1, instruction: '', expectedResult: '', nextIfFailed: '' }])
 
 function apiBase() {
-    // Backend läuft auf :8000, Vite auf :5173 → absolute URL für dev
     return 'http://127.0.0.1:8000'
 }
 
@@ -211,7 +210,6 @@ async function createSolution() {
             headers: { 'Content-Type': 'application/ld+json', 'Accept': 'application/ld+json' }
         })
 
-        // API Platform gibt id meistens als "/api/support_solutions/12" in "@id"
         const iri = res.data?.['@id'] || ''
         const id = iri.split('/').pop()
         createdSolutionId.value = id ? Number(id) : null
@@ -249,7 +247,6 @@ async function saveKeywords() {
 
     saving.value = true
     try {
-        // einzeln posten (einfach & robust)
         for (const k of cleaned) {
             await axios.post(`${apiBase()}/api/support_solution_keywords`, {
                 solution: `/api/support_solutions/${createdSolutionId.value}`,
@@ -290,7 +287,6 @@ async function saveSteps() {
         return
     }
 
-    // optional: StepNo uniqueness check in UI
     const stepNos = cleaned.map(s => s.stepNo)
     const dup = stepNos.find((n, i) => stepNos.indexOf(n) !== i)
     if (dup) {
@@ -361,6 +357,8 @@ function resetAll() {
 .step { border:1px dashed #ddd; border-radius: 12px; padding: 12px; }
 .step-head { display:flex; justify-content:space-between; align-items:center; gap: 10px; }
 .two { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.media { margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee; }
+.media-hint { font-size: 12px; color: #666; }
 @media (max-width: 900px) {
     .grid { grid-template-columns: 1fr; }
     .two { grid-template-columns: 1fr; }

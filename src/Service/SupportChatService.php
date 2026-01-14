@@ -109,7 +109,17 @@ final class SupportChatService
      *   matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,
      *   modeHint:string,
      *   tts:string,
-     *   mediaUrl:string
+     *   mediaUrl:string,
+     *   steps:array<int,array{
+     *     id:string|null,
+     *     stepNo:int,
+     *     instruction:string,
+     *     expectedResult?:string|null,
+     *     nextIfFailed?:string|null,
+     *     mediaPath?:string|null,
+     *     mediaUrl?:string|null,
+     *     mediaMimeType?:string|null
+     *   }>
      * }
      */
     private function answerDbOnly(string $sessionId, int $solutionId): array
@@ -123,33 +133,64 @@ final class SupportChatService
                 'modeHint' => 'db_only',
                 'tts' => 'Die SOP wurde nicht gefunden.',
                 'mediaUrl' => '',
+                'steps' => [],
             ];
         }
 
-        $steps = [];
-        foreach ($solution->getSteps() as $st) {
-            $steps[] = $st->getStepNo() . ') ' . $st->getInstruction();
+        // Doctrine Collection -> Array + sort by stepNo
+        $stepsEntities = $solution->getSteps()->toArray();
+        usort($stepsEntities, static fn($a, $b) => $a->getStepNo() <=> $b->getStepNo());
+
+        // ✅ 1) steps payload für Frontend (mit mediaUrl)
+        $stepsPayload = [];
+        foreach ($stepsEntities as $st) {
+            $stepsPayload[] = [
+                'id' => $st->getId(),
+                'stepNo' => (int) $st->getStepNo(),
+                'instruction' => (string) $st->getInstruction(),
+                'expectedResult' => $st->getExpectedResult(),
+                'nextIfFailed' => $st->getNextIfFailed(),
+
+                // Media (optional)
+                'mediaPath' => $st->getMediaPath(),
+                'mediaUrl' => method_exists($st, 'getMediaUrl') ? $st->getMediaUrl() : null,
+                'mediaMimeType' => $st->getMediaMimeType(),
+            ];
         }
 
-        $answer =
-            "SOP: {$solution->getTitle()}\n" .
-            ($solution->getSymptoms() ? "Symptome: {$solution->getSymptoms()}\n" : '') .
-            "\n" .
-            ($steps ? implode("\n", $steps) : 'Keine Steps hinterlegt.');
+        // ✅ 2) answer Text (wie bisher)
+        $lines = [];
+        $lines[] = "SOP: {$solution->getTitle()}";
+        if ($solution->getSymptoms()) {
+            $lines[] = "Symptome: {$solution->getSymptoms()}";
+        }
+        $lines[] = "";
+
+        if ($stepsEntities) {
+            foreach ($stepsEntities as $st) {
+                $lines[] = $st->getStepNo() . ') ' . $st->getInstruction();
+            }
+        } else {
+            $lines[] = 'Keine Steps hinterlegt.';
+        }
 
         return [
-            'answer' => $answer,
+            'answer' => implode("\n", $lines),
 
-            // ✅ WICHTIG: damit die SOP-Box NICHT doppelt erscheint
+            // ✅ damit die SOP-Box NICHT doppelt erscheint
             'matches' => [],
 
             'modeHint' => 'db_only',
 
-            // ✅ Avatar nur im DB-only Mode anbieten
+            // ✅ Avatar nur im DB-only Mode anbieten (kannst du später komplett entfernen)
             'tts' => 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
             'mediaUrl' => '/guides/print/step1.gif',
+
+            // ✅ DAS ist der entscheidende Fix
+            'steps' => $stepsPayload,
         ];
     }
+
 
     /**
      * @return array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>
