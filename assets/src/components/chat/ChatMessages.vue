@@ -1,4 +1,7 @@
 <template>
+    <!-- Avatar/Offer EINMAL über dem Chat -->
+    <slot name="avatar" />
+
     <div class="chat">
         <div v-for="(m, idx) in messages" :key="idx" class="msg" :class="m.role">
             <div class="role">{{ roleLabel(m.role) }}:</div>
@@ -44,21 +47,20 @@
                     </ol>
                 </div>
 
-                <!-- Avatar Opt-In Bereich (optional) -->
-                <slot name="avatar" />
             </div>
         </div>
     </div>
 </template>
 
 <script setup>
-const props = defineProps({
+defineProps({
     messages: { type: Array, required: true },
     roleLabel: { type: Function, required: true },
 })
 
 defineEmits(['db-only'])
 </script>
+
 <style scoped>
 .chat { border: 1px solid #ddd; border-radius: 12px; padding: 16px; min-height: 360px; background: #fff; }
 .msg { display: grid; grid-template-columns: 110px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid #f1f1f1; }

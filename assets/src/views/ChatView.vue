@@ -15,14 +15,29 @@
             :roleLabel="roleLabel"
             @db-only="useDbStepsOnly"
         >
-            <!-- Avatar wieder aktivieren? Dann hier rein als Slot -->
-            <!--
             <template #avatar>
-              <AvatarGuide v-if="avatarEnabled && pendingGuide" ... />
-              ...
+                <!-- Angebot erscheint nur nach DB-only Auswahl -->
+                <div v-if="pendingGuide && !avatarEnabled" class="avatar-offer">
+                    <div class="avatar-offer-title">
+                        Möchtest du dazu eine geführte Avatar-Demo?
+                    </div>
+                    <div class="avatar-offer-actions">
+                        <button class="btn ghost" @click="declineAvatar">Nein, Steps reichen</button>
+                        <button class="btn" @click="acceptAvatar">Ja, Avatar starten</button>
+                    </div>
+                </div>
+
+                <!-- Avatar wird NUR gezeigt, wenn User Opt-In gegeben hat -->
+                <AvatarGuide
+                    v-if="avatarEnabled && pendingGuide"
+                    :tts-text="avatarTtsText"
+                    :media-url="avatarMediaUrl"
+                    @next="onNextStep"
+                />
             </template>
-            -->
         </ChatMessages>
+
+
 
         <ChatComposer
             v-model="input"
@@ -34,11 +49,13 @@
 
 <script setup>
 import axios from 'axios'
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { uuid } from '../utils/uuid'
 
+import AvatarGuide from '@/views/AvatarGuide.vue'
 import ChatMessages from '@/components/chat/ChatMessages.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
+
 
 const input = ref('')
 const sending = ref(false)
@@ -51,6 +68,20 @@ const messages = ref([{ role: 'system', content: 'Willkommen. Beschreibe dein Pr
 const ROLE_LABELS = { assistant: 'KI Antwort', system: 'System', user: 'Du' }
 function roleLabel(role) {
     return ROLE_LABELS[role] ?? role
+}
+
+const avatarEnabled = ref(false)
+const pendingGuide = ref(null)
+
+const avatarTtsText = computed(() => pendingGuide.value?.tts ?? '')
+const avatarMediaUrl = computed(() => pendingGuide.value?.mediaUrl ?? '/guides/print/step1.gif')
+
+function acceptAvatar() {
+    avatarEnabled.value = true
+}
+function declineAvatar() {
+    avatarEnabled.value = false
+    pendingGuide.value = null
 }
 
 function mapSteps(raw) {
@@ -70,6 +101,9 @@ function mapSteps(raw) {
 
 async function send(textFromComposer) {
     const text = String(textFromComposer ?? input.value).trim()
+    pendingGuide.value = null
+    avatarEnabled.value = false
+
     if (!text) return
 
     messages.value.push({ role: 'user', content: text })
@@ -100,19 +134,25 @@ async function useDbStepsOnly(solutionId) {
             message: '',
             dbOnlySolutionId: solutionId,
         })
+
         messages.value.push({
             role: 'assistant',
             content: data.answer ?? '[leer]',
             matches: data.matches ?? [],
             steps: mapSteps(data.steps),
         })
-    } catch (e) {
-        console.error(e)
-        messages.value.push({ role: 'assistant', content: 'Fehler beim Laden der Steps (DB-only).' })
+
+        // ✅ NUR jetzt: Opt-In vorbereiten
+        pendingGuide.value = {
+            tts: data.tts ?? 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
+            mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
+        }
+        avatarEnabled.value = false
     } finally {
         sending.value = false
     }
 }
+
 
 function newChat() {
     sessionId.value = uuid()
