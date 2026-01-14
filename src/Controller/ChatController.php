@@ -19,16 +19,19 @@ final class ChatController extends AbstractController
     #[Route('/api/chat', name: 'app_chat', methods: ['POST'])]
     public function chat(Request $request): JsonResponse
     {
-        $payload = json_decode((string) $request->getContent(), true) ?: [];
+        $payload = json_decode((string)$request->getContent(), true) ?: [];
 
-        $sessionId = (string) ($payload['sessionId'] ?? '');
-        $message   = (string) ($payload['message'] ?? '');
+        $sessionId = (string)($payload['sessionId'] ?? '');
+        $message   = (string)($payload['message'] ?? '');
 
-        // Optional: DB-only Modus (wenn User “Nur Steps” klickt)
-        $dbOnlySolutionId = $payload['dbOnlySolutionId'] ?? null;
-        $dbOnlySolutionId = is_numeric($dbOnlySolutionId) ? (int) $dbOnlySolutionId : null;
+        $dbOnly = $payload['dbOnlySolutionId'] ?? null;
+        $dbOnlySolutionId = is_numeric($dbOnly) ? (int)$dbOnly : null;
 
-        $result = $this->chatService->ask($sessionId, $message, $dbOnlySolutionId);
+        $result = $this->chatService->ask(
+            $sessionId,
+            $message,
+            $dbOnlySolutionId
+        );
 
         return new JsonResponse($result);
     }

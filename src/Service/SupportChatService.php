@@ -14,18 +14,23 @@ use Symfony\Contracts\Cache\ItemInterface;
 final class SupportChatService
 {
     private const SESSION_TTL_SECONDS = 60 * 60; // 1h
-    private const MAX_HISTORY_MESSAGES = 18;     // damit Context nicht zu groß wird
+    private const MAX_HISTORY_MESSAGES = 18;
 
     public function __construct(
         private readonly AIChatRequestHandlerInterface $chatHandler,
         private readonly SupportSolutionRepository $solutions,
         private readonly CacheInterface $cache,
-        // ✅ kein Attribute nötig: Symfony kann das anhand des Argumentnamens autowiren
         private readonly LoggerInterface $supportSolutionLogger,
     ) {}
 
     /**
-     * @return array{answer:string,matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,modeHint:string}
+     * @return array{
+     *   answer:string,
+     *   matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,
+     *   modeHint:string,
+     *   tts?:string,
+     *   mediaUrl?:string
+     * }
      */
     public function ask(string $sessionId, string $message, ?int $dbOnlySolutionId = null): array
     {
@@ -36,12 +41,12 @@ final class SupportChatService
             $sessionId = $this->newSessionIdFallback();
         }
 
-        // 1) DB-only Mode: Nur Steps aus DB ausgeben (ohne Gemini)
+        // 1) DB-only Mode: Nur Steps aus DB
         if ($dbOnlySolutionId !== null) {
             return $this->answerDbOnly($sessionId, $dbOnlySolutionId);
         }
 
-        // 2) Normal: Matchen + Gemini Antwort erzeugen
+        // 2) Normal: Matchen + KI Antwort (OHNE Avatar-Felder!)
         $matches = $this->findMatches($message);
 
         $history = $this->loadHistory($sessionId);
@@ -56,21 +61,10 @@ final class SupportChatService
             ];
         }
 
-        // User Message in Verlauf
         $history[] = ['role' => 'user', 'content' => $message];
 
-        // KB Context als Systemmessage (nur intern)
         $kbContext = $this->buildKbContext($matches);
 
-        $this->supportSolutionLogger->info('chat_request', [
-            'sessionId' => $sessionId,
-            'message' => $message,
-            'matchCount' => count($matches),
-            'matchIds' => array_map(fn($m) => $m['id'], $matches),
-            'kbContextChars' => mb_strlen($kbContext),
-        ]);
-
-        // Request bauen
         $builder = $this->chatHandler->createRequest();
 
         foreach ($this->trimHistory($history) as $msg) {
@@ -97,14 +91,8 @@ final class SupportChatService
             ? trim((string) $respMsg->content)
             : '[unlesbare Antwort]';
 
-        // Assistant Antwort in Verlauf
         $history[] = ['role' => 'assistant', 'content' => $answer];
         $this->saveHistory($sessionId, $history);
-
-        $this->supportSolutionLogger->info('chat_response', [
-            'sessionId' => $sessionId,
-            'answerChars' => mb_strlen($answer),
-        ]);
 
         return [
             'answer' => $answer,
@@ -114,22 +102,27 @@ final class SupportChatService
     }
 
     /**
-     * @return array{answer:string,matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,modeHint:string}
+     * DB-only Antwort + Avatar-Vorschlag (tts/mediaUrl)
+     *
+     * @return array{
+     *   answer:string,
+     *   matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,
+     *   modeHint:string,
+     *   tts:string,
+     *   mediaUrl:string
+     * }
      */
     private function answerDbOnly(string $sessionId, int $solutionId): array
     {
         $solution = $this->solutions->find($solutionId);
 
         if (!$solution instanceof SupportSolution) {
-            $this->supportSolutionLogger->warning('db_only_not_found', [
-                'sessionId' => $sessionId,
-                'solutionId' => $solutionId,
-            ]);
-
             return [
                 'answer' => 'Die ausgewählte SOP wurde nicht gefunden.',
                 'matches' => [],
                 'modeHint' => 'db_only',
+                'tts' => 'Die SOP wurde nicht gefunden.',
+                'mediaUrl' => '',
             ];
         }
 
@@ -144,18 +137,17 @@ final class SupportChatService
             "\n" .
             ($steps ? implode("\n", $steps) : 'Keine Steps hinterlegt.');
 
-        $matches = [$this->mapMatch($solution, 999)];
-
-        $this->supportSolutionLogger->info('db_only_response', [
-            'sessionId' => $sessionId,
-            'solutionId' => $solutionId,
-            'stepsCount' => count($steps),
-        ]);
-
         return [
             'answer' => $answer,
-            'matches' => $matches,
+
+            // ✅ WICHTIG: damit die SOP-Box NICHT doppelt erscheint
+            'matches' => [],
+
             'modeHint' => 'db_only',
+
+            // ✅ Avatar nur im DB-only Mode anbieten
+            'tts' => 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
+            'mediaUrl' => '/guides/print/step1.gif',
         ];
     }
 
@@ -168,8 +160,7 @@ final class SupportChatService
             return [];
         }
 
-        $raw = $this->solutions->findBestMatches($message, 5); // <= existiert bei dir schon
-        // Erwartet: [['solution'=>SupportSolution,'score'=>int], ...]
+        $raw = $this->solutions->findBestMatches($message, 5);
 
         $mapped = [];
         foreach ($raw as $m) {
@@ -179,11 +170,6 @@ final class SupportChatService
             }
             $mapped[] = $this->mapMatch($s, (int) ($m['score'] ?? 0));
         }
-
-        $this->supportSolutionLogger->debug('db_matches', [
-            'message' => $message,
-            'matches' => $mapped,
-        ]);
 
         return $mapped;
     }
@@ -195,9 +181,6 @@ final class SupportChatService
     {
         $id = (int) $solution->getId();
         $iri = '/api/support_solutions/' . $id;
-
-        // Wenn deine Steps-Resource einen Filter "solution" hat:
-        // /api/support_solution_steps?solution=/api/support_solutions/{id}
         $stepsUrl = '/api/support_solution_steps?solution=' . rawurlencode($iri);
 
         return [
@@ -210,8 +193,6 @@ final class SupportChatService
     }
 
     /**
-     * Baut einen kompakten KB-Block, den Gemini intern bekommt.
-     *
      * @param array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}> $matches
      */
     private function buildKbContext(array $matches): string
@@ -220,7 +201,6 @@ final class SupportChatService
             return '';
         }
 
-        // Wir geben Gemini kurze SOP-Hinweise + Rule, damit er sie wirklich nutzt
         $lines = [];
         $lines[] = 'WISSENSDATENBANK (SOPs) – nutze diese vorrangig, wenn passend:';
         foreach ($matches as $hit) {
@@ -232,10 +212,7 @@ final class SupportChatService
                 $hit['url']
             );
         }
-
-        $lines[] =
-            'REGEL: Wenn eine SOP passt, führe den User Schritt-für-Schritt. ' .
-            'Nach JEDEM Schritt nach dem Ergebnis fragen.';
+        $lines[] = 'REGEL: Wenn eine SOP passt, führe Schritt-für-Schritt und frage nach jedem Ergebnis.';
 
         return implode("\n", $lines);
     }
@@ -247,10 +224,12 @@ final class SupportChatService
     {
         $key = $this->historyCacheKey($sessionId);
 
-        return $this->cache->get($key, function (ItemInterface $item) {
+        $val = $this->cache->get($key, function (ItemInterface $item) {
             $item->expiresAfter(self::SESSION_TTL_SECONDS);
             return [];
         });
+
+        return is_array($val) ? $val : [];
     }
 
     /**
@@ -260,7 +239,8 @@ final class SupportChatService
     {
         $key = $this->historyCacheKey($sessionId);
 
-        // overwrite via get() callback
+        $this->cache->delete($key);
+
         $this->cache->get($key, function (ItemInterface $item) use ($history) {
             $item->expiresAfter(self::SESSION_TTL_SECONDS);
             return $history;
@@ -273,7 +253,6 @@ final class SupportChatService
      */
     private function trimHistory(array $history): array
     {
-        // system msg immer behalten, dann letzten N-1 Messages
         $system = [];
         $rest = $history;
 

@@ -10,9 +10,29 @@
             </div>
         </header>
 
+        <!-- ✅ Avatar wird NUR gezeigt, wenn User Opt-In gegeben hat -->
+        <AvatarGuide
+            v-if="avatarEnabled && pendingGuide"
+            :tts-text="avatarTtsText"
+            :media-url="avatarMediaUrl"
+            @next="onNextStep"
+        />
+
+        <!-- ✅ Angebot erscheint nur nach DB-only Auswahl -->
+        <div v-if="pendingGuide && !avatarEnabled" class="avatar-offer">
+            <div class="avatar-offer-title">
+                Möchtest du dazu eine geführte Avatar-Demo?
+            </div>
+            <div class="avatar-offer-actions">
+                <button class="btn ghost" @click="declineAvatar">Nein, Steps reichen</button>
+                <button class="btn" @click="acceptAvatar">Ja, Avatar starten</button>
+            </div>
+        </div>
+
         <div class="chat">
             <div v-for="(m, idx) in messages" :key="idx" class="msg" :class="m.role">
                 <div class="role">{{ m.role }}:</div>
+
                 <div class="content">
                     <pre class="pre">{{ m.content }}</pre>
 
@@ -56,9 +76,9 @@
 
 <script setup>
 import axios from 'axios'
-import { ref } from 'vue'
-import { uuid } from '../utils/uuid';
-
+import { ref, computed } from 'vue'
+import AvatarGuide from '@/views/AvatarGuide.vue'
+import { uuid } from '../utils/uuid'
 
 const input = ref('')
 const sending = ref(false)
@@ -70,6 +90,33 @@ const messages = ref([
     { role: 'system', content: 'Willkommen. Beschreibe dein Druckerproblem.' }
 ])
 
+// ✅ Avatar Opt-In State
+const avatarEnabled = ref(false)
+
+// ✅ Guide-Daten werden erst gesetzt, wenn DB-only Steps geladen wurden
+const pendingGuide = ref(null) // { tts: string, mediaUrl: string } | null
+
+const avatarTtsText = computed(() => pendingGuide.value?.tts ?? '')
+const avatarMediaUrl = computed(() => pendingGuide.value?.mediaUrl ?? '/guides/print/step1.gif')
+
+function acceptAvatar() {
+    avatarEnabled.value = true
+}
+
+function declineAvatar() {
+    avatarEnabled.value = false
+    pendingGuide.value = null
+}
+
+function onNextStep() {
+    // MVP: nur Demo
+    messages.value.push({
+        role: 'assistant',
+        content: 'Alles klar. Schritt 2 folgt (Demo).',
+        matches: []
+    })
+}
+
 async function send() {
     const text = input.value.trim()
     if (!text) return
@@ -77,6 +124,10 @@ async function send() {
     messages.value.push({ role: 'user', content: text })
     input.value = ''
     sending.value = true
+
+    // ✅ wichtig: normales Chatten soll keinen Avatar triggern
+    pendingGuide.value = null
+    avatarEnabled.value = false
 
     try {
         const { data } = await axios.post('/api/chat', {
@@ -103,6 +154,7 @@ async function send() {
 
 async function useDbStepsOnly(solutionId) {
     sending.value = true
+
     try {
         const { data } = await axios.post('/api/chat', {
             sessionId: sessionId.value,
@@ -115,6 +167,13 @@ async function useDbStepsOnly(solutionId) {
             content: data.answer ?? '[leer]',
             matches: data.matches ?? []
         })
+
+        // ✅ Nur jetzt: Avatar-Angebot vorbereiten (aber NICHT sofort anzeigen!)
+        pendingGuide.value = {
+            tts: data.tts ?? 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
+            mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif'
+        }
+        avatarEnabled.value = false
     } catch (e) {
         console.error(e)
         messages.value.push({
@@ -135,32 +194,49 @@ function newChat() {
         { role: 'system', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }
     ]
     input.value = ''
+
+    // ✅ Avatar reset
+    avatarEnabled.value = false
+    pendingGuide.value = null
 }
 </script>
 
 <style scoped>
-.page { padding: 16px; }
-.topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom: 12px; }
-.actions { display:flex; gap:10px; }
-.btn { display:inline-flex; align-items:center; gap:6px; padding:8px 12px; border:1px solid #ccc; border-radius:10px; text-decoration:none; background:white; cursor:pointer; }
-.btn:hover { background:#f7f7f7; }
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }
-.header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-.actions { display: flex; gap: 8px; }
+.header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.actions { display:flex; gap:8px; }
+
 .chat { border: 1px solid #ddd; border-radius: 12px; padding: 16px; min-height: 360px; background: #fff; }
 .msg { display: grid; grid-template-columns: 110px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid #f1f1f1; }
 .msg:last-child { border-bottom: none; }
 .role { font-weight: 700; text-transform: lowercase; color: #333; }
 .pre { white-space: pre-wrap; margin: 0; font-family: inherit; }
+
 .composer { display: flex; gap: 10px; margin-top: 14px; }
 .input { flex: 1; border: 1px solid #ccc; border-radius: 10px; padding: 12px; font-size: 16px; }
-.btn { border: 1px solid #111; background: #111; color: #fff; border-radius: 10px; padding: 10px 14px; cursor: pointer; }
+
+.btn { border: 1px solid #111; background:#111; color:#fff; border-radius: 10px; padding: 10px 14px; cursor: pointer; }
 .btn:disabled { opacity: .6; cursor: not-allowed; }
 .btn.small { padding: 6px 10px; border-radius: 8px; font-size: 13px; }
 .btn.ghost { background: transparent; color: #111; }
+
 .kb { margin-top: 10px; padding: 10px; border: 1px dashed #aaa; border-radius: 10px; background: #fafafa; }
 .kb-title { font-weight: 700; margin-bottom: 6px; }
 .kb-list { margin: 0; padding-left: 18px; }
 .kb-item { margin: 6px 0; }
 .kb-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+.avatar-offer {
+    margin: 14px 0;
+    border: 1px solid #ddd;
+    border-radius: 12px;
+    padding: 12px;
+    background: #fff;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+}
+.avatar-offer-title { font-weight: 700; }
+.avatar-offer-actions { display:flex; gap:10px; }
 </style>

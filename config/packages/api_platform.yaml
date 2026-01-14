@@ -1,7 +1,21 @@
 api_platform:
     title: Hello API Platform
     version: 1.0.0
+
     defaults:
         stateless: true
         cache_headers:
             vary: ['Content-Type', 'Authorization', 'Origin']
+
+    formats:
+        json: ['application/json']
+        jsonld: ['application/ld+json']
+
+    patch_formats:
+        json: ['application/merge-patch+json']
+
+    swagger:
+        versions: [3]
+
+    # WICHTIG: erlaubt formatlose URLs wie /api/support_solutions
+    use_symfony_listeners: true
