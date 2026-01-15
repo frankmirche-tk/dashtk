@@ -16,18 +16,14 @@
             @db-only="useDbStepsOnly"
         >
             <template #avatar>
-                <!-- Angebot erscheint nur nach DB-only Auswahl -->
                 <div v-if="avatarOfferEnabled && pendingGuide && !avatarEnabled" class="avatar-offer">
-                    <div class="avatar-offer-title">
-                        Möchtest du dazu eine geführte Avatar-Demo?
-                    </div>
+                    <div class="avatar-offer-title">Möchtest du dazu eine geführte Avatar-Demo?</div>
                     <div class="avatar-offer-actions">
                         <button class="btn ghost" @click="declineAvatar">Nein, Steps reichen</button>
                         <button class="btn" @click="acceptAvatar">Ja, Avatar starten</button>
                     </div>
                 </div>
 
-                <!-- Avatar wird NUR gezeigt, wenn User Opt-In gegeben hat -->
                 <AvatarGuide
                     v-if="avatarEnabled && pendingGuide"
                     :tts-text="avatarTtsText"
@@ -37,12 +33,13 @@
             </template>
         </ChatMessages>
 
-
-
         <ChatComposer
             v-model="input"
             :disabled="sending"
+            :show-attention="inputAttentionEnabled"
+            :attention-key="attentionKey"
             @submit="send"
+            @attention-consumed="inputAttentionEnabled = false"
         />
     </div>
 </template>
@@ -55,7 +52,6 @@ import { uuid } from '../utils/uuid'
 import AvatarGuide from '@/views/AvatarGuide.vue'
 import ChatMessages from '@/components/chat/ChatMessages.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
-
 
 const input = ref('')
 const sending = ref(false)
@@ -70,7 +66,7 @@ function roleLabel(role) {
     return ROLE_LABELS[role] ?? role
 }
 
-const avatarOfferEnabled = true  // Diesen Flag true wenn Avatar gewünscht ist
+const avatarOfferEnabled = true
 const avatarEnabled = ref(false)
 const pendingGuide = ref(null)
 
@@ -84,6 +80,10 @@ function declineAvatar() {
     avatarEnabled.value = false
     pendingGuide.value = null
 }
+
+// Input Attention (Hint + Pulse)
+const inputAttentionEnabled = ref(true)
+const attentionKey = ref(0)
 
 function mapSteps(raw) {
     if (!Array.isArray(raw)) return []
@@ -102,6 +102,8 @@ function mapSteps(raw) {
 
 async function send(textFromComposer) {
     const text = String(textFromComposer ?? input.value).trim()
+
+    // Beim normalen Chatten: Avatar/Offer reset
     pendingGuide.value = null
     avatarEnabled.value = false
 
@@ -143,12 +145,7 @@ async function useDbStepsOnly(solutionId) {
             steps: mapSteps(data.steps),
         })
 
-        // ✅ NUR jetzt: Opt-In vorbereiten
-        pendingGuide.value = {
-            tts: data.tts ?? 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
-            mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
-        }
-        // ✅ Offer-Daten erst NACH erfolgreichem Call setzen
+        // ✅ NUR jetzt: Opt-In vorbereiten (einmal!)
         pendingGuide.value = {
             tts: data.tts ?? 'Soll ich dir das als Avatar-Demo zeigen?',
             mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
@@ -159,17 +156,31 @@ async function useDbStepsOnly(solutionId) {
     }
 }
 
-
 function newChat() {
     sessionId.value = uuid()
     sessionStorage.setItem('sessionId', sessionId.value)
+
     messages.value = [{ role: 'system', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }]
     input.value = ''
+
     // ✅ Avatar/Offer komplett reset
     avatarEnabled.value = false
     pendingGuide.value = null
+
+    // ✅ Hint + Pulse wieder anwerfen
+    inputAttentionEnabled.value = true
+    attentionKey.value += 1
+}
+
+function onNextStep() {
+    messages.value.push({
+        role: 'assistant',
+        content: 'Alles klar. Schritt 2 folgt (Demo).',
+        matches: []
+    })
 }
 </script>
+
 
 <style scoped>
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }
