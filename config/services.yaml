@@ -19,3 +19,7 @@ services:
 
     Gemini\Contracts\ClientContract:
         factory: ['@modelflow.gemini_client_factory', 'make']
+
+    App\Service\SupportChatService:
+        arguments:
+            $supportSolutionLogger: '@monolog.logger.support_solution'

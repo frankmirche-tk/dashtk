@@ -91,24 +91,23 @@ final class SupportSolutionRepository extends ServiceEntityRepository
     }
 
     /**
+     * Tokenizer:
+     * - normalisiert
+     * - entfernt Stopwörter
+     * - erzeugt zusätzlich 2er- und 3er-Phrasen (Bigrams/Trigrams)
+     *
      * @return string[]
      */
     private function tokenize(string $input): array
     {
         $s = mb_strtolower($input);
         $s = preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $s) ?? $s;
-        $parts = preg_split('/\s+/u', trim($s)) ?: [];
+        $s = preg_replace('/\s+/u', ' ', trim($s)) ?? $s;
 
-        $parts = array_values(array_filter($parts, fn ($p) => mb_strlen($p) >= 3));
+        $parts = preg_split('/\s+/u', $s) ?: [];
+        $parts = array_values(array_filter($parts, static fn ($p) => $p !== ''));
 
-        $stop = [
-            'und','oder','aber','dass','ich','nicht','kein','eine','einen','der','die','das',
-            'mit','auf','für','von','ist','sind','war','wie','was','wir','ihr','sie','er','es',
-            'mein','meine','meinen','bitte','danke',
-        ];
-        $parts = array_values(array_filter($parts, fn ($p) => !in_array($p, $stop, true)));
-
-        // Synonyme / Normalisierung
+        // Synonyme / Normalisierung (vor Stopwords, damit stopwords/phrase konsistent sind)
         $map = [
             'queue' => 'warteschlange',
             'queu' => 'warteschlange',
@@ -119,8 +118,44 @@ final class SupportSolutionRepository extends ServiceEntityRepository
             'windows10' => 'windows',
             'wlan' => 'wlan',
         ];
-        $parts = array_map(fn ($p) => $map[$p] ?? $p, $parts);
+        $parts = array_map(static fn ($p) => $map[$p] ?? $p, $parts);
 
-        return array_values(array_unique($parts));
+        // Stopwords
+        $stop = [
+            'und','oder','aber','dass','ich','nicht','kein','eine','einen','der','die','das',
+            'mit','auf','für','von','ist','sind','war','wie','was','wir','ihr','sie','er','es',
+            'mein','meine','meinen','bitte','danke',
+            // oft in Chat-Texten drin, bringt fürs Matching nix:
+            'habe','hab','hast','haben','hat','hatte',
+        ];
+
+        // 1) Unigrams (Einzelwörter), Mindestlänge 3, keine Stopwords
+        $unigrams = array_values(array_filter($parts, static function ($p) use ($stop) {
+            if (mb_strlen($p) < 3) {
+                return false;
+            }
+            return !in_array($p, $stop, true);
+        }));
+
+        // 2) Phrasen bilden aus den gefilterten Unigrams (damit "falscher drucker" entsteht)
+        $phrases = [];
+
+        // Bigrams
+        for ($i = 0; $i < count($unigrams) - 1; $i++) {
+            $phrases[] = $unigrams[$i] . ' ' . $unigrams[$i + 1];
+        }
+
+        // Trigrams (optional, aber hilfreich)
+        for ($i = 0; $i < count($unigrams) - 2; $i++) {
+            $phrases[] = $unigrams[$i] . ' ' . $unigrams[$i + 1] . ' ' . $unigrams[$i + 2];
+        }
+
+        // Gesamtmenge
+        $tokens = array_merge($unigrams, $phrases);
+
+        // Duplikate raus
+        $tokens = array_values(array_unique($tokens));
+
+        return $tokens;
     }
 }

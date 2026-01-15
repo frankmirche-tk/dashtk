@@ -29,7 +29,17 @@ final class SupportChatService
      *   matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,
      *   modeHint:string,
      *   tts?:string,
-     *   mediaUrl?:string
+     *   mediaUrl?:string,
+     *   steps?:array<int,array{
+     *     id:string|int|null,
+     *     stepNo:int,
+     *     instruction:string,
+     *     expectedResult?:string|null,
+     *     nextIfFailed?:string|null,
+     *     mediaPath?:string|null,
+     *     mediaUrl?:string|null,
+     *     mediaMimeType?:string|null
+     *   }>
      * }
      */
     public function ask(string $sessionId, string $message, ?int $dbOnlySolutionId = null): array
@@ -43,10 +53,18 @@ final class SupportChatService
 
         // 1) DB-only Mode: Nur Steps aus DB
         if ($dbOnlySolutionId !== null) {
-            return $this->answerDbOnly($sessionId, $dbOnlySolutionId);
+            $result = $this->answerDbOnly($sessionId, $dbOnlySolutionId);
+
+            $this->supportSolutionLogger->info('db_only_response', [
+                'sessionId'  => $sessionId,
+                'solutionId' => $dbOnlySolutionId,
+                'stepsCount' => isset($result['steps']) && is_array($result['steps']) ? count($result['steps']) : null,
+            ]);
+
+            return $result;
         }
 
-        // 2) Normal: Matchen + KI Antwort (OHNE Avatar-Felder!)
+        // 2) Normal: Matchen + KI Antwort
         $matches = $this->findMatches($message);
 
         $history = $this->loadHistory($sessionId);
@@ -64,6 +82,15 @@ final class SupportChatService
         $history[] = ['role' => 'user', 'content' => $message];
 
         $kbContext = $this->buildKbContext($matches);
+
+        // Logging wie früher
+        $this->supportSolutionLogger->info('chat_request', [
+            'sessionId'       => $sessionId,
+            'message'         => $message,
+            'matchCount'      => count($matches),
+            'matchIds'        => array_map(static fn($m) => $m['id'] ?? null, $matches),
+            'kbContextChars'  => strlen($kbContext),
+        ]);
 
         $builder = $this->chatHandler->createRequest();
 
@@ -84,7 +111,22 @@ final class SupportChatService
             $builder->addSystemMessage($kbContext);
         }
 
-        $response = $builder->execute();
+        try {
+            $response = $builder->execute();
+        } catch (\Throwable $e) {
+            $this->supportSolutionLogger->error('chat_execute_failed', [
+                'sessionId' => $sessionId,
+                'message'   => $message,
+                'error'     => $e->getMessage(),
+                'class'     => $e::class,
+            ]);
+
+            return [
+                'answer' => 'Fehler beim Erzeugen der Antwort. Bitte Logs prüfen.',
+                'matches' => $matches,
+                'modeHint' => 'ai_with_db',
+            ];
+        }
 
         $respMsg = $response->getMessage();
         $answer = (is_object($respMsg) && property_exists($respMsg, 'content'))
@@ -94,6 +136,11 @@ final class SupportChatService
         $history[] = ['role' => 'assistant', 'content' => $answer];
         $this->saveHistory($sessionId, $history);
 
+        $this->supportSolutionLogger->info('chat_response', [
+            'sessionId'   => $sessionId,
+            'answerChars' => strlen($answer),
+        ]);
+
         return [
             'answer' => $answer,
             'matches' => $matches,
@@ -102,8 +149,6 @@ final class SupportChatService
     }
 
     /**
-     * DB-only Antwort + Avatar-Vorschlag (tts/mediaUrl)
-     *
      * @return array{
      *   answer:string,
      *   matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,
@@ -111,7 +156,7 @@ final class SupportChatService
      *   tts:string,
      *   mediaUrl:string,
      *   steps:array<int,array{
-     *     id:string|null,
+     *     id:string|int|null,
      *     stepNo:int,
      *     instruction:string,
      *     expectedResult?:string|null,
@@ -137,11 +182,9 @@ final class SupportChatService
             ];
         }
 
-        // Doctrine Collection -> Array + sort by stepNo
         $stepsEntities = $solution->getSteps()->toArray();
         usort($stepsEntities, static fn($a, $b) => $a->getStepNo() <=> $b->getStepNo());
 
-        // ✅ 1) steps payload für Frontend (mit mediaUrl)
         $stepsPayload = [];
         foreach ($stepsEntities as $st) {
             $stepsPayload[] = [
@@ -150,15 +193,12 @@ final class SupportChatService
                 'instruction' => (string) $st->getInstruction(),
                 'expectedResult' => $st->getExpectedResult(),
                 'nextIfFailed' => $st->getNextIfFailed(),
-
-                // Media (optional)
                 'mediaPath' => $st->getMediaPath(),
                 'mediaUrl' => method_exists($st, 'getMediaUrl') ? $st->getMediaUrl() : null,
                 'mediaMimeType' => $st->getMediaMimeType(),
             ];
         }
 
-        // ✅ 2) answer Text (wie bisher)
         $lines = [];
         $lines[] = "SOP: {$solution->getTitle()}";
         if ($solution->getSymptoms()) {
@@ -176,28 +216,21 @@ final class SupportChatService
 
         return [
             'answer' => implode("\n", $lines),
-
-            // ✅ damit die SOP-Box NICHT doppelt erscheint
             'matches' => [],
-
             'modeHint' => 'db_only',
-
-            // ✅ Avatar nur im DB-only Mode anbieten (kannst du später komplett entfernen)
             'tts' => 'Hallo, ich zeige dir jetzt wie du die Aufträge löschst.',
             'mediaUrl' => '/guides/print/step1.gif',
-
-            // ✅ DAS ist der entscheidende Fix
             'steps' => $stepsPayload,
         ];
     }
-
 
     /**
      * @return array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>
      */
     private function findMatches(string $message): array
     {
-        if (trim($message) === '') {
+        $message = trim($message);
+        if ($message === '') {
             return [];
         }
 
@@ -211,6 +244,12 @@ final class SupportChatService
             }
             $mapped[] = $this->mapMatch($s, (int) ($m['score'] ?? 0));
         }
+
+        // Debug Logging wie früher
+        $this->supportSolutionLogger->debug('db_matches', [
+            'message' => $message,
+            'matches' => $mapped,
+        ]);
 
         return $mapped;
     }

@@ -65,3 +65,9 @@ when@prod:
                 channels: [deprecation]
                 path: php://stderr
                 formatter: monolog.formatter.json
+
+            support_solution:
+                type: stream
+                path: "%kernel.logs_dir%/support_solution.%kernel.environment%.log"
+                level: info
+                channels: [ "support_solution" ]
