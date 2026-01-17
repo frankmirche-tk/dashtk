@@ -27,11 +27,21 @@ final class ChatController extends AbstractController
         $dbOnly = $payload['dbOnlySolutionId'] ?? null;
         $dbOnlySolutionId = is_numeric($dbOnly) ? (int)$dbOnly : null;
 
+        $provider = (string)($payload['provider'] ?? 'gemini');
+        $model = isset($payload['model']) && is_string($payload['model']) ? $payload['model'] : null;
+
         $result = $this->chatService->ask(
-            $sessionId,
-            $message,
-            $dbOnlySolutionId
+            sessionId: $sessionId,
+            message: $message,
+            dbOnlySolutionId: $dbOnlySolutionId,
+            provider: $provider,
+            model: $model
         );
+
+        $result['provider'] = $provider;
+        if ($model !== null) {
+            $result['model'] = $model;
+        }
 
         return new JsonResponse($result);
     }

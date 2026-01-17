@@ -13,11 +13,12 @@ use Symfony\Contracts\Cache\ItemInterface;
 
 final class SupportChatService
 {
-    private const SESSION_TTL_SECONDS = 60 * 60; // 1h
+    private const SESSION_TTL_SECONDS = 3600; // 1h
     private const MAX_HISTORY_MESSAGES = 18;
 
     public function __construct(
-        private readonly AIChatRequestHandlerInterface $chatHandler,
+        private readonly AIChatRequestHandlerInterface $chatHandler, // Gemini/Modelflow
+        private readonly OpenAiChatService $openAiChat,              // OpenAI
         private readonly SupportSolutionRepository $solutions,
         private readonly CacheInterface $cache,
         private readonly LoggerInterface $supportSolutionLogger,
@@ -42,16 +43,22 @@ final class SupportChatService
      *   }>
      * }
      */
-    public function ask(string $sessionId, string $message, ?int $dbOnlySolutionId = null): array
-    {
+    public function ask(
+        string $sessionId,
+        string $message,
+        ?int $dbOnlySolutionId = null,
+        string $provider = 'gemini',
+        ?string $model = null
+    ): array {
         $sessionId = trim($sessionId);
         $message   = trim($message);
+        $provider  = strtolower(trim($provider));
 
         if ($sessionId === '') {
             $sessionId = $this->newSessionIdFallback();
         }
 
-        // 1) DB-only Mode: Nur Steps aus DB
+        // 1) DB-only Mode
         if ($dbOnlySolutionId !== null) {
             $result = $this->answerDbOnly($sessionId, $dbOnlySolutionId);
 
@@ -80,45 +87,63 @@ final class SupportChatService
         }
 
         $history[] = ['role' => 'user', 'content' => $message];
-
         $kbContext = $this->buildKbContext($matches);
 
-        // Logging wie früher
         $this->supportSolutionLogger->info('chat_request', [
-            'sessionId'       => $sessionId,
-            'message'         => $message,
-            'matchCount'      => count($matches),
-            'matchIds'        => array_map(static fn($m) => $m['id'] ?? null, $matches),
-            'kbContextChars'  => strlen($kbContext),
+            'sessionId'      => $sessionId,
+            'message'        => $message,
+            'matchCount'     => count($matches),
+            'matchIds'       => array_map(static fn($m) => $m['id'] ?? null, $matches),
+            'kbContextChars' => strlen($kbContext),
+            'provider'       => $provider,
+            'model'          => $model,
         ]);
 
-        $builder = $this->chatHandler->createRequest();
-
-        foreach ($this->trimHistory($history) as $msg) {
-            $role = $msg['role'] ?? 'user';
-            $content = (string) ($msg['content'] ?? '');
-
-            if ($role === 'system') {
-                $builder->addSystemMessage($content);
-            } elseif ($role === 'assistant') {
-                $builder->addAssistantMessage($content);
-            } else {
-                $builder->addUserMessage($content);
-            }
-        }
-
-        if ($kbContext !== '') {
-            $builder->addSystemMessage($kbContext);
-        }
-
         try {
-            $response = $builder->execute();
+            if ($provider === 'openai') {
+                // ✅ OpenAI Pfad
+                $answer = $this->openAiChat->chat(
+                    history: $this->trimHistory($history),
+                    kbContext: $kbContext,
+                    model: $model
+                );
+            } else {
+                // ✅ Gemini/Modelflow Pfad
+                $builder = $this->chatHandler->createRequest();
+
+                foreach ($this->trimHistory($history) as $msg) {
+                    $role = $msg['role'] ?? 'user';
+                    $content = (string)($msg['content'] ?? '');
+
+                    if ($role === 'system') {
+                        $builder->addSystemMessage($content);
+                    } elseif ($role === 'assistant') {
+                        $builder->addAssistantMessage($content);
+                    } else {
+                        $builder->addUserMessage($content);
+                    }
+                }
+
+                if ($kbContext !== '') {
+                    $builder->addSystemMessage($kbContext);
+                }
+
+                // execute()
+                $response = $builder->execute();
+
+                $respMsg = $response->getMessage();
+                $answer = (is_object($respMsg) && property_exists($respMsg, 'content'))
+                    ? trim((string)$respMsg->content)
+                    : '[unlesbare Antwort]';
+            }
         } catch (\Throwable $e) {
             $this->supportSolutionLogger->error('chat_execute_failed', [
                 'sessionId' => $sessionId,
                 'message'   => $message,
                 'error'     => $e->getMessage(),
                 'class'     => $e::class,
+                'provider'  => $provider,
+                'model'     => $model,
             ]);
 
             return [
@@ -128,17 +153,14 @@ final class SupportChatService
             ];
         }
 
-        $respMsg = $response->getMessage();
-        $answer = (is_object($respMsg) && property_exists($respMsg, 'content'))
-            ? trim((string) $respMsg->content)
-            : '[unlesbare Antwort]';
-
         $history[] = ['role' => 'assistant', 'content' => $answer];
         $this->saveHistory($sessionId, $history);
 
         $this->supportSolutionLogger->info('chat_response', [
             'sessionId'   => $sessionId,
             'answerChars' => strlen($answer),
+            'provider'    => $provider,
+            'model'       => $model,
         ]);
 
         return [
@@ -189,8 +211,8 @@ final class SupportChatService
         foreach ($stepsEntities as $st) {
             $stepsPayload[] = [
                 'id' => $st->getId(),
-                'stepNo' => (int) $st->getStepNo(),
-                'instruction' => (string) $st->getInstruction(),
+                'stepNo' => (int)$st->getStepNo(),
+                'instruction' => (string)$st->getInstruction(),
                 'expectedResult' => $st->getExpectedResult(),
                 'nextIfFailed' => $st->getNextIfFailed(),
                 'mediaPath' => $st->getMediaPath(),
@@ -242,10 +264,9 @@ final class SupportChatService
             if (!$s instanceof SupportSolution) {
                 continue;
             }
-            $mapped[] = $this->mapMatch($s, (int) ($m['score'] ?? 0));
+            $mapped[] = $this->mapMatch($s, (int)($m['score'] ?? 0));
         }
 
-        // Debug Logging wie früher
         $this->supportSolutionLogger->debug('db_matches', [
             'message' => $message,
             'matches' => $mapped,
@@ -259,13 +280,13 @@ final class SupportChatService
      */
     private function mapMatch(SupportSolution $solution, int $score): array
     {
-        $id = (int) $solution->getId();
+        $id = (int)$solution->getId();
         $iri = '/api/support_solutions/' . $id;
         $stepsUrl = '/api/support_solution_steps?solution=' . rawurlencode($iri);
 
         return [
             'id' => $id,
-            'title' => (string) $solution->getTitle(),
+            'title' => (string)$solution->getTitle(),
             'score' => $score,
             'url' => $iri,
             'stepsUrl' => $stepsUrl,
@@ -341,7 +362,7 @@ final class SupportChatService
             $rest = array_slice($history, 1);
         }
 
-        $rest = array_slice($rest, - (self::MAX_HISTORY_MESSAGES - count($system)));
+        $rest = array_slice($rest, -(self::MAX_HISTORY_MESSAGES - count($system)));
 
         return array_merge($system, $rest);
     }

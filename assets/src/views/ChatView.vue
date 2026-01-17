@@ -4,6 +4,11 @@
             <h1>Dashboard Support Chat</h1>
 
             <div class="actions">
+                <select v-model="provider" class="select" @change="onProviderChange">
+                    <option value="gemini">Gemini (Standard)</option>
+                    <option value="openai">OpenAI</option>
+                </select>
+
                 <router-link class="btn" to="/kb/new">Neues Thema</router-link>
                 <router-link class="btn" to="/kb">Wissen bearbeiten</router-link>
                 <button class="btn" @click="newChat">Neuer Chat</button>
@@ -53,19 +58,49 @@ import AvatarGuide from '@/views/AvatarGuide.vue'
 import ChatMessages from '@/components/chat/ChatMessages.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 
+/**
+ * UI State
+ */
 const input = ref('')
 const sending = ref(false)
+const provider = ref('gemini') // 'gemini' | 'openai'
+
+// falls du später Model-Auswahl ergänzt:
+const model = ref(null) // optional string (z.B. 'gpt-4o-mini'), bleibt sonst null
 
 const sessionId = ref(sessionStorage.getItem('sessionId') || uuid())
 sessionStorage.setItem('sessionId', sessionId.value)
 
-const messages = ref([{ role: 'system', content: 'Willkommen. Beschreibe dein Problem.' }])
+/**
+ * System Message helper
+ */
+function providerLabel(p) {
+    if (p === 'openai') return 'OpenAI'
+    if (p === 'gemini') return 'Gemini'
+    return String(p || '')
+}
+function providerModelLabel(p, m) {
+    return m ? `${providerLabel(p)} (${m})` : providerLabel(p)
+}
+function systemText() {
+    return `Willkommen. Aktiver KI-Provider: ${providerModelLabel(provider.value, model.value)}`
+}
 
+const messages = ref([
+    { role: 'system', content: systemText() }
+])
+
+/**
+ * Role labels (für ChatMessages)
+ */
 const ROLE_LABELS = { assistant: 'KI Antwort', system: 'System', user: 'Du' }
 function roleLabel(role) {
     return ROLE_LABELS[role] ?? role
 }
 
+/**
+ * Avatar / Attention
+ */
 const avatarOfferEnabled = true
 const avatarEnabled = ref(false)
 const pendingGuide = ref(null)
@@ -81,7 +116,6 @@ function declineAvatar() {
     pendingGuide.value = null
 }
 
-// Input Attention (Hint + Pulse)
 const inputAttentionEnabled = ref(true)
 const attentionKey = ref(0)
 
@@ -100,35 +134,91 @@ function mapSteps(raw) {
     }))
 }
 
+/**
+ * Provider change: System-Message aktualisieren
+ */
+function onProviderChange() {
+    // optional: model zurücksetzen, wenn Provider wechselt
+    model.value = null
+
+    // System Message in-place updaten (erste Nachricht)
+    if (messages.value.length > 0 && messages.value[0].role === 'system') {
+        messages.value[0].content = systemText()
+    } else {
+        messages.value.unshift({ role: 'system', content: systemText() })
+    }
+}
+
+/**
+ * Send
+ */
 async function send(textFromComposer) {
     const text = String(textFromComposer ?? input.value).trim()
+    if (!text) return
 
-    // Beim normalen Chatten: Avatar/Offer reset
+    // Avatar reset
     pendingGuide.value = null
     avatarEnabled.value = false
-
-    if (!text) return
 
     messages.value.push({ role: 'user', content: text })
     input.value = ''
     sending.value = true
 
     try {
-        const { data } = await axios.post('/api/chat', { sessionId: sessionId.value, message: text })
+        const { data } = await axios.post('/api/chat', {
+            sessionId: sessionId.value,
+            message: text,
+            provider: provider.value,
+            model: model.value, // null ok
+        })
+
+        // Backend kann provider/model zurückgeben (du setzt es im ChatController)
+        const p = data.provider ?? provider.value
+        const m = data.model ?? model.value
+
+        // UI State aktualisieren (falls Backend was zurückgibt)
+        provider.value = p
+        model.value = m ?? null
+
+        // System-Message aktualisieren (zeigt den aktiven Provider)
+        if (messages.value.length > 0 && messages.value[0].role === 'system') {
+            messages.value[0].content = systemText()
+        }
+
+        // Assistant Message (mit Provider-Sichtbarkeit)
+        const prefix = `(${providerModelLabel(p, m)}) `
         messages.value.push({
             role: 'assistant',
-            content: data.answer ?? '[leer]',
+            content: prefix + (data.answer ?? '[leer]'),
             matches: data.matches ?? [],
             steps: mapSteps(data.steps),
+            provider: p,
+            model: m ?? null,
         })
     } catch (e) {
-        console.error(e)
-        messages.value.push({ role: 'assistant', content: 'Fehler beim Senden. Siehe Console/Logs.' })
+        console.error('chat error:', e)
+        console.error('status:', e?.response?.status)
+        console.error('server data:', e?.response?.data)
+
+        const serverMsg =
+            (typeof e?.response?.data === 'string' && e.response.data) ||
+            e?.response?.data?.detail ||
+            e?.response?.data?.message ||
+            e?.response?.data?.error ||
+            null
+
+        messages.value.push({
+            role: 'assistant',
+            content: serverMsg ? `Serverfehler: ${serverMsg}` : 'Fehler beim Senden. Bitte dev.log prüfen.',
+        })
     } finally {
         sending.value = false
     }
 }
 
+/**
+ * DB-only Steps (bleibt provider-unabhängig)
+ */
 async function useDbStepsOnly(solutionId) {
     sending.value = true
     try {
@@ -136,38 +226,56 @@ async function useDbStepsOnly(solutionId) {
             sessionId: sessionId.value,
             message: '',
             dbOnlySolutionId: solutionId,
+            provider: provider.value,
+            model: model.value,
         })
 
+        const p = data.provider ?? provider.value
+        const m = data.model ?? model.value
+
+        provider.value = p
+        model.value = m ?? null
+
+        if (messages.value.length > 0 && messages.value[0].role === 'system') {
+            messages.value[0].content = systemText()
+        }
+
+        const prefix = `(${providerModelLabel(p, m)}) `
         messages.value.push({
             role: 'assistant',
-            content: data.answer ?? '[leer]',
+            content: prefix + (data.answer ?? '[leer]'),
             matches: data.matches ?? [],
             steps: mapSteps(data.steps),
+            provider: p,
+            model: m ?? null,
         })
 
-        // ✅ NUR jetzt: Opt-In vorbereiten (einmal!)
-        pendingGuide.value = {
-            tts: data.tts ?? 'Soll ich dir das als Avatar-Demo zeigen?',
-            mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
+        // Optional Avatar offer setup (falls du es nutzt)
+        if (data.tts || data.mediaUrl) {
+            pendingGuide.value = {
+                tts: data.tts ?? 'Soll ich dir das als Avatar-Demo zeigen?',
+                mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
+            }
+            avatarEnabled.value = false
         }
-        avatarEnabled.value = false
     } finally {
         sending.value = false
     }
 }
 
+/**
+ * New chat
+ */
 function newChat() {
     sessionId.value = uuid()
     sessionStorage.setItem('sessionId', sessionId.value)
 
-    messages.value = [{ role: 'system', content: 'Neuer Chat gestartet. Beschreibe dein Problem.' }]
+    messages.value = [{ role: 'system', content: systemText() }]
     input.value = ''
 
-    // ✅ Avatar/Offer komplett reset
     avatarEnabled.value = false
     pendingGuide.value = null
 
-    // ✅ Hint + Pulse wieder anwerfen
     inputAttentionEnabled.value = true
     attentionKey.value += 1
 }
@@ -176,16 +284,23 @@ function onNextStep() {
     messages.value.push({
         role: 'assistant',
         content: 'Alles klar. Schritt 2 folgt (Demo).',
-        matches: []
+        matches: [],
     })
 }
 </script>
 
-
 <style scoped>
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }
 .header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
-.actions { display:flex; gap:8px; }
+.actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+
+.select{
+    border: 1px solid #bbb;
+    border-radius: 999px;
+    padding: 10px 12px;
+    background: #fff;
+}
+
 .btn{
     appearance: none;
     border: 1px solid #111;
@@ -212,7 +327,6 @@ function onNextStep() {
     background: rgba(0,0,0,.03);
 }
 
-/* Avatar Offer Box etwas "cardiger" */
 .avatar-offer{
     margin: 14px 0;
     border: 1px solid #ddd;
@@ -225,12 +339,6 @@ function onNextStep() {
     gap:12px;
     box-shadow: 0 1px 0 rgba(0,0,0,.03);
 }
-.avatar-offer-title{
-    font-weight: 750;
-}
-.avatar-offer-actions{
-    display:flex;
-    gap:10px;
-}
-
+.avatar-offer-title{ font-weight: 750; }
+.avatar-offer-actions{ display:flex; gap:10px; }
 </style>

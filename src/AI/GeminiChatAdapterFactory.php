@@ -14,13 +14,11 @@ final readonly class GeminiChatAdapterFactory implements AIChatAdapterFactoryInt
     public function __construct(
         private ClientContract $client,
         private string $defaultModel,
-    ) {
-    }
+    ) {}
 
     public function createChatAdapter(array $options): AIChatAdapterInterface
     {
         $model = $options['model'] ?? $this->defaultModel;
-
         return new GoogleGeminiChatAdapter($this->client, $model);
     }
 }

@@ -1,6 +1,5 @@
-# yaml-language-server: $schema=../vendor/symfony/dependency-injection/Loader/schema/services.schema.json
-
 parameters:
+    app.openai.default_model: 'gpt-4o-mini'
 
 services:
     _defaults:
@@ -10,7 +9,7 @@ services:
     App\:
         resource: '../src/'
 
-
+    # Gemini (wie bisher)
     modelflow.gemini_client_factory:
         class: ModelflowAi\GoogleGeminiAdapter\ClientFactory
         factory: ['ModelflowAi\GoogleGeminiAdapter\ClientFactory', 'create']
@@ -19,6 +18,18 @@ services:
 
     Gemini\Contracts\ClientContract:
         factory: ['@modelflow.gemini_client_factory', 'make']
+
+    # ✅ OpenAI Client
+    OpenAI\Client:
+        factory: ['OpenAI', 'client']
+        arguments:
+            - '%env(string:OPENAI_API_KEY)%'
+
+    # ✅ OpenAI Chat Service bekommt API Key injected (KEIN getenv)
+    App\Service\OpenAiChatService:
+        arguments:
+            $apiKey: '%env(string:OPENAI_API_KEY)%'
+            $defaultModel: '%app.openai.default_model%'
 
     App\Service\SupportChatService:
         arguments:
