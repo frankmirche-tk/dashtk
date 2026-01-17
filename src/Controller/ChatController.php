@@ -30,12 +30,19 @@ final class ChatController extends AbstractController
         $provider = (string)($payload['provider'] ?? 'gemini');
         $model = isset($payload['model']) && is_string($payload['model']) ? $payload['model'] : null;
 
+        // ✅ NEW: context auslesen (muss Array sein)
+        $context = [];
+        if (isset($payload['context']) && is_array($payload['context'])) {
+            $context = $payload['context'];
+        }
+
         $result = $this->chatService->ask(
             sessionId: $sessionId,
             message: $message,
             dbOnlySolutionId: $dbOnlySolutionId,
             provider: $provider,
-            model: $model
+            model: $model,
+            context: $context, // ✅ NEW
         );
 
         $result['provider'] = $provider;

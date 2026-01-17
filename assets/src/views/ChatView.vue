@@ -19,6 +19,7 @@
             :messages="messages"
             :roleLabel="roleLabel"
             @db-only="useDbStepsOnly"
+            @contact-selected="onContactSelected"
         >
             <template #avatar>
                 <div v-if="avatarOfferEnabled && pendingGuide && !avatarEnabled" class="avatar-offer">
@@ -64,9 +65,7 @@ import ChatComposer from '@/components/chat/ChatComposer.vue'
 const input = ref('')
 const sending = ref(false)
 const provider = ref('gemini') // 'gemini' | 'openai'
-
-// falls du später Model-Auswahl ergänzt:
-const model = ref(null) // optional string (z.B. 'gpt-4o-mini'), bleibt sonst null
+const model = ref(null)        // optional model string
 
 const sessionId = ref(sessionStorage.getItem('sessionId') || uuid())
 sessionStorage.setItem('sessionId', sessionId.value)
@@ -86,12 +85,10 @@ function systemText() {
     return `Willkommen. Aktiver KI-Provider: ${providerModelLabel(provider.value, model.value)}`
 }
 
-const messages = ref([
-    { role: 'system', content: systemText() }
-])
+const messages = ref([{ role: 'system', content: systemText() }])
 
 /**
- * Role labels (für ChatMessages)
+ * Role labels
  */
 const ROLE_LABELS = { assistant: 'KI Antwort', system: 'System', user: 'Du' }
 function roleLabel(role) {
@@ -119,6 +116,22 @@ function declineAvatar() {
 const inputAttentionEnabled = ref(true)
 const attentionKey = ref(0)
 
+/**
+ * Provider change: System-Message aktualisieren
+ */
+function onProviderChange() {
+    model.value = null
+
+    if (messages.value.length > 0 && messages.value[0].role === 'system') {
+        messages.value[0].content = systemText()
+    } else {
+        messages.value.unshift({ role: 'system', content: systemText() })
+    }
+}
+
+/**
+ * Steps mapping (dein bestehendes Schema)
+ */
 function mapSteps(raw) {
     if (!Array.isArray(raw)) return []
     return raw.map(s => ({
@@ -135,28 +148,28 @@ function mapSteps(raw) {
 }
 
 /**
- * Provider change: System-Message aktualisieren
+ * CONTACT: Auswahl aus Mehrtreffern (kommt aus ChatMessages)
+ * -> Wir zeigen danach sofort eine strukturierte Contact-Card im Chat (ohne KI).
  */
-function onProviderChange() {
-    // optional: model zurücksetzen, wenn Provider wechselt
-    model.value = null
-
-    // System Message in-place updaten (erste Nachricht)
-    if (messages.value.length > 0 && messages.value[0].role === 'system') {
-        messages.value[0].content = systemText()
-    } else {
-        messages.value.unshift({ role: 'system', content: systemText() })
-    }
+function onContactSelected(payload) {
+    const type = payload?.type ?? null
+    const match = payload?.match ?? null
+    if (!match) return
+    pushContactCardMessage(type, match)
 }
 
 /**
- * Send
+ * Send: Kontakt/Filiale hat Vorrang vor KI
+ * 1) User-Message immer anzeigen
+ * 2) Resolve versuchen
+ *    - 1 Treffer + hohe Confidence => Contact-Card, KEIN /api/chat
+ *    - >1 Treffer => Auswahl-Message, KEIN /api/chat
+ *    - 0 Treffer => normal /api/chat
  */
 async function send(textFromComposer) {
     const text = String(textFromComposer ?? input.value).trim()
     if (!text) return
 
-    // Avatar reset
     pendingGuide.value = null
     avatarEnabled.value = false
 
@@ -165,27 +178,47 @@ async function send(textFromComposer) {
     sending.value = true
 
     try {
+        // 1) IMMER zuerst Kontakt auflösen
+        const { data: c } = await axios.post('/api/contact/resolve', { query: text })
+
+        if (c?.type && c.type !== 'none' && Array.isArray(c.matches) && c.matches.length > 0) {
+            // Optional: kleine Info-Zeile statt KI
+            // messages.value.push({ role: 'info', content: 'Kontakt gefunden:' })
+
+            // 2) Alle Treffer als Cards ausgeben
+            for (const hit of c.matches) {
+                messages.value.push({
+                    role: 'info',
+                    content: '',
+                    contactCard: {
+                        type: c.type,     // 'branch' | 'person'
+                        data: hit.data,   // dein JSON payload
+                    }
+                })
+            }
+
+            // WICHTIG: hier abbrechen, KEIN /api/chat!
+            return
+        }
+
+        // 3) Kein Kontakt -> normaler Chat (KI / SOP)
         const { data } = await axios.post('/api/chat', {
             sessionId: sessionId.value,
             message: text,
             provider: provider.value,
-            model: model.value, // null ok
+            model: model.value,
         })
 
-        // Backend kann provider/model zurückgeben (du setzt es im ChatController)
         const p = data.provider ?? provider.value
         const m = data.model ?? model.value
 
-        // UI State aktualisieren (falls Backend was zurückgibt)
         provider.value = p
         model.value = m ?? null
 
-        // System-Message aktualisieren (zeigt den aktiven Provider)
         if (messages.value.length > 0 && messages.value[0].role === 'system') {
             messages.value[0].content = systemText()
         }
 
-        // Assistant Message (mit Provider-Sichtbarkeit)
         const prefix = `(${providerModelLabel(p, m)}) `
         messages.value.push({
             role: 'assistant',
@@ -197,9 +230,6 @@ async function send(textFromComposer) {
         })
     } catch (e) {
         console.error('chat error:', e)
-        console.error('status:', e?.response?.status)
-        console.error('server data:', e?.response?.data)
-
         const serverMsg =
             (typeof e?.response?.data === 'string' && e.response.data) ||
             e?.response?.data?.detail ||
@@ -217,7 +247,128 @@ async function send(textFromComposer) {
 }
 
 /**
- * DB-only Steps (bleibt provider-unabhängig)
+ * Resolver-Gate: erkennt Filialcode/Person und rendert strukturierte Chat-Einträge
+ * @returns {Promise<boolean>} handled? (true => kein /api/chat mehr)
+ */
+async function tryResolveContactAndRender(text) {
+    // optional: nur bei kurzen Eingaben, damit nicht jeder Satz resolve triggert
+    const tokenCount = String(text).trim().split(/\s+/).filter(Boolean).length
+    if (tokenCount > 2) return false
+
+    try {
+        const { data } = await axios.post('/api/contact/resolve', {
+            query: text,
+            limit: 5,
+        })
+
+        const matches = Array.isArray(data?.matches) ? data.matches : []
+        const type = data?.type ?? null
+
+        if (matches.length === 0) return false
+
+        // 1 Treffer -> wenn sehr sicher, sofort Contact-Card (ohne KI)
+        if (matches.length === 1) {
+            const m = matches[0]
+            const conf = Number(m?.confidence ?? 0)
+
+            // Filialcodes sollten praktisch immer sehr sicher sein; default: 0.95
+            if (conf >= 0.95) {
+                pushContactCardMessage(type, m)
+                return true
+            }
+
+            // bei niedriger confidence lieber nicht “hart” routen
+            return false
+        }
+
+        // Mehrtreffer -> alle Treffer als Kontaktkarten anzeigen (ohne Auswahl)
+        messages.value.push({
+            role: 'info',
+            content: `Mehrere Treffer für "${text}":`,
+        })
+
+        for (const m of matches) {
+            pushContactCardMessage(type, m)
+        }
+
+        return true
+    } catch (e) {
+        console.error('resolve error:', e)
+        return false
+    }
+}
+
+function pushContactCardMessage(type, match) {
+    const data = match?.data ?? {}
+
+    messages.value.push({
+        role: 'info',
+        content: '',
+        contactCard: { type, data },
+    })
+
+}
+
+function pushContactDisambiguationMessage(type, matches, originalQuery) {
+    messages.value.push({
+        role: 'info',
+        content: `Mehrere Treffer für "${originalQuery}". Bitte auswählen:`,
+        contactChoices: { type, matches },
+    })
+}
+
+
+/**
+ * Text-Fallback (wird angezeigt, selbst wenn du später eine “echte Card” renderst)
+ */
+function formatContactText(type, data) {
+    if (type === 'branch') {
+        const filialenNr = data.filialenNr ?? ''
+        const anschrift  = data.anschrift ?? ''
+        const strasse    = data.strasse ?? ''
+        const plz        = data.plz ?? ''
+        const ort        = data.ort ?? ''
+        const telefon    = data.telefon ?? ''
+        const email      = data.email ?? ''
+        const zusatz     = data.zusatz ?? ''
+        const gln        = data.gln ?? ''
+        const ecTerminalId = data.ecTerminalId ?? ''
+
+        const addressLine = [strasse, [plz, ort].filter(Boolean).join(' ')].filter(Boolean).join(', ')
+
+        return [
+            `Filiale: ${filialenNr}${anschrift ? ' – ' + anschrift : ''}`,
+            addressLine ? `Adresse: ${addressLine}${zusatz ? ' (' + zusatz + ')' : ''}` : null,
+            telefon ? `Telefon: ${telefon}` : null,
+            email ? `E-Mail: ${email}` : null,
+            gln ? `GLN: ${gln}` : null,
+            ecTerminalId ? `EC-Terminal: ${ecTerminalId}` : null,
+        ].filter(Boolean).join('\n')
+    }
+
+    if (type === 'person') {
+        // bleibt wie bisher
+        const first = data.first_name ?? ''
+        const last = data.last_name ?? ''
+        const dept = data.department ?? ''
+        const loc = data.location ?? ''
+        const phone = data.phone ?? ''
+        const email = data.email ?? ''
+
+        return [
+            `Kontakt: ${first} ${last}`,
+            (dept || loc) ? `Bereich: ${dept}${dept && loc ? ' – ' : ''}${loc}` : null,
+            phone ? `Telefon: ${phone}` : null,
+            email ? `E-Mail: ${email}` : null,
+        ].filter(Boolean).join('\n')
+    }
+
+    return 'Kontakt gefunden.'
+}
+
+
+/**
+ * DB-only Steps (unverändert, nur minimal robust)
  */
 async function useDbStepsOnly(solutionId) {
     sending.value = true
@@ -250,7 +401,6 @@ async function useDbStepsOnly(solutionId) {
             model: m ?? null,
         })
 
-        // Optional Avatar offer setup (falls du es nutzt)
         if (data.tts || data.mediaUrl) {
             pendingGuide.value = {
                 tts: data.tts ?? 'Soll ich dir das als Avatar-Demo zeigen?',
@@ -288,6 +438,7 @@ function onNextStep() {
     })
 }
 </script>
+
 
 <style scoped>
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }

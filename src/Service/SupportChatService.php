@@ -48,7 +48,8 @@ final class SupportChatService
         string $message,
         ?int $dbOnlySolutionId = null,
         string $provider = 'gemini',
-        ?string $model = null
+        ?string $model = null,
+        array $context = [] // ✅ NEU
     ): array {
         $sessionId = trim($sessionId);
         $message   = trim($message);

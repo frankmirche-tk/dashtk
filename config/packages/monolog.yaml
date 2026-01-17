@@ -2,6 +2,7 @@ monolog:
     channels:
         - deprecation
         - support_solution
+        - contact_lookup
 
 when@dev:
     monolog:
@@ -22,6 +23,12 @@ when@dev:
                 path: "%kernel.logs_dir%/support_solution.%kernel.environment%.log"
                 level: debug
                 channels: ["support_solution"]
+
+            contact_lookup:
+                type: stream
+                path: "%kernel.logs_dir%/contact_lookup.%kernel.environment%.log"
+                level: debug
+                channels: [ "contact_lookup" ]
 
 when@test:
     monolog:
@@ -71,3 +78,9 @@ when@prod:
                 path: "%kernel.logs_dir%/support_solution.%kernel.environment%.log"
                 level: info
                 channels: [ "support_solution" ]
+
+            contact_lookup:
+                type: stream
+                path: "%kernel.logs_dir%/contact_lookup.%kernel.environment%.log"
+                level: info
+                channels: [ "contact_lookup" ]

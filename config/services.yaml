@@ -34,3 +34,11 @@ services:
     App\Service\SupportChatService:
         arguments:
             $supportSolutionLogger: '@monolog.logger.support_solution'
+
+    App\Service\ContactResolver:
+        arguments:
+            $projectDir: '%kernel.project_dir%'
+
+    App\Controller\ContactResolverController:
+        arguments:
+            $contactLookupLogger: '@monolog.logger.contact_lookup'
