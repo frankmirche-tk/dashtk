@@ -169,13 +169,39 @@
 </template>
 
 <script setup>
-defineProps({
-    messages: { type: Array, required: true },
-    roleLabel: { type: Function, required: true },
+/**
+ * ChatMessages.vue
+ * Fix:
+ * - declare props (messages, roleLabel)
+ * - declare emits (db-only, contact-selected)
+ */
+
+const props = defineProps({
+    messages: {
+        type: Array,
+        required: true,
+        default: () => [],
+    },
+    roleLabel: {
+        type: Function,
+        required: false,
+        default: (r) => String(r ?? ''),
+    },
 })
 
-defineEmits(['db-only'])
+const emit = defineEmits([
+    'db-only',
+    'contact-selected',
+])
+
+/**
+ * Optional helper, falls du Buttons o.ä. im Template hast:
+ * emit('db-only', solutionId)
+ * emit('contact-selected', payload)
+ */
 </script>
+
+
 
 <style scoped>
 .chat { border: 1px solid #ddd; border-radius: 12px; padding: 16px; min-height: 360px; background: #fff; }

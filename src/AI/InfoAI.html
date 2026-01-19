@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <title>AI Architektur – DashTK Support Chat</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            line-height: 1.6;
+            margin: 2rem;
+            color: #222;
+            max-width: 1100px;
+        }
+        h1, h2, h3 {
+            line-height: 1.25;
+        }
+        h1 {
+            margin-bottom: 1rem;
+        }
+        h2 {
+            margin-top: 3rem;
+            border-bottom: 2px solid #eee;
+            padding-bottom: .3rem;
+        }
+        h3 {
+            margin-top: 2rem;
+        }
+        code, pre {
+            background: #f6f8fa;
+            border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        }
+        code {
+            padding: 0.15rem 0.35rem;
+        }
+        pre {
+            padding: 1rem;
+            overflow-x: auto;
+        }
+        ul {
+            margin-left: 1.5rem;
+        }
+        .box {
+            background: #fafafa;
+            border-left: 4px solid #4f46e5;
+            padding: 1rem;
+            margin: 1.5rem 0;
+        }
+        .flow li {
+            margin-bottom: .4rem;
+        }
+        .small {
+            color: #555;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+
+<h1>AI Architektur – Support Chat (DashTK)</h1>
+
+<p>
+    Diese Dokumentation beschreibt den Aufbau der aktuellen KI-Architektur,
+    die Verantwortlichkeiten der einzelnen PHP-Komponenten sowie das Vorgehen
+    zur Anbindung neuer KI-Provider.
+</p>
+
+<div class="box">
+    <strong>Ziel der Architektur</strong><br>
+    Einheitliche, erweiterbare KI-Anbindung (OpenAI, Gemini, weitere Provider),
+    ohne Änderungen an Controller- oder Business-Logik.
+</div>
+
+---
+
+<h2>1. Gesamtüberblick (Datenfluss)</h2>
+
+<ol class="flow">
+    <li>Frontend sendet <code>POST /api/chat</code></li>
+    <li><strong>ChatController</strong> nimmt Request an</li>
+    <li><strong>SupportChatService</strong> orchestriert DB + KI</li>
+    <li><strong>AiChatGateway</strong> wählt Provider</li>
+    <li><strong>ChatAdapterRegistry</strong> findet passende Factory</li>
+    <li><strong>ProviderFactory</strong> erzeugt Adapter</li>
+    <li><strong>Adapter</strong> ruft externe KI-API</li>
+    <li>Antwort fließt zurück bis ins Frontend</li>
+</ol>
+
+---
+
+<h2>2. Controller & Service Layer</h2>
+
+<h3>ChatController</h3>
+
+<p><strong>Aufgabe:</strong> HTTP-Einstiegspunkt für den Chat.</p>
+
+<ul>
+    <li>Liest JSON-Payload</li>
+    <li>Validiert und normalisiert Parameter</li>
+    <li>Ruft <code>SupportChatService::ask()</code> auf</li>
+    <li>Gibt strukturierte JSON-Antwort zurück</li>
+</ul>
+
+<p class="small">
+    Der Controller enthält keine KI-Logik und keine Provider-spezifischen Details.
+</p>
+
+---
+
+<h3>SupportChatService</h3>
+
+<p><strong>Aufgabe:</strong> Zentrale Business-Logik für den Support-Chat.</p>
+
+<ul>
+    <li>Auflösen von Support-Lösungen (DB)</li>
+    <li>Erzeugen von Knowledge-Base-Kontext</li>
+    <li>Session- & Chat-History-Verwaltung</li>
+    <li>Entscheidung des Modus:
+        <ul>
+            <li>DB-only</li>
+            <li>AI-only</li>
+            <li>AI + DB-Kontext</li>
+        </ul>
+    </li>
+    <li>Aufruf des <code>AiChatGateway</code></li>
+    <li>Logging (Requests, Matches, Responses, Errors)</li>
+</ul>
+
+<div class="box">
+    <strong>Wichtig:</strong><br>
+    Der Service kennt keine konkreten KI-Provider.
+</div>
+
+---
+
+<h2>3. AI Core Layer</h2>
+
+<h3>AiChatGateway</h3>
+
+<p><strong>Aufgabe:</strong> Provider-agnostische Schnittstelle zur KI.</p>
+
+<ul>
+    <li>Bestimmt aktiven Provider</li>
+    <li>Ergänzt System- & KB-Kontext</li>
+    <li>Baut <code>AIChatMessageCollection</code></li>
+    <li>Erzeugt <code>AIChatRequest</code></li>
+    <li>Delegiert an Adapter</li>
+</ul>
+
+<p class="small">
+    Das Gateway abstrahiert vollständig von OpenAI / Gemini / etc.
+</p>
+
+---
+
+<h3>ChatAdapterRegistry</h3>
+
+<p><strong>Aufgabe:</strong> Provider-Router.</p>
+
+<ul>
+    <li>Sammelt alle Provider-Factories über Service-Tags</li>
+    <li>Findet Factory anhand Provider-String</li>
+    <li>Erzeugt Adapter über die Factory</li>
+</ul>
+
+<pre><code>create(string $provider, array $options)</code></pre>
+
+---
+
+<h3>ProviderChatAdapterFactoryInterface</h3>
+
+<p><strong>Aufgabe:</strong> Einheitlicher Vertrag für alle Provider-Factories.</p>
+
+<ul>
+    <li><code>supports(string $provider): bool</code></li>
+    <li><code>create(array $options): AIChatAdapterInterface</code></li>
+</ul>
+
+---
+
+<h2>4. Provider-spezifische Implementierungen</h2>
+
+<h3>OpenAiChatAdapterFactory</h3>
+
+<ul>
+    <li>Injiziert OpenAI Client</li>
+    <li>Liest Default-Model aus ENV</li>
+    <li>Erzeugt OpenAI Adapter</li>
+</ul>
+
+---
+
+<h3>OpenAiChatAdapter</h3>
+
+<ul>
+    <li>Mappt Modelflow Messages → OpenAI Format</li>
+    <li>Führt API-Call aus</li>
+    <li>Extrahiert Content & Usage</li>
+    <li>Erzeugt <code>AIChatResponse</code></li>
+</ul>
+
+---
+
+<h3>GeminiChatAdapterFactory / Gemini Adapter</h3>
+
+<ul>
+    <li>Analoge Struktur zu OpenAI</li>
+    <li>Verwendet Gemini ClientContract</li>
+    <li>Unterstützt aktuelle Gemini-Modelle</li>
+</ul>
+
+---
+
+<h2>5. Neuen KI-Provider anbinden</h2>
+
+<h3>Schritt 1: Neue Factory & Adapter</h3>
+
+<pre><code>
+src/AI/MyProviderChatAdapterFactory.php
+src/AI/MyProviderChatAdapter.php
+</code></pre>
+
+<ul>
+    <li>Factory implementiert Interface</li>
+    <li>Adapter implementiert KI-Call</li>
+</ul>
+
+---
+
+<h3>Schritt 2: Service-Registrierung</h3>
+
+<pre><code>
+App\AI\MyProviderChatAdapterFactory:
+  arguments:
+    $defaultModel: '%app.ai.myprovider.default_model%'
+  tags:
+    - app.ai_provider_factory
+</code></pre>
+
+---
+
+<h3>Schritt 3: ENV & Parameter</h3>
+
+<pre><code>
+MYPROVIDER_API_KEY=...
+MYPROVIDER_DEFAULT_MODEL=...
+</code></pre>
+
+---
+
+<h3>Schritt 4: Nutzung</h3>
+
+<p>
+    Frontend oder API-Client sendet:
+</p>
+
+<pre><code>
+{
+  "provider": "myprovider",
+  "model": "optional override"
+}
+</code></pre>
+
+<div class="box">
+    <strong>Ergebnis:</strong><br>
+    Keine Änderungen an Controller, Service oder Gateway notwendig.
+</div>
+
+---
+
+<h2>6. Architektur-Prinzipien</h2>
+
+<ul>
+    <li>Provider sind Plug-ins</li>
+    <li>Business-Logik ist provider-neutral</li>
+    <li>Neue KI = neue Factory + Adapter</li>
+    <li>Kein Vendor-Lock-in im Core</li>
+</ul>
+
+<p class="small">
+    Stand: Januar 2026 – DashTK
+</p>
+
+</body>
+</html>

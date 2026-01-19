@@ -4,25 +4,24 @@ declare(strict_types=1);
 
 namespace App\AI;
 
-use Gemini\Contracts\ClientContract;
 use ModelflowAi\Chat\Adapter\AIChatAdapterInterface;
-use ModelflowAi\GoogleGeminiAdapter\Chat\GoogleGeminiChatAdapter;
+use OpenAI\Client;
 
-final readonly class GeminiChatAdapterFactory implements ProviderChatAdapterFactoryInterface
+final readonly class OpenAiChatAdapterFactory implements ProviderChatAdapterFactoryInterface
 {
     public function __construct(
-        private ClientContract $client,
+        private Client $client,
         private string $defaultModel,
     ) {}
 
     public function supports(string $provider): bool
     {
-        return $provider === 'gemini';
+        return $provider === 'openai';
     }
 
     public function create(array $options = []): AIChatAdapterInterface
     {
         $model = $options['model'] ?? $this->defaultModel;
-        return new GoogleGeminiChatAdapter($this->client, (string) $model);
+        return new OpenAiChatAdapter($this->client, (string) $model);
     }
 }

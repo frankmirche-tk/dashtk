@@ -4,27 +4,46 @@ declare(strict_types=1);
 
 namespace App\Service;
 
+use App\AI\AiChatGateway;
 use App\Entity\SupportSolution;
 use App\Repository\SupportSolutionRepository;
-use ModelflowAi\Chat\AIChatRequestHandlerInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
 
+/**
+ * Purpose: Orchestrates the support chat flow by combining KB/SOP matching with an AI provider,
+ * and persists short-lived conversation history in cache for multi-turn troubleshooting.
+ */
 final class SupportChatService
 {
     private const SESSION_TTL_SECONDS = 3600; // 1h
     private const MAX_HISTORY_MESSAGES = 18;
 
     public function __construct(
-        private readonly AIChatRequestHandlerInterface $chatHandler, // Gemini/Modelflow
-        private readonly OpenAiChatService $openAiChat,              // OpenAI
+        private readonly AiChatGateway $aiChat,
         private readonly SupportSolutionRepository $solutions,
         private readonly CacheInterface $cache,
         private readonly LoggerInterface $supportSolutionLogger,
     ) {}
 
     /**
+     * Main entry point for the support chat.
+     *
+     * Two operating modes:
+     *  - DB-only mode: if $dbOnlySolutionId is provided, returns the selected SOP including its steps payload.
+     *  - AI + DB mode: finds best SOP matches for context and calls the AI gateway with trimmed chat history.
+     *
+     * Conversation state is stored in cache per session (TTL: 1 hour). The system prompt is injected on the
+     * first message of a new session to guide the assistant toward step-by-step troubleshooting.
+     *
+     * @param string      $sessionId         Session identifier used for caching chat history. If empty, a fallback will be generated.
+     * @param string      $message           User input message.
+     * @param int|null    $dbOnlySolutionId  When set, bypasses AI and returns the SOP content directly.
+     * @param string      $provider          AI provider key (normalized to lowercase), e.g. "gemini" or "openai".
+     * @param string|null $model             Optional model name/identifier for the chosen provider.
+     * @param array       $context           Additional provider-specific context forwarded to the AI gateway.
+     *
      * @return array{
      *   answer:string,
      *   matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,
@@ -49,7 +68,7 @@ final class SupportChatService
         ?int $dbOnlySolutionId = null,
         string $provider = 'gemini',
         ?string $model = null,
-        array $context = [] // ✅ NEU
+        array $context = []
     ): array {
         $sessionId = trim($sessionId);
         $message   = trim($message);
@@ -101,42 +120,13 @@ final class SupportChatService
         ]);
 
         try {
-            if ($provider === 'openai') {
-                // ✅ OpenAI Pfad
-                $answer = $this->openAiChat->chat(
-                    history: $this->trimHistory($history),
-                    kbContext: $kbContext,
-                    model: $model
-                );
-            } else {
-                // ✅ Gemini/Modelflow Pfad
-                $builder = $this->chatHandler->createRequest();
-
-                foreach ($this->trimHistory($history) as $msg) {
-                    $role = $msg['role'] ?? 'user';
-                    $content = (string)($msg['content'] ?? '');
-
-                    if ($role === 'system') {
-                        $builder->addSystemMessage($content);
-                    } elseif ($role === 'assistant') {
-                        $builder->addAssistantMessage($content);
-                    } else {
-                        $builder->addUserMessage($content);
-                    }
-                }
-
-                if ($kbContext !== '') {
-                    $builder->addSystemMessage($kbContext);
-                }
-
-                // execute()
-                $response = $builder->execute();
-
-                $respMsg = $response->getMessage();
-                $answer = (is_object($respMsg) && property_exists($respMsg, 'content'))
-                    ? trim((string)$respMsg->content)
-                    : '[unlesbare Antwort]';
-            }
+            $answer = $this->aiChat->chat(
+                history: $this->trimHistory($history),
+                kbContext: $kbContext,
+                provider: $provider,
+                model: $model,
+                context: $context
+            );
         } catch (\Throwable $e) {
             $this->supportSolutionLogger->error('chat_execute_failed', [
                 'sessionId' => $sessionId,
@@ -172,6 +162,17 @@ final class SupportChatService
     }
 
     /**
+     * Returns a response that contains a single SOP (SupportSolution) including its ordered steps.
+     *
+     * This method does not call the AI provider. It is intended for "show me SOP X" style requests.
+     * If the SOP cannot be found, a user-friendly message and an empty steps array is returned.
+     *
+     * Note: $sessionId is currently unused in this method, but kept in the signature for consistent
+     * call structure and potential future tracking/log correlation.
+     *
+     * @param string $sessionId  Session identifier (currently unused here).
+     * @param int    $solutionId Database ID of the SOP to load.
+     *
      * @return array{
      *   answer:string,
      *   matches:array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>,
@@ -212,8 +213,8 @@ final class SupportChatService
         foreach ($stepsEntities as $st) {
             $stepsPayload[] = [
                 'id' => $st->getId(),
-                'stepNo' => (int)$st->getStepNo(),
-                'instruction' => (string)$st->getInstruction(),
+                'stepNo' => (int) $st->getStepNo(),
+                'instruction' => (string) $st->getInstruction(),
                 'expectedResult' => $st->getExpectedResult(),
                 'nextIfFailed' => $st->getNextIfFailed(),
                 'mediaPath' => $st->getMediaPath(),
@@ -248,6 +249,13 @@ final class SupportChatService
     }
 
     /**
+     * Finds best matching SOPs for a given user message.
+     *
+     * Uses the repository full-text/semantic matching (depending on implementation of findBestMatches)
+     * and maps results into a lightweight payload for the UI/API.
+     *
+     * @param string $message User message used as search query.
+     *
      * @return array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}>
      */
     private function findMatches(string $message): array
@@ -265,7 +273,7 @@ final class SupportChatService
             if (!$s instanceof SupportSolution) {
                 continue;
             }
-            $mapped[] = $this->mapMatch($s, (int)($m['score'] ?? 0));
+            $mapped[] = $this->mapMatch($s, (int) ($m['score'] ?? 0));
         }
 
         $this->supportSolutionLogger->debug('db_matches', [
@@ -277,17 +285,26 @@ final class SupportChatService
     }
 
     /**
+     * Maps a SupportSolution entity plus score into a stable API payload.
+     *
+     * The payload includes:
+     *  - a canonical IRI to the solution
+     *  - a prebuilt URL to query the associated steps collection
+     *
+     * @param SupportSolution $solution The SOP entity.
+     * @param int             $score    Relevance score provided by the repository matching layer.
+     *
      * @return array{id:int,title:string,score:int,url:string,stepsUrl:string}
      */
     private function mapMatch(SupportSolution $solution, int $score): array
     {
-        $id = (int)$solution->getId();
+        $id = (int) $solution->getId();
         $iri = '/api/support_solutions/' . $id;
         $stepsUrl = '/api/support_solution_steps?solution=' . rawurlencode($iri);
 
         return [
             'id' => $id,
-            'title' => (string)$solution->getTitle(),
+            'title' => (string) $solution->getTitle(),
             'score' => $score,
             'url' => $iri,
             'stepsUrl' => $stepsUrl,
@@ -295,7 +312,14 @@ final class SupportChatService
     }
 
     /**
-     * @param array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}> $matches
+     * Builds a short knowledge-base context block for the AI prompt from SOP matches.
+     *
+     * The returned string is meant to be injected into the AI gateway request as "kbContext" so the model
+     * can prioritize existing SOPs and follow the "ask after each step" rule.
+     *
+     * @param array<int,array{id:int,title:string,score:int,url:string,stepsUrl:string}> $matches Matched SOPs.
+     *
+     * @return string Multi-line context or empty string if no matches exist.
      */
     private function buildKbContext(array $matches): string
     {
@@ -320,7 +344,14 @@ final class SupportChatService
     }
 
     /**
-     * @return array<int,array{role:string,content:string}>
+     * Loads the chat history for the given session from cache.
+     *
+     * The cache entry is created lazily with a TTL (SESSION_TTL_SECONDS). If the cache value is not an array,
+     * an empty history is returned to keep the calling code safe.
+     *
+     * @param string $sessionId Session identifier.
+     *
+     * @return array<int,array{role:string,content:string}> List of chat messages in OpenAI-style format.
      */
     private function loadHistory(string $sessionId): array
     {
@@ -335,7 +366,12 @@ final class SupportChatService
     }
 
     /**
-     * @param array<int,array{role:string,content:string}> $history
+     * Persists chat history for the given session in cache with the configured TTL.
+     *
+     * Implementation detail: deletes the key first to ensure the next get() closure writes the new value.
+     *
+     * @param string                                $sessionId Session identifier.
+     * @param array<int,array{role:string,content:string}> $history   Full message list to store.
      */
     private function saveHistory(string $sessionId, array $history): void
     {
@@ -350,8 +386,14 @@ final class SupportChatService
     }
 
     /**
-     * @param array<int,array{role:string,content:string}> $history
-     * @return array<int,array{role:string,content:string}>
+     * Trims the conversation history to a bounded size for provider calls.
+     *
+     * Keeps the initial "system" message (if present as first item) and then keeps only the last N messages
+     * so that total messages do not exceed MAX_HISTORY_MESSAGES.
+     *
+     * @param array<int,array{role:string,content:string}> $history Full untrimmed history.
+     *
+     * @return array<int,array{role:string,content:string}> Trimmed history with system message preserved.
      */
     private function trimHistory(array $history): array
     {
@@ -368,11 +410,27 @@ final class SupportChatService
         return array_merge($system, $rest);
     }
 
+    /**
+     * Builds the cache key for a session's chat history.
+     *
+     * A hash is used to avoid excessively long keys and to reduce the chance of problematic characters.
+     *
+     * @param string $sessionId Session identifier.
+     *
+     * @return string Cache key.
+     */
     private function historyCacheKey(string $sessionId): string
     {
         return 'support_chat.history.' . sha1($sessionId);
     }
 
+    /**
+     * Generates a random fallback session ID if the caller did not provide one.
+     *
+     * @return string Random session ID (32 hex chars).
+     *
+     * @throws \Exception If the system CSPRNG fails (random_bytes).
+     */
     private function newSessionIdFallback(): string
     {
         return bin2hex(random_bytes(16));

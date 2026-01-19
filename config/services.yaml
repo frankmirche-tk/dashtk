@@ -1,5 +1,8 @@
 parameters:
-    app.openai.default_model: 'gpt-4o-mini'
+    app.ai.default_provider: '%env(string:AI_DEFAULT_PROVIDER)%'
+    app.ai.gemini.default_model: '%env(string:GEMINI_DEFAULT_MODEL)%'
+    app.ai.openai.default_model: '%env(string:OPENAI_DEFAULT_MODEL)%'
+
 
 services:
     _defaults:
@@ -25,12 +28,6 @@ services:
         arguments:
             - '%env(string:OPENAI_API_KEY)%'
 
-    # ✅ OpenAI Chat Service bekommt API Key injected (KEIN getenv)
-    App\Service\OpenAiChatService:
-        arguments:
-            $apiKey: '%env(string:OPENAI_API_KEY)%'
-            $defaultModel: '%app.openai.default_model%'
-
     App\Service\SupportChatService:
         arguments:
             $supportSolutionLogger: '@monolog.logger.support_solution'
@@ -42,3 +39,22 @@ services:
     App\Controller\ContactResolverController:
         arguments:
             $contactLookupLogger: '@monolog.logger.contact_lookup'
+
+    App\AI\GeminiChatAdapterFactory:
+        arguments:
+            $defaultModel: '%app.ai.gemini.default_model%'
+        tags: [ 'app.ai_provider_factory' ]
+
+    App\AI\OpenAiChatAdapterFactory:
+        arguments:
+            $defaultModel: '%app.ai.openai.default_model%'
+        tags: [ 'app.ai_provider_factory' ]
+
+    App\AI\ChatAdapterRegistry:
+        arguments:
+            $factories: !tagged_iterator app.ai_provider_factory
+
+    App\AI\AiChatGateway:
+        arguments:
+            $defaultProvider: '%app.ai.default_provider%'
+
