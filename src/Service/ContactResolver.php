@@ -1,11 +1,15 @@
 <?php
 
 namespace App\Service;
+use App\Attribute\TrackUsage;
+use App\Service\UsageTracker;
+
 
 final class ContactResolver
 {
     private string $personsFile;
     private string $branchesFile;
+    private const USAGE_KEY_RESOLVE = 'contact_resolver.resolve';
 
     /** @var array<int, array<string, mixed>>|null */
     private ?array $persons = null;
@@ -13,7 +17,7 @@ final class ContactResolver
     /** @var array<int, array<string, mixed>>|null */
     private ?array $branches = null;
 
-    public function __construct(string $projectDir)
+    public function __construct(string $projectDir, private readonly UsageTracker $usageTracker)
     {
         $this->personsFile  = $projectDir . '/var/data/kontakt_personen.json';
         $this->branchesFile = $projectDir . '/var/data/kontakt_filialen.json';
@@ -22,10 +26,14 @@ final class ContactResolver
     /**
      * @return array<string, mixed>
      */
+    #[TrackUsage(self::USAGE_KEY_RESOLVE, weight: 3)]
     public function resolve(string $query, int $limit = 5): array
     {
+        $this->usageTracker->increment(self::USAGE_KEY_RESOLVE);
+
         $query = trim($query);
         $qNorm = $this->normalize($query);
+
 
         if ($qNorm === '') {
             return [

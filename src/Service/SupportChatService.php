@@ -10,6 +10,8 @@ use App\Repository\SupportSolutionRepository;
 use Psr\Log\LoggerInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
+use App\Attribute\TrackUsage;
+
 
 /**
  * Purpose: Orchestrates the support chat flow by combining KB/SOP matching with an AI provider,
@@ -20,11 +22,15 @@ final class SupportChatService
     private const SESSION_TTL_SECONDS = 3600; // 1h
     private const MAX_HISTORY_MESSAGES = 18;
 
+    private const USAGE_KEY_ASK = 'support_chat.ask';
+
+
     public function __construct(
         private readonly AiChatGateway $aiChat,
         private readonly SupportSolutionRepository $solutions,
         private readonly CacheInterface $cache,
         private readonly LoggerInterface $supportSolutionLogger,
+        private readonly UsageTracker $usageTracker,
     ) {}
 
     /**
@@ -62,6 +68,7 @@ final class SupportChatService
      *   }>
      * }
      */
+    #[TrackUsage(self::USAGE_KEY_ASK, weight: 5)]
     public function ask(
         string $sessionId,
         string $message,
@@ -73,6 +80,8 @@ final class SupportChatService
         $sessionId = trim($sessionId);
         $message   = trim($message);
         $provider  = strtolower(trim($provider));
+        $this->usageTracker->increment(self::USAGE_KEY_ASK);
+
 
         if ($sessionId === '') {
             $sessionId = $this->newSessionIdFallback();
@@ -90,6 +99,9 @@ final class SupportChatService
 
             return $result;
         }
+
+
+
 
         // 2) Normal: Matchen + KI Antwort
         $matches = $this->findMatches($message);
