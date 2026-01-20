@@ -1,0 +1,14 @@
+parameters:
+    ai_cost.enabled: true
+
+    # Preise pro 1K Tokens (Input/Output getrennt)
+    # Werte sind Beispiele – tragt eure echten Preise ein.
+    ai_cost.pricing:
+        openai:
+            default:
+                input_per_1k: 0.00015
+                output_per_1k: 0.00060
+        gemini:
+            default:
+                input_per_1k: 0.00010
+                output_per_1k: 0.00030

@@ -58,4 +58,17 @@ services:
         arguments:
             $defaultProvider: '%app.ai.default_provider%'
 
+    App\AI\Cost\AiCostCalculator:
+        arguments:
+            $pricing: '%ai_cost.pricing%'
+
+    App\AI\Cost\AiCostTracker:
+        arguments:
+            $cache: '@cache.app'
+            $calculator: '@App\AI\Cost\AiCostCalculator'
+            $enabled: '%ai_cost.enabled%'
+
+    App\AI\Usage\AiUsageExtractor: ~
+
+
 

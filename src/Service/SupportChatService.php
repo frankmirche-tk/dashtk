@@ -177,6 +177,23 @@ final class SupportChatService
 
         $kbContext = $this->buildKbContext($matches);
 
+        // AI cost attribution (Variant B):
+        $context['usage_key'] ??= self::USAGE_KEY_ASK;
+        $context['cache_hit'] ??= false;
+
+        // Ensure stable model names for reporting.
+        // If caller did not pass a model, fall back to provider defaults configured via env.
+        if ($model === null || trim((string) $model) === '') {
+            if ($provider === 'openai') {
+                $model = (string) ($_ENV['OPENAI_DEFAULT_MODEL'] ?? $_SERVER['OPENAI_DEFAULT_MODEL'] ?? '');
+            } elseif ($provider === 'gemini') {
+                $model = (string) ($_ENV['GEMINI_DEFAULT_MODEL'] ?? $_SERVER['GEMINI_DEFAULT_MODEL'] ?? '');
+            }
+
+            $model = trim((string) $model);
+            $model = $model !== '' ? $model : null;
+        }
+
         $this->supportSolutionLogger->info('chat_request', [
             'sessionId'      => $sessionId,
             'message'        => $message,
@@ -185,9 +202,27 @@ final class SupportChatService
             'kbContextChars' => strlen($kbContext),
             'provider'       => $provider,
             'model'          => $model,
+            'usageKey'       => $context['usage_key'] ?? self::USAGE_KEY_ASK,
         ]);
 
+
         try {
+            // AI cost attribution (Variant B):
+            // - We reuse the same business usage key as UsageTracker/TrackUsage so reports can join:
+            //   usage/impact  <->  tokens/requests/costs
+            // - Caller-provided context stays intact; we only enforce the missing key(s).
+            $context['usage_key'] ??= self::USAGE_KEY_ASK;
+
+            // Optional: if you ever add an application-side cache for AI answers,
+            // set this to true on cache hits to separate "no provider call" cases.
+            $context['cache_hit'] ??= false;
+
+            $this->supportSolutionLogger->info('ai_cost_debug', [
+                'usage_key' => $context['usage_key'] ?? self::USAGE_KEY_ASK,
+                'provider'  => $provider,
+                'model'     => $model,
+            ]);
+
             $answer = $this->aiChat->chat(
                 history: $this->trimHistory($history),
                 kbContext: $kbContext,
@@ -196,6 +231,7 @@ final class SupportChatService
                 context: $context
             );
         } catch (\Throwable $e) {
+
             $this->supportSolutionLogger->error('chat_execute_failed', [
                 'sessionId' => $sessionId,
                 'message'   => $message,

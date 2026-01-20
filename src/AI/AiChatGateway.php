@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\AI;
 
+use App\AI\Cost\AiCostTracker;
+use App\AI\Usage\AiUsage;
+use App\AI\Usage\AiUsageExtractor;
 use ModelflowAi\Chat\Request\AIChatMessageCollection;
 use ModelflowAi\Chat\Request\AIChatRequest;
 
@@ -31,6 +34,17 @@ use ModelflowAi\Chat\Request\AIChatRequest;
  * - $kbContext: optional additional "system" message appended at the end of history.
  * - $context: optional provider-specific structured context passed to the adapter registry.
  *
+ * AI cost measurement (Tokens + Requests):
+ * - This gateway is the central, provider-agnostic place to measure AI usage and costs.
+ * - Measurement is explicit (no magic) and uses context-based attribution (Variant B):
+ *   - $context['usage_key'] is used to attribute requests/tokens/costs to a feature/entry-point.
+ * - The tracker writes aggregated daily counters to the cache, so reports can be generated quickly.
+ *
+ * Suggested context keys (Variant B):
+ * - usage_key: string  (e.g. "support_chat.ask")  -> required for meaningful attribution
+ * - cache_hit: bool    (true if your own prompt/response cache returned a hit)
+ * - model_used: string (optional override if the effective model differs from $model argument)
+ *
  * Version compatibility:
  * - Modelflow's message and request classes have changed across versions.
  * - This gateway contains defensive logic for:
@@ -43,10 +57,14 @@ final readonly class AiChatGateway
     /**
      * @param ChatAdapterRegistry $registry        Factory/registry that creates provider adapters.
      * @param string              $defaultProvider Default provider key used when chat() is called without $provider.
+     * @param AiCostTracker       $aiCostTracker   Explicit AI cost/usage tracker (requests + tokens + optional EUR cost).
+     * @param AiUsageExtractor    $aiUsageExtractor Best-effort extractor for usage metrics from provider responses.
      */
     public function __construct(
         private ChatAdapterRegistry $registry,
         private string $defaultProvider,
+        private AiCostTracker $aiCostTracker,
+        private AiUsageExtractor $aiUsageExtractor,
     ) {}
 
     /**
@@ -64,6 +82,10 @@ final readonly class AiChatGateway
      *   - The options array contains:
      *     - model: optional model override
      *     - context: provider-specific structured context
+     * - AI cost measurement (Tokens + Requests):
+     *   - Measures latency, success/error and extracts usage tokens (best-effort).
+     *   - Attributes the request via $context['usage_key'] (Variant B).
+     *   - Records an aggregated event via AiCostTracker (typically daily aggregates in cache).
      *
      * @param array<int, array{role:string, content:string}> $history  Chat history in OpenAI-like array format.
      * @param string                                        $kbContext Optional KB context appended as a system message.
@@ -72,6 +94,8 @@ final readonly class AiChatGateway
      * @param array                                         $context   Additional provider-specific context forwarded to the adapter.
      *
      * @return string Plain text assistant response (best-effort extraction).
+     *
+     * @throws \Throwable Re-throws provider/adapter exceptions after recording an error event.
      */
     public function chat(
         array $history,
@@ -95,9 +119,72 @@ final readonly class AiChatGateway
 
         $request = $this->makeAiChatRequest($messages);
 
-        $response = $adapter->handleRequest($request);
+        // ---- AI Cost / Usage instrumentation (explicit; Variant B via $context['usage_key']) ----
+        // We track:
+        // - requests (always 1 per gateway call)
+        // - tokens (best-effort via AiUsageExtractor)
+        // - latency (ms)
+        // - success/error
+        // - optional cache-hit flag (if the caller sets it)
+        //
+        // Attribution:
+        // - usage_key is expected in $context['usage_key'] and should match your business entry-point key.
+        // - If missing, we record under "unknown" so reporting still works and highlights missing attribution.
+        $start = microtime(true);
 
-        return $this->extractResponseText($response->getMessage());
+        try {
+            $response = $adapter->handleRequest($request);
+
+            $latencyMs = (int) round((microtime(true) - $start) * 1000);
+
+            // Variant B: feature/entry-point attribution via context
+            $usageKey = $this->normalizeUsageKey((string) ($context['usage_key'] ?? 'unknown'));
+
+            // Determine effective model (best-effort):
+            // - prefer explicit $model argument
+            // - allow override from context if your adapter selects a different model internally
+            $modelUsed = $this->normalizeModel(
+                $model ?? (string) ($context['model_used'] ?? '')
+            );
+
+            // Extract tokens usage from response (best-effort, provider-agnostic).
+            $usage = $this->aiUsageExtractor->extract($response);
+
+            // Record success event (aggregated in cache).
+            $this->aiCostTracker->record(
+                usageKey: $usageKey,
+                provider: $provider,
+                model: $modelUsed,
+                usage: $usage,
+                latencyMs: $latencyMs,
+                ok: true,
+                errorCode: null,
+                cacheHit: (bool) ($context['cache_hit'] ?? false),
+            );
+
+            return $this->extractResponseText($response->getMessage());
+        } catch (\Throwable $e) {
+            $latencyMs = (int) round((microtime(true) - $start) * 1000);
+
+            $usageKey = $this->normalizeUsageKey((string) ($context['usage_key'] ?? 'unknown'));
+            $modelUsed = $this->normalizeModel(
+                $model ?? (string) ($context['model_used'] ?? '')
+            );
+
+            // Record error event (tokens usually unknown on hard failures).
+            $this->aiCostTracker->record(
+                usageKey: $usageKey,
+                provider: $provider,
+                model: $modelUsed,
+                usage: new AiUsage(null, null, null),
+                latencyMs: $latencyMs,
+                ok: false,
+                errorCode: $this->normalizeErrorCode($e),
+                cacheHit: (bool) ($context['cache_hit'] ?? false),
+            );
+
+            throw $e;
+        }
     }
 
     /**
@@ -314,5 +401,52 @@ final readonly class AiChatGateway
             $responseFormat,
             $toolChoice
         );
+    }
+
+    /**
+     * Normalize a usage key for cost attribution.
+     *
+     * Notes:
+     * - Keeps a stable key even if callers pass empty/whitespace.
+     * - Uses "unknown" as a safe fallback, so missing attribution becomes visible in reports.
+     */
+    private function normalizeUsageKey(string $usageKey): string
+    {
+        $usageKey = trim($usageKey);
+        return $usageKey !== '' ? $usageKey : 'unknown';
+    }
+
+    /**
+     * Normalize model name for reporting and pricing lookup.
+     *
+     * Notes:
+     * - Providers sometimes return/alias different model names than requested.
+     * - If you know the effective model in your adapter, you can pass it via $context['model_used'].
+     * - "unknown" is used if nothing is provided.
+     */
+    private function normalizeModel(?string $model): string
+    {
+        $model = trim((string) $model);
+        return $model !== '' ? $model : 'unknown';
+    }
+
+    /**
+     * Normalize an error code string for aggregation.
+     *
+     * Notes:
+     * - We prefer a numeric exception code if present.
+     * - Otherwise we fall back to the exception class name (stable enough for aggregation).
+     */
+    private function normalizeErrorCode(\Throwable $e): string
+    {
+        $code = $e->getCode();
+        if (is_int($code) && $code !== 0) {
+            return (string) $code;
+        }
+        if (is_string($code) && $code !== '' && $code !== '0') {
+            return $code;
+        }
+
+        return $e::class;
     }
 }
