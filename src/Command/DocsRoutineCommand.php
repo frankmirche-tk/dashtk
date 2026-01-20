@@ -109,6 +109,11 @@ final class DocsRoutineCommand extends Command
             ->addOption('dir', null, InputOption::VALUE_REQUIRED, 'Root-Docs-Verzeichnis (Standard: var/docs)', 'var/docs')
             ->addOption('format', null, InputOption::VALUE_REQUIRED, 'md|json (Standard: md)', 'md')
 
+            // ai cost report
+            ->addOption('ai-cost-report', null, InputOption::VALUE_NONE, 'Erzeugt zusätzlich einen AI Cost Report (Tokens + Requests + EUR)')
+            ->addOption('no-ai-cost-report', null, InputOption::VALUE_NONE, 'Deaktiviert den AI Cost Report (überschreibt Default und --ai-cost-report)')
+
+
             // report tuning
             ->addOption('min-impact', null, InputOption::VALUE_REQUIRED, 'Nur Einträge mit impact >= X in Reports (Default je Schedule)', null)
             ->addOption('attention-weight', null, InputOption::VALUE_REQUIRED, 'Attention: low usage aber weight >= X (Default je Schedule)', null)
@@ -208,6 +213,21 @@ final class DocsRoutineCommand extends Command
             $cleanupAfter = false;
         }
 
+        // ai-cost-report default: ON für alle schedules (daily/weekly/monthly)
+        $aiCostReportFlag = (bool) $input->getOption('ai-cost-report');
+        $noAiCostReport = (bool) $input->getOption('no-ai-cost-report');
+
+        $aiCostReportDefault = true;
+        $aiCostReport = $aiCostReportDefault;
+
+        if ($aiCostReportFlag) {
+            $aiCostReport = true;
+        }
+        if ($noAiCostReport) {
+            $aiCostReport = false;
+        }
+
+
         // keep-last: schedule default, aber override möglich
         $keepLastOpt = $input->getOption('keep-last');
         $keepLast = $keepLastOpt !== null ? (int) $keepLastOpt : (int) $preset['keepLast'];
@@ -236,6 +256,7 @@ final class DocsRoutineCommand extends Command
             ['Keep last', (string) $keepLast],
             ['Cleanup mode', $cleanupDelete ? 'delete' : 'move'],
             ['Cleanup dry run', $cleanupDryRun ? 'yes' : 'no'],
+            ['AI cost report', $aiCostReport ? 'yes' : 'no'],
         ]);
         $table->render();
         $output->writeln('');

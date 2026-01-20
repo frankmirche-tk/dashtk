@@ -68,6 +68,10 @@ services:
             $calculator: '@App\AI\Cost\AiCostCalculator'
             $enabled: '%ai_cost.enabled%'
 
+    App\AI\Cost\AiCostWindowReader:
+        arguments:
+            $cache: '@cache.app'
+
     App\AI\Usage\AiUsageExtractor: ~
 
 
