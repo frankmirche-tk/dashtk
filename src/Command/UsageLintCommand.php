@@ -13,21 +13,107 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
+/**
+ * UsageLintCommand
+ *
+ * Purpose:
+ * - Static "lint" for your usage tracking convention:
+ *   every method annotated with #[TrackUsage(key, weight)] should also call
+ *   UsageTracker->increment(key) inside its method body.
+ *
+ * Why it matters:
+ * - TrackUsage is a declaration ("this method should be tracked"),
+ *   but the counter only increases if increment() is actually called.
+ * - This command prevents silent tracking gaps, especially after refactors.
+ *
+ * How it works (high level):
+ * - Scans service classes under src/Service (derived from the provided namespace prefix).
+ * - For each method declared in the class:
+ *   - if it has #[TrackUsage], the method's source code is extracted by line range
+ *   - regex checks are performed on the source to find ->increment(...) calls
+ *   - reports errors/warnings based on strictness and detectability
+ *
+ * What is checked:
+ * 1) TrackUsage weight validity:
+ *    - must be between 1 and 10 (inclusive)
+ * 2) Strict mode rules (--strict):
+ *    - only public methods may be tracked
+ *    - exactly one increment() match is expected
+ *    - variable/dynamic keys are treated as errors if an increment() exists but cannot be matched
+ * 3) increment() key matching:
+ *    - counts exact matches for:
+ *      - ->increment('literal.key')
+ *      - ->increment("literal.key")
+ *      - ->increment(self::CONST) or ->increment(static::CONST)
+ *        if the referenced constant exists on the class and resolves to the same literal key
+ *
+ * What is NOT reliably supported:
+ * - Dynamic keys are intentionally not counted as matches:
+ *   - ->increment($key)
+ *   - ->increment($a . $b)
+ *   - ->increment(sprintf(...))
+ * - Those patterns are considered "not safely checkable" and will:
+ *   - produce an error in strict mode (if an increment() exists but cannot be matched)
+ *   - (intended) produce a warning in non-strict mode (see note below)
+ *
+ * Output / exit behavior:
+ * - Prints WARN section if warnings exist.
+ * - Prints FAIL section if errors exist.
+ * - Exit code is FAILURE if:
+ *   - errors exist, or
+ *   - --fail-on-warn is enabled and warnings exist, or
+ *   - --strict is enabled (it forces fail-on-warn behavior)
+ *
+ * CI usage:
+ * - Recommended in CI as a gate:
+ *   - php bin/console dashtk:usage:lint --strict
+ *
+ * Important note about current behavior:
+ * - The code path "non-strict: warn on dynamic increment" is currently unreachable because
+ *   the earlier "if ($countMatch === 0) { ... $errors[] ... continue; }" returns an error
+ *   before the later warning branch can run.
+ * - If you want non-strict mode to allow dynamic keys with only warnings, you should move
+ *   the warning logic into the $countMatch === 0 branch (instead of always erroring there).
+ */
 #[AsCommand(
     name: 'dashtk:usage:lint',
     description: 'Lint: Prüft, ob TrackUsage-Methoden auch UsageTracker->increment(...) aufrufen.'
 )]
 final class UsageLintCommand extends Command
 {
+    /**
+     * Configure lint behavior.
+     *
+     * - namespace: namespace prefix used to map scanned files to class names
+     * - fail-on-warn: treat warnings as failure (exit code 1)
+     * - strict:
+     *   - enables CI-grade rules (public-only, exactly one increment, no variable key)
+     *   - implicitly enables fail-on-warn
+     */
     protected function configure(): void
     {
         $this
             ->addOption('namespace', null, InputOption::VALUE_REQUIRED, 'Namespace-Prefix zum Scannen', 'App\\Service\\')
             ->addOption('fail-on-warn', null, InputOption::VALUE_NONE, 'Behandelt Warnungen als Fehler (Exit Code 1)')
-            ->addOption('strict', null, InputOption::VALUE_NONE, 'Strict mode: public-only, genau 1 increment(), kein variable key')
-        ;
+            ->addOption('strict', null, InputOption::VALUE_NONE, 'Strict mode: public-only, genau 1 increment(), kein variable key');
     }
 
+    /**
+     * Execute the lint scan.
+     *
+     * Steps:
+     * 1) Scan classes under src/Service and reflect methods.
+     * 2) For methods annotated with #[TrackUsage]:
+     *    - validate weight range
+     *    - optionally enforce "public-only" in strict mode
+     *    - extract source by file line ranges and search for increment() calls matching the key
+     * 3) Print warnings/errors and return corresponding exit code.
+     *
+     * @param InputInterface  $input  CLI input.
+     * @param OutputInterface $output CLI output.
+     *
+     * @return int Command::SUCCESS if lint passes, otherwise Command::FAILURE.
+     */
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $nsPrefix   = (string) $input->getOption('namespace');
@@ -168,7 +254,19 @@ final class UsageLintCommand extends Command
     }
 
     /**
-     * @return array<int,string>
+     * Discover service class names based on a namespace prefix and the src/Service directory.
+     *
+     * Implementation:
+     * - Scans PHP files under src/Service recursively.
+     * - Builds a class name: $namespacePrefix + relative path (slashes -> backslashes, .php removed).
+     *
+     * Caveats:
+     * - Assumes that namespace prefix matches filesystem layout.
+     * - The command relies on class_exists() to skip non-autoloadable results safely.
+     *
+     * @param string $namespacePrefix Namespace prefix (default: "App\\Service\\").
+     *
+     * @return array<int, string> Fully qualified class names (sorted ASC).
      */
     private function discoverClasses(string $namespacePrefix): array
     {
@@ -198,7 +296,13 @@ final class UsageLintCommand extends Command
     }
 
     /**
-     * Extrahiert den Methoden-Quelltext grob über File + Start/End Line.
+     * Extract the method's source code by slicing the declaring file by start/end line numbers.
+     *
+     * This is a best-effort "static inspection" approach (fast, no AST parser required).
+     *
+     * @param ReflectionMethod $m Reflected method.
+     *
+     * @return string|null Method source code or null if file/line information is not available.
      */
     private function getMethodSource(ReflectionMethod $m): ?string
     {
@@ -226,7 +330,11 @@ final class UsageLintCommand extends Command
     }
 
     /**
-     * Erkennt, ob irgendwo ein increment(...) call im Methodentext vorkommt (egal welcher key).
+     * Detect whether the method source contains any "->increment(" call at all (independent of key).
+     *
+     * @param string $methodSource Method source code.
+     *
+     * @return bool True if an increment() call is present, otherwise false.
      */
     private function hasAnyIncrementCall(string $methodSource): bool
     {
@@ -235,13 +343,25 @@ final class UsageLintCommand extends Command
     }
 
     /**
-     * Zählt passende increment()-Aufrufe für einen Key.
+     * Count increment() calls that can be verified to match the given key.
      *
-     * Unterstützt:
-     * - ->increment('key') / ->increment("key")
-     * - ->increment(self::CONST) / static::CONST, wenn CONST in der Klasse existiert und == key ist
+     * Supported patterns:
+     * - ->increment('literal.key')
+     * - ->increment("literal.key")
+     * - ->increment(self::CONST) / ->increment(static::CONST)
+     *   - only if the constant exists on the class and its value equals $key
      *
-     * Hinweis: variable/dynamic keys (->increment($x), ->increment($a.$b), ->increment(sprintf(...))) werden NICHT als match gezählt.
+     * Not supported (intentionally not counted as match):
+     * - variable/dynamic keys:
+     *   - ->increment($x)
+     *   - ->increment($a . $b)
+     *   - ->increment(sprintf(...))
+     *
+     * @param ReflectionClass $ref          Reflected class (for constant resolution).
+     * @param string          $methodSource Method source code.
+     * @param string          $key          TrackUsage key to validate.
+     *
+     * @return int Number of verified matching increment() calls.
      */
     private function countIncrementForKey(ReflectionClass $ref, string $methodSource, string $key): int
     {
@@ -250,7 +370,7 @@ final class UsageLintCommand extends Command
 
         $count = 0;
 
-        // 1) Direkt: ->increment('key') / ->increment("key")
+        // 1) Direct: ->increment('key') / ->increment("key")
         $patternDirect = '~->\s*increment\s*\(\s*[\'"]' . preg_quote($key, '~') . '[\'"]~i';
         if (preg_match_all($patternDirect, $src, $mm) > 0) {
             $count += (int) preg_match_all($patternDirect, $src);

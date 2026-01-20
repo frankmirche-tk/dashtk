@@ -13,17 +13,112 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 
+/**
+ * UsageReportCommand
+ *
+ * Purpose:
+ * - Generates an "actionability focused" usage report from:
+ *   - declared tracking entry points via #[TrackUsage(key, weight)]
+ *   - real counters stored in UsageTracker (cache-backed)
+ * - Adds business/ops prioritization via:
+ *   - weight (importance/criticality)
+ *   - impact = count * weight (prioritization score)
+ *
+ * Why this report exists:
+ * - A raw "top usage" list is helpful but often misses operational reality:
+ *   - low usage can be fine, unless the entry point is critical (high weight)
+ *   - high usage might be noise if weight is low
+ * - impact lets you prioritize changes, testing, and documentation work.
+ *
+ * Definitions used:
+ * - count:
+ *   - UsageTracker counter value for the key (usage.<key>)
+ * - seen:
+ *   - UsageTracker::has($key) indicates whether the key currently exists in cache
+ * - weight:
+ *   - criticality of the entry point (expected range 1..10)
+ * - impact:
+ *   - computed as: impact = count * weight
+ *
+ * Sections produced:
+ * 1) Meta:
+ *    - generation time, namespace, thresholds, totals, formula, tracking count
+ * 2) Executive Summary:
+ *    - totals + highlights (Top 3, Attention, Critical unused)
+ * 3) Top (by impact):
+ *    - highest impact entry points (impact DESC, count DESC)
+ * 4) Low usage:
+ *    - unusedMax < count <= lowMax
+ * 5) Unused:
+ *    - count <= unusedMax (includes "never_seen" emphasis)
+ * 6) Critical unused:
+ *    - weight >= critical AND count <= unusedMax
+ * 7) Attention:
+ *    - low usage but relevant (weight >= attention-weight), not unused
+ *
+ * Options:
+ * - --namespace:
+ *   - namespace prefix used to map src/Service files to FQCNs (default App\\Service\\)
+ * - --format:
+ *   - md (default) or json
+ * - --output / -o:
+ *   - optional file path for writing the report
+ * - --top:
+ *   - number of entries in Top list (default 20)
+ * - --low:
+ *   - low usage threshold (<= low) (default 2)
+ * - --unused:
+ *   - unused threshold (<= unused) (default 0)
+ * - --critical:
+ *   - "critical" weight threshold (>= critical) (default 7)
+ * - --attention-weight:
+ *   - weight threshold for "Attention" list (default 5)
+ * - --min-impact:
+ *   - global filter (only include items with impact >= min-impact in all report sections)
+ *
+ * Output formats:
+ * - Markdown:
+ *   - human readable summary with tables
+ * - JSON:
+ *   - machine readable payload with meta + full sections
+ *
+ * Typical usage:
+ * - Print markdown report to console:
+ *   - php bin/console dashtk:usage:report
+ * - Write markdown report to file:
+ *   - php bin/console dashtk:usage:report -o var/docs/usage_report.md
+ * - JSON for automation:
+ *   - php bin/console dashtk:usage:report --format=json -o var/docs/usage_report.json
+ * - Filter to focus on meaningful impact:
+ *   - php bin/console dashtk:usage:report --min-impact=10
+ *
+ * Notes / limitations:
+ * - The tracked methods list is derived from source scanning under src/Service and reflection.
+ * - Counters are cache-based and TTL-dependent; "never_seen" may also occur when counters expired.
+ * - collectTrackedMethods() deduplicates by key; if two methods accidentally share a key, only one wins.
+ */
 #[AsCommand(
     name: 'dashtk:usage:report',
     description: 'Erzeugt einen Usage-Report (Top/Low/Unused) aus TrackUsage + UsageTracker inkl. weight/impact.'
 )]
 final class UsageReportCommand extends Command
 {
+    /**
+     * @param UsageTracker $usage Usage tracker cache abstraction.
+     */
     public function __construct(private readonly UsageTracker $usage)
     {
         parent::__construct();
     }
 
+    /**
+     * Configure CLI options for report generation.
+     *
+     * Options allow:
+     * - tuning thresholds (top/low/unused/critical/attention-weight/min-impact)
+     * - selecting output format (md/json)
+     * - writing output directly into a file (docs pipeline)
+     */
     protected function configure(): void
     {
         $this
@@ -35,10 +130,26 @@ final class UsageReportCommand extends Command
             ->addOption('unused', null, InputOption::VALUE_REQUIRED, 'Unused Schwelle (<= unused). Standard: 0', '0')
             ->addOption('critical', null, InputOption::VALUE_REQUIRED, 'Critical threshold (weight >= critical). Standard: 7', '7')
             ->addOption('attention-weight', null, InputOption::VALUE_REQUIRED, 'Attention: low usage aber weight >= X (Default: 5)', '5')
-            ->addOption('min-impact', null, InputOption::VALUE_REQUIRED, 'Filter: impact >= X (Default: 0)', '0')
-        ;
+            ->addOption('min-impact', null, InputOption::VALUE_REQUIRED, 'Filter: impact >= X (Default: 0)', '0');
     }
 
+    /**
+     * Executes report generation.
+     *
+     * Steps:
+     * 1) Collect tracked methods (keys + weight + location).
+     * 2) Enrich each tracked method with usage counters (count/seen) and compute impact.
+     * 3) Compute totals (totalUsage / totalImpact).
+     * 4) Apply optional min-impact filtering for all sections.
+     * 5) Build report sections (top/low/unused/criticalUnused/attention + summaryTop3).
+     * 6) Render as Markdown or JSON.
+     * 7) Print to console or write to output file.
+     *
+     * @param InputInterface  $input  CLI input.
+     * @param OutputInterface $output CLI output.
+     *
+     * @return int Command::SUCCESS on success, Command::FAILURE on output directory errors.
+     */
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $nsPrefix = (string) $input->getOption('namespace');
@@ -54,14 +165,16 @@ final class UsageReportCommand extends Command
 
         $tracked = $this->collectTrackedMethods($nsPrefix);
 
-        // Usage + Impact anreichern
+        // Enrich with usage counters + compute impact
         foreach ($tracked as &$r) {
             $r['seen']  = $this->usage->has($r['key']);
             $r['count'] = $this->usage->get($r['key']);
+
             $w = (int) ($r['weight'] ?? 1);
             if ($w < 1) {
                 $w = 1;
             }
+
             $r['weight'] = $w;
             $r['impact'] = (int) $r['count'] * $w;
         }
@@ -70,100 +183,100 @@ final class UsageReportCommand extends Command
         $totalUsage = 0;
         $totalImpact = 0;
         foreach ($tracked as $r) {
-            $totalUsage += (int)($r['count'] ?? 0);
-            $totalImpact += (int)($r['impact'] ?? 0);
+            $totalUsage += (int) ($r['count'] ?? 0);
+            $totalImpact += (int) ($r['impact'] ?? 0);
         }
 
-        // Optional: min-impact Filter (für ALLE Sektionen außer Meta)
+        // Optional: min-impact filter (for all sections)
         $filtered = $tracked;
         if ($minImpact > 0) {
             $filtered = array_values(array_filter(
                 $filtered,
-                static fn(array $r): bool => ((int)($r['impact'] ?? 0) >= $minImpact)
+                static fn(array $r): bool => ((int) ($r['impact'] ?? 0) >= $minImpact)
             ));
         }
 
-        // Top: primär Impact DESC, dann Count DESC, dann Key ASC
+        // Top: impact DESC, then count DESC, then key ASC
         $top = $filtered;
         usort($top, static function (array $a, array $b): int {
-            $c = ((int)($b['impact'] ?? 0) <=> (int)($a['impact'] ?? 0));
+            $c = ((int) ($b['impact'] ?? 0) <=> (int) ($a['impact'] ?? 0));
             if ($c !== 0) {
                 return $c;
             }
-            $c = ((int)($b['count'] ?? 0) <=> (int)($a['count'] ?? 0));
+            $c = ((int) ($b['count'] ?? 0) <=> (int) ($a['count'] ?? 0));
             if ($c !== 0) {
                 return $c;
             }
-            return strcmp((string)($a['key'] ?? ''), (string)($b['key'] ?? ''));
+            return strcmp((string) ($a['key'] ?? ''), (string) ($b['key'] ?? ''));
         });
         $top = array_slice($top, 0, $topN);
 
         // Unused: count <= unusedMax
         $unused = array_values(array_filter(
             $filtered,
-            static fn(array $r): bool => ((int)($r['count'] ?? 0) <= $unusedMax)
+            static fn(array $r): bool => ((int) ($r['count'] ?? 0) <= $unusedMax)
         ));
         usort($unused, static function (array $a, array $b): int {
-            // never_seen zuerst
+            // never_seen first
             $sa = ($a['seen'] ?? false) ? 1 : 0;
             $sb = ($b['seen'] ?? false) ? 1 : 0;
             if ($sa !== $sb) {
                 return $sa <=> $sb;
             }
-            // dann impact, dann count
-            $c = ((int)($a['impact'] ?? 0) <=> (int)($b['impact'] ?? 0));
+            // then impact ASC, then count ASC
+            $c = ((int) ($a['impact'] ?? 0) <=> (int) ($b['impact'] ?? 0));
             if ($c !== 0) {
                 return $c;
             }
-            return ((int)($a['count'] ?? 0) <=> (int)($b['count'] ?? 0));
+            return ((int) ($a['count'] ?? 0) <=> (int) ($b['count'] ?? 0));
         });
 
         // Low: unusedMax < count <= lowMax
         $low = array_values(array_filter($filtered, static fn(array $r): bool =>
-            ((int)($r['count'] ?? 0) > $unusedMax) && ((int)($r['count'] ?? 0) <= $lowMax)
+            ((int) ($r['count'] ?? 0) > $unusedMax) && ((int) ($r['count'] ?? 0) <= $lowMax)
         ));
         usort($low, static function (array $a, array $b): int {
-            $c = ((int)($b['impact'] ?? 0) <=> (int)($a['impact'] ?? 0));
+            $c = ((int) ($b['impact'] ?? 0) <=> (int) ($a['impact'] ?? 0));
             if ($c !== 0) {
                 return $c;
             }
-            return ((int)($b['count'] ?? 0) <=> (int)($a['count'] ?? 0));
+            return ((int) ($b['count'] ?? 0) <=> (int) ($a['count'] ?? 0));
         });
 
         // Critical unused: weight >= criticalMin AND count <= unusedMax
         $criticalUnused = array_values(array_filter($filtered, static fn(array $r): bool =>
-            ((int)($r['weight'] ?? 1) >= $criticalMin) && ((int)($r['count'] ?? 0) <= $unusedMax)
+            ((int) ($r['weight'] ?? 1) >= $criticalMin) && ((int) ($r['count'] ?? 0) <= $unusedMax)
         ));
-        usort($criticalUnused, static fn(array $a, array $b): int => ((int)($b['weight'] ?? 1) <=> (int)($a['weight'] ?? 1)));
+        usort($criticalUnused, static fn(array $a, array $b): int => ((int) ($b['weight'] ?? 1) <=> (int) ($a['weight'] ?? 1)));
 
-        // Attention: low usage aber relevant (weight >= attentionW), NICHT unused
+        // Attention: low usage but relevant (weight >= attentionW), NOT unused
         $attention = array_values(array_filter($filtered, static fn(array $r): bool =>
-            ((int)($r['count'] ?? 0) > $unusedMax) &&
-            ((int)($r['count'] ?? 0) <= $lowMax) &&
-            ((int)($r['weight'] ?? 1) >= $attentionW)
+            ((int) ($r['count'] ?? 0) > $unusedMax) &&
+            ((int) ($r['count'] ?? 0) <= $lowMax) &&
+            ((int) ($r['weight'] ?? 1) >= $attentionW)
         ));
-        usort($attention, static fn(array $a, array $b): int => ((int)($b['impact'] ?? 0) <=> (int)($a['impact'] ?? 0)));
+        usort($attention, static fn(array $a, array $b): int => ((int) ($b['impact'] ?? 0) <=> (int) ($a['impact'] ?? 0)));
 
         $summaryTop3 = array_slice($top, 0, 3);
 
         $meta = [
-            'generatedAt'    => date('c'),
-            'namespace'      => $nsPrefix,
-            'topN'           => $topN,
-            'lowMax'         => $lowMax,
-            'unusedMax'      => $unusedMax,
-            'criticalMin'    => $criticalMin,
-            'attentionWeight'=> $attentionW,
-            'minImpact'      => $minImpact,
-            'trackedCount'   => count($tracked), // tracked total (unfiltered)
-            'totalUsage'     => $totalUsage,
-            'totalImpact'    => $totalImpact,
-            'sortTopBy'      => 'impact_desc',
-            'impactFormula'  => 'impact = usage_count * weight',
-            'summary'        => [
-                'top3'          => $summaryTop3,
-                'attention'     => $attention,
-                'criticalUnused'=> $criticalUnused,
+            'generatedAt'     => date('c'),
+            'namespace'       => $nsPrefix,
+            'topN'            => $topN,
+            'lowMax'          => $lowMax,
+            'unusedMax'       => $unusedMax,
+            'criticalMin'     => $criticalMin,
+            'attentionWeight' => $attentionW,
+            'minImpact'       => $minImpact,
+            'trackedCount'    => count($tracked), // tracked total (unfiltered)
+            'totalUsage'      => $totalUsage,
+            'totalImpact'     => $totalImpact,
+            'sortTopBy'       => 'impact_desc',
+            'impactFormula'   => 'impact = usage_count * weight',
+            'summary'         => [
+                'top3'           => $summaryTop3,
+                'attention'      => $attention,
+                'criticalUnused' => $criticalUnused,
             ],
         ];
 
@@ -197,7 +310,24 @@ final class UsageReportCommand extends Command
     }
 
     /**
-     * @return array<int,array{key:string,weight:int,class:string,method:string,seen?:bool,count?:int,impact?:int}>
+     * Collect all unique TrackUsage entry points from service classes.
+     *
+     * - Scans src/Service and reflects methods.
+     * - Picks methods annotated with #[TrackUsage].
+     * - Captures key, weight and location (class + method).
+     * - Deduplicates by key (last writer wins in current implementation).
+     *
+     * @param string $namespacePrefix Namespace prefix used to build FQCNs from file paths.
+     *
+     * @return array<int, array{
+     *   key:string,
+     *   weight:int,
+     *   class:string,
+     *   method:string,
+     *   seen?:bool,
+     *   count?:int,
+     *   impact?:int
+     * }>
      */
     private function collectTrackedMethods(string $namespacePrefix): array
     {
@@ -233,10 +363,10 @@ final class UsageReportCommand extends Command
             }
         }
 
-        // unique by key
+        // unique by key (prevents double counting if keys are reused accidentally)
         $byKey = [];
         foreach ($rows as $r) {
-            $byKey[(string)$r['key']] = $r;
+            $byKey[(string) $r['key']] = $r;
         }
         ksort($byKey);
 
@@ -244,7 +374,11 @@ final class UsageReportCommand extends Command
     }
 
     /**
-     * @return array<int,string>
+     * Discover service classes by scanning src/Service and mapping paths to class names.
+     *
+     * @param string $namespacePrefix Namespace prefix (default App\\Service\\).
+     *
+     * @return array<int, string> Fully qualified class names.
      */
     private function discoverClasses(string $namespacePrefix): array
     {
@@ -273,13 +407,17 @@ final class UsageReportCommand extends Command
     }
 
     /**
-     * @param array<string,mixed> $meta
-     * @param array<int,array<string,mixed>> $summaryTop3
-     * @param array<int,array<string,mixed>> $attention
-     * @param array<int,array<string,mixed>> $top
-     * @param array<int,array<string,mixed>> $low
-     * @param array<int,array<string,mixed>> $unused
-     * @param array<int,array<string,mixed>> $criticalUnused
+     * Render the report as Markdown with a meta header, executive summary and tables per section.
+     *
+     * @param array<string,mixed>              $meta
+     * @param array<int,array<string,mixed>>   $summaryTop3
+     * @param array<int,array<string,mixed>>   $attention
+     * @param array<int,array<string,mixed>>   $top
+     * @param array<int,array<string,mixed>>   $low
+     * @param array<int,array<string,mixed>>   $unused
+     * @param array<int,array<string,mixed>>   $criticalUnused
+     *
+     * @return string Markdown content.
      */
     private function renderMarkdown(
         array $meta,
@@ -464,6 +602,13 @@ final class UsageReportCommand extends Command
         return implode("\n", $md);
     }
 
+    /**
+     * Ensure an output directory exists (mkdir -p behavior).
+     *
+     * @param string $dir Directory path.
+     *
+     * @return bool True if directory exists or could be created, otherwise false.
+     */
     private function ensureDir(string $dir): bool
     {
         if ($dir === '' || $dir === '.' || $dir === '/') {
