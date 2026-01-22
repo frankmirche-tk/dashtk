@@ -74,5 +74,15 @@ services:
 
     App\AI\Usage\AiUsageExtractor: ~
 
+    App\Tracing\Http\TracingHttpClient:
+        decorates: 'http_client'
+        arguments:
+            $inner: '@App\Tracing\Http\TracingHttpClient.inner'
+
+    App\Tracing\Export\TraceExportService:
+        arguments:
+            $projectDir: '%kernel.project_dir%'
+
+
 
 

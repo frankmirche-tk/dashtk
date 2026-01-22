@@ -12,6 +12,25 @@
                 <router-link class="btn" to="/kb/new">Neues Thema</router-link>
                 <router-link class="btn" to="/kb">Wissen bearbeiten</router-link>
                 <button class="btn" @click="newChat">Neuer Chat</button>
+
+                <!-- ✅ TRACE BUTTON -->
+                <button
+                    v-if="lastTraceId"
+                    class="btn"
+                    @click="openTrace"
+                    title="Letzten Request-Flow anzeigen"
+                >
+                    Flow anzeigen
+                </button>
+                <button
+                    v-if="lastTraceId"
+                    class="btn"
+                    @click="exportTrace"
+                    title="Trace als JSON exportieren"
+                >
+                    Trace exportieren
+                </button>
+
             </div>
         </header>
 
@@ -49,10 +68,10 @@
         />
     </div>
 </template>
-
 <script setup>
 import axios from 'axios'
 import { ref, computed } from 'vue'
+import { useRouter } from 'vue-router'
 import { uuid } from '../utils/uuid'
 
 import AvatarGuide from '@/views/AvatarGuide.vue'
@@ -60,12 +79,23 @@ import ChatMessages from '@/components/chat/ChatMessages.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 
 /**
+ * Router + Trace
+ */
+const router = useRouter()
+const lastTraceId = ref(null)
+
+function openTrace() {
+    if (!lastTraceId.value) return
+    router.push({ name: 'trace_view', params: { traceId: lastTraceId.value } })
+}
+
+/**
  * UI State
  */
 const input = ref('')
 const sending = ref(false)
-const provider = ref('gemini') // 'gemini' | 'openai'
-const model = ref(null)        // optional model string
+const provider = ref('gemini')
+const model = ref(null)
 
 const sessionId = ref(sessionStorage.getItem('sessionId') || uuid())
 sessionStorage.setItem('sessionId', sessionId.value)
@@ -90,7 +120,7 @@ const messages = ref([{ role: 'system', content: systemText() }])
 /**
  * Role labels
  */
-const ROLE_LABELS = { assistant: 'KI Antwort', system: 'System', user: 'Du' }
+const ROLE_LABELS = { assistant: 'KI Antwort', system: 'System', user: 'Du', info: 'Info' }
 function roleLabel(role) {
     return ROLE_LABELS[role] ?? role
 }
@@ -117,20 +147,17 @@ const inputAttentionEnabled = ref(true)
 const attentionKey = ref(0)
 
 /**
- * Provider change: System-Message aktualisieren
+ * Provider change
  */
 function onProviderChange() {
     model.value = null
-
     if (messages.value.length > 0 && messages.value[0].role === 'system') {
         messages.value[0].content = systemText()
-    } else {
-        messages.value.unshift({ role: 'system', content: systemText() })
     }
 }
 
 /**
- * Steps mapping (dein bestehendes Schema)
+ * Steps mapping
  */
 function mapSteps(raw) {
     if (!Array.isArray(raw)) return []
@@ -148,8 +175,7 @@ function mapSteps(raw) {
 }
 
 /**
- * CONTACT: Auswahl aus Mehrtreffern (kommt aus ChatMessages)
- * -> Wir zeigen danach sofort eine strukturierte Contact-Card im Chat (ohne KI).
+ * CONTACT selection
  */
 function onContactSelected(payload) {
     const type = payload?.type ?? null
@@ -158,13 +184,17 @@ function onContactSelected(payload) {
     pushContactCardMessage(type, match)
 }
 
+function pushContactCardMessage(type, match) {
+    const data = match?.data ?? {}
+    messages.value.push({
+        role: 'info',
+        content: '',
+        contactCard: { type, data },
+    })
+}
+
 /**
- * Send: Kontakt/Filiale hat Vorrang vor KI
- * 1) User-Message immer anzeigen
- * 2) Resolve versuchen
- *    - 1 Treffer + hohe Confidence => Contact-Card, KEIN /api/chat
- *    - >1 Treffer => Auswahl-Message, KEIN /api/chat
- *    - 0 Treffer => normal /api/chat
+ * SEND
  */
 async function send(textFromComposer) {
     const text = String(textFromComposer ?? input.value).trim()
@@ -178,40 +208,56 @@ async function send(textFromComposer) {
     sending.value = true
 
     try {
-        // 1) IMMER zuerst Kontakt auflösen
+        // 1) Contact resolve
         const { data: c } = await axios.post('/api/contact/resolve', { query: text })
 
         if (c?.type && c.type !== 'none' && Array.isArray(c.matches) && c.matches.length > 0) {
-            // Optional: kleine Info-Zeile statt KI
-            // messages.value.push({ role: 'info', content: 'Kontakt gefunden:' })
-
-            // 2) Alle Treffer als Cards ausgeben
+            lastTraceId.value = null
             for (const hit of c.matches) {
                 messages.value.push({
                     role: 'info',
                     content: '',
                     contactCard: {
-                        type: c.type,     // 'branch' | 'person'
-                        data: hit.data,   // dein JSON payload
+                        type: c.type,
+                        data: hit.data,
                     }
                 })
             }
-
-            // WICHTIG: hier abbrechen, KEIN /api/chat!
             return
         }
 
-        // 3) Kein Kontakt -> normaler Chat (KI / SOP)
-        const { data } = await axios.post('/api/chat', {
-            sessionId: sessionId.value,
-            message: text,
-            provider: provider.value,
-            model: model.value,
-        })
+        // 2) Normaler KI-Chat
+        const uiSpan = 'ui.ChatView.send.normal'
+        const uiAt = Date.now()
+
+        // 2) HTTP-Span "axios"
+        const httpSpan = 'http.api.chat'
+        const httpAt = Date.now()
+
+        const { data } = await axios.post(
+            '/api/chat',
+            {
+                sessionId: sessionId.value,
+                message: text,
+                provider: provider.value,
+                model: model.value,
+            },
+            {
+                headers: {
+                    'X-UI-Span': uiSpan,
+                    'X-UI-At': String(uiAt),
+
+                    // NEU: eigener HTTP-Span (für Tree)
+                    'X-UI-Http-Span': httpSpan,
+                    'X-UI-Http-At': String(httpAt),
+                },
+            }
+        )
+
+        lastTraceId.value = data.trace_id ?? null
 
         const p = data.provider ?? provider.value
         const m = data.model ?? model.value
-
         provider.value = p
         model.value = m ?? null
 
@@ -219,27 +265,18 @@ async function send(textFromComposer) {
             messages.value[0].content = systemText()
         }
 
-        const prefix = `(${providerModelLabel(p, m)}) `
         messages.value.push({
             role: 'assistant',
-            content: prefix + (data.answer ?? '[leer]'),
+            content: `(${providerModelLabel(p, m)}) ${data.answer ?? '[leer]'}`,
             matches: data.matches ?? [],
             steps: mapSteps(data.steps),
             provider: p,
             model: m ?? null,
         })
     } catch (e) {
-        console.error('chat error:', e)
-        const serverMsg =
-            (typeof e?.response?.data === 'string' && e.response.data) ||
-            e?.response?.data?.detail ||
-            e?.response?.data?.message ||
-            e?.response?.data?.error ||
-            null
-
         messages.value.push({
             role: 'assistant',
-            content: serverMsg ? `Serverfehler: ${serverMsg}` : 'Fehler beim Senden. Bitte dev.log prüfen.',
+            content: 'Fehler beim Senden. Bitte dev.log prüfen.',
         })
     } finally {
         sending.value = false
@@ -247,143 +284,35 @@ async function send(textFromComposer) {
 }
 
 /**
- * Resolver-Gate: erkennt Filialcode/Person und rendert strukturierte Chat-Einträge
- * @returns {Promise<boolean>} handled? (true => kein /api/chat mehr)
- */
-async function tryResolveContactAndRender(text) {
-    // optional: nur bei kurzen Eingaben, damit nicht jeder Satz resolve triggert
-    const tokenCount = String(text).trim().split(/\s+/).filter(Boolean).length
-    if (tokenCount > 2) return false
-
-    try {
-        const { data } = await axios.post('/api/contact/resolve', {
-            query: text,
-            limit: 5,
-        })
-
-        const matches = Array.isArray(data?.matches) ? data.matches : []
-        const type = data?.type ?? null
-
-        if (matches.length === 0) return false
-
-        // 1 Treffer -> wenn sehr sicher, sofort Contact-Card (ohne KI)
-        if (matches.length === 1) {
-            const m = matches[0]
-            const conf = Number(m?.confidence ?? 0)
-
-            // Filialcodes sollten praktisch immer sehr sicher sein; default: 0.95
-            if (conf >= 0.95) {
-                pushContactCardMessage(type, m)
-                return true
-            }
-
-            // bei niedriger confidence lieber nicht “hart” routen
-            return false
-        }
-
-        // Mehrtreffer -> alle Treffer als Kontaktkarten anzeigen (ohne Auswahl)
-        messages.value.push({
-            role: 'info',
-            content: `Mehrere Treffer für "${text}":`,
-        })
-
-        for (const m of matches) {
-            pushContactCardMessage(type, m)
-        }
-
-        return true
-    } catch (e) {
-        console.error('resolve error:', e)
-        return false
-    }
-}
-
-function pushContactCardMessage(type, match) {
-    const data = match?.data ?? {}
-
-    messages.value.push({
-        role: 'info',
-        content: '',
-        contactCard: { type, data },
-    })
-
-}
-
-function pushContactDisambiguationMessage(type, matches, originalQuery) {
-    messages.value.push({
-        role: 'info',
-        content: `Mehrere Treffer für "${originalQuery}". Bitte auswählen:`,
-        contactChoices: { type, matches },
-    })
-}
-
-
-/**
- * Text-Fallback (wird angezeigt, selbst wenn du später eine “echte Card” renderst)
- */
-function formatContactText(type, data) {
-    if (type === 'branch') {
-        const filialenNr = data.filialenNr ?? ''
-        const anschrift  = data.anschrift ?? ''
-        const strasse    = data.strasse ?? ''
-        const plz        = data.plz ?? ''
-        const ort        = data.ort ?? ''
-        const telefon    = data.telefon ?? ''
-        const email      = data.email ?? ''
-        const zusatz     = data.zusatz ?? ''
-        const gln        = data.gln ?? ''
-        const ecTerminalId = data.ecTerminalId ?? ''
-
-        const addressLine = [strasse, [plz, ort].filter(Boolean).join(' ')].filter(Boolean).join(', ')
-
-        return [
-            `Filiale: ${filialenNr}${anschrift ? ' – ' + anschrift : ''}`,
-            addressLine ? `Adresse: ${addressLine}${zusatz ? ' (' + zusatz + ')' : ''}` : null,
-            telefon ? `Telefon: ${telefon}` : null,
-            email ? `E-Mail: ${email}` : null,
-            gln ? `GLN: ${gln}` : null,
-            ecTerminalId ? `EC-Terminal: ${ecTerminalId}` : null,
-        ].filter(Boolean).join('\n')
-    }
-
-    if (type === 'person') {
-        // bleibt wie bisher
-        const first = data.first_name ?? ''
-        const last = data.last_name ?? ''
-        const dept = data.department ?? ''
-        const loc = data.location ?? ''
-        const phone = data.phone ?? ''
-        const email = data.email ?? ''
-
-        return [
-            `Kontakt: ${first} ${last}`,
-            (dept || loc) ? `Bereich: ${dept}${dept && loc ? ' – ' : ''}${loc}` : null,
-            phone ? `Telefon: ${phone}` : null,
-            email ? `E-Mail: ${email}` : null,
-        ].filter(Boolean).join('\n')
-    }
-
-    return 'Kontakt gefunden.'
-}
-
-
-/**
- * DB-only Steps (unverändert, nur minimal robust)
+ * DB-only steps
  */
 async function useDbStepsOnly(solutionId) {
     sending.value = true
     try {
-        const { data } = await axios.post('/api/chat', {
-            sessionId: sessionId.value,
-            message: '',
-            dbOnlySolutionId: solutionId,
-            provider: provider.value,
-            model: model.value,
-        })
+        const uiSpan = 'ui.ChatView.send.dbOnly'
+        const uiAt = Date.now()
+
+        const { data } = await axios.post(
+            '/api/chat',
+            {
+                sessionId: sessionId.value,
+                message: '',
+                dbOnlySolutionId: solutionId,
+                provider: provider.value,
+                model: model.value,
+            },
+            {
+                headers: {
+                    'X-UI-Span': uiSpan,
+                    'X-UI-At': String(uiAt),
+                },
+            }
+        )
+
+        lastTraceId.value = data.trace_id ?? null
 
         const p = data.provider ?? provider.value
         const m = data.model ?? model.value
-
         provider.value = p
         model.value = m ?? null
 
@@ -391,23 +320,14 @@ async function useDbStepsOnly(solutionId) {
             messages.value[0].content = systemText()
         }
 
-        const prefix = `(${providerModelLabel(p, m)}) `
         messages.value.push({
             role: 'assistant',
-            content: prefix + (data.answer ?? '[leer]'),
+            content: `(${providerModelLabel(p, m)}) ${data.answer ?? '[leer]'}`,
             matches: data.matches ?? [],
             steps: mapSteps(data.steps),
             provider: p,
             model: m ?? null,
         })
-
-        if (data.tts || data.mediaUrl) {
-            pendingGuide.value = {
-                tts: data.tts ?? 'Soll ich dir das als Avatar-Demo zeigen?',
-                mediaUrl: data.mediaUrl ?? '/guides/print/step1.gif',
-            }
-            avatarEnabled.value = false
-        }
     } finally {
         sending.value = false
     }
@@ -422,12 +342,11 @@ function newChat() {
 
     messages.value = [{ role: 'system', content: systemText() }]
     input.value = ''
-
     avatarEnabled.value = false
     pendingGuide.value = null
-
     inputAttentionEnabled.value = true
     attentionKey.value += 1
+    lastTraceId.value = null
 }
 
 function onNextStep() {
@@ -435,6 +354,20 @@ function onNextStep() {
         role: 'assistant',
         content: 'Alles klar. Schritt 2 folgt (Demo).',
         matches: [],
+    })
+}
+
+/**
+ * Trace Export
+ * Wichtig: Backend erwartet i.d.R. "traceId" (nicht trace_id).
+ * Wenn dein Controller aktuell trace_id liest, kannst du es unten wieder zurückdrehen.
+ */
+async function exportTrace() {
+    if (!lastTraceId.value) return
+
+    await axios.post('/api/trace/export', {
+        traceId: lastTraceId.value,
+        view: 'ChatView.vue',
     })
 }
 </script>

@@ -5,105 +5,119 @@ declare(strict_types=1);
 namespace App\Controller;
 
 use App\Service\SupportChatService;
+use App\Tracing\TraceContext;
+use App\Tracing\TraceManager;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Routing\Annotation\Route;
 
-/**
- * ChatController
- *
- * Purpose:
- * - HTTP API entry point for the internal support chatbot.
- * - Acts as a thin transport/controller layer that validates and normalizes
- *   request payload data before delegating all business logic to SupportChatService.
- *
- * Responsibilities:
- * - Decode JSON request payload.
- * - Extract and type-normalize supported parameters.
- * - Forward the request to the chat service.
- * - Return the service result as a JSON response.
- *
- * Design notes:
- * - This controller intentionally contains no chatbot logic.
- * - All orchestration, AI routing, KB/SOP matching, caching and usage tracking
- *   is handled by SupportChatService and downstream services.
- * - The API is designed to be stable for SPA or other frontend consumers.
- */
 final class ChatController extends AbstractController
 {
-    /**
-     * @param SupportChatService $chatService Central service orchestrating the support chat flow.
-     */
     public function __construct(
         private readonly SupportChatService $chatService,
+        private readonly TraceManager $traceManager,
     ) {}
 
-    /**
-     * Handle a chat request from the frontend.
-     *
-     * Expected JSON payload (simplified):
-     * {
-     *   "sessionId": "string",                // client-side session identifier
-     *   "message": "string",                  // user input / question
-     *   "dbOnlySolutionId": 123|null,          // optional: force DB-only solution
-     *   "provider": "gemini"|"openai"|...,     // optional: AI provider (default: gemini)
-     *   "model": "string"|null,                // optional: provider-specific model
-     *   "context": { ... }                     // optional: structured context data
-     * }
-     *
-     * Notes:
-     * - Unknown or missing fields are ignored.
-     * - context must be an array if present; otherwise it is discarded.
-     * - dbOnlySolutionId is only accepted if numeric; otherwise it is treated as null.
-     *
-     * @param Request $request Incoming HTTP request.
-     *
-     * @return JsonResponse JSON response containing the chatbot result and metadata.
-     */
     #[Route('/api/chat', name: 'app_chat', methods: ['POST'])]
     public function chat(Request $request): JsonResponse
     {
-        $payload = json_decode((string) $request->getContent(), true) ?: [];
+        // ✅ genau EIN Trace pro Request
+        $trace = $this->traceManager->start('http.api.chat');
+        TraceContext::set($trace);
 
-        // Session identifier used for conversation state / caching
-        $sessionId = (string) ($payload['sessionId'] ?? '');
+        // Optionaler UI-Span (kommt aus ChatView.vue Headern)
+        $uiSpan = (string) $request->headers->get('X-UI-Span', '');
+        $uiAt   = (string) $request->headers->get('X-UI-At', '');
 
-        // User message / question
-        $message = (string) ($payload['message'] ?? '');
-
-        // Optional: enforce DB-only solution lookup
-        $dbOnly = $payload['dbOnlySolutionId'] ?? null;
-        $dbOnlySolutionId = is_numeric($dbOnly) ? (int) $dbOnly : null;
-
-        // AI provider and optional model override
-        $provider = (string) ($payload['provider'] ?? 'gemini');
-        $model = isset($payload['model']) && is_string($payload['model'])
-            ? $payload['model']
-            : null;
-
-        // Optional structured context (must be an array)
-        $context = [];
-        if (isset($payload['context']) && is_array($payload['context'])) {
-            $context = $payload['context'];
+        if ($uiSpan !== '') {
+            $trace->span($uiSpan, static fn () => null, [
+                'ui_at' => $uiAt !== '' ? $uiAt : null,
+                'path' => $request->getPathInfo(),
+                'method' => $request->getMethod(),
+            ]);
         }
 
-        // Delegate processing to the support chat service
-        $result = $this->chatService->ask(
-            sessionId: $sessionId,
-            message: $message,
-            dbOnlySolutionId: $dbOnlySolutionId,
-            provider: $provider,
-            model: $model,
-            context: $context,
-        );
+        // Optionaler UI-Span (kommt aus ChatView.vue Headern)
+        $uiHttpSpan = (string) $request->headers->get('X-UI-Http-Span', '');
+        $uiHttpAt   = (string) $request->headers->get('X-UI-Http-At', '');
 
-        // Echo back provider/model metadata for transparency/debugging
-        $result['provider'] = $provider;
-        if ($model !== null) {
-            $result['model'] = $model;
+        if ($uiHttpSpan !== '') {
+            $trace->span($uiHttpSpan, static fn () => null, [
+                'ui_at' => $uiHttpAt !== '' ? $uiHttpAt : null,
+                'path' => $request->getPathInfo(),
+                'method' => $request->getMethod(),
+            ]);
         }
 
-        return new JsonResponse($result);
+        // Controller Span und Route
+        $routeName = (string) $request->attributes->get('_route', '');
+        $routePath = $request->getPathInfo();
+
+        $trace->span('controller.ChatController::chat', static fn () => null, [
+            'route' => $routeName,
+            'path' => $routePath,
+            'method' => $request->getMethod(),
+        ]);
+
+
+        try {
+            $payload = json_decode((string) $request->getContent(), true) ?: [];
+
+            $sessionId = (string) ($payload['sessionId'] ?? '');
+            $message = (string) ($payload['message'] ?? '');
+
+            $dbOnly = $payload['dbOnlySolutionId'] ?? null;
+            $dbOnlySolutionId = is_numeric($dbOnly) ? (int) $dbOnly : null;
+
+            $provider = (string) ($payload['provider'] ?? 'gemini');
+            $model = isset($payload['model']) && is_string($payload['model'])
+                ? $payload['model']
+                : null;
+
+            $context = [];
+            if (isset($payload['context']) && is_array($payload['context'])) {
+                $context = $payload['context'];
+            }
+
+            // ✅ Hauptspan: support_chat.ask (alles darunter)
+            $result = $trace->span('support_chat.ask', function () use (
+                $sessionId,
+                $message,
+                $dbOnlySolutionId,
+                $provider,
+                $model,
+                $context,
+                $trace
+            ) {
+                return $this->chatService->ask(
+                    sessionId: $sessionId,
+                    message: $message,
+                    dbOnlySolutionId: $dbOnlySolutionId,
+                    provider: $provider,
+                    model: $model,
+                    context: $context,
+                    trace: $trace,
+                );
+            }, [
+                'provider' => $provider,
+                'model' => $model,
+                'db_only' => $dbOnlySolutionId !== null,
+            ]);
+
+            // Response Meta
+            $result['provider'] = $provider;
+            if ($model !== null) {
+                $result['model'] = $model;
+            }
+
+            // Trace-ID ans Frontend
+            $result['trace_id'] = $trace->getTraceId();
+
+            return new JsonResponse($result);
+        } finally {
+            TraceContext::set(null);
+            $trace->finish();
+        }
     }
 }
