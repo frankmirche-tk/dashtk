@@ -1,18 +1,24 @@
-
 ###> symfony/framework-bundle ###
 /.env.local
 /.env.local.php
 /.env.*.local
 /config/secrets/prod/prod.decrypt.private.php
-/public/bundles/
-/var/
-/vendor/
 ###< symfony/framework-bundle ###
 
 ###> pentatrion/vite-bundle ###
 /node_modules/
 /public/build/
 ###< pentatrion/vite-bundle ###
-SymfonyBenutzung.txt
-SymfonyBenutzung.txt
+
+# uploads / persist-only (symlink to /var/www/persist/...)
 /public/guides/
+
+# local-only notes
+/SymfonyBenutzung.txt
+
+# optional: if deploy.sh should stay server-local only
+# /deploy.sh
+
+# recommended (usually already there in many projects)
+/var/
+/vendor/
