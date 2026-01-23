@@ -1,132 +1,72 @@
-// assets/src/components/trace/traceTree.js
 import { mapLabel } from './traceMap'
 
 // mode: "flow" | "debug"
-// - flow: gruppiert nach Prefix (ui / support_chat / ai / gateway / adapter / ...)
-// - debug: flach (alle spans als children unter einem Root)
+// flow: parent/child tree (parent_span_id)
+// debug: flat list
 export function buildTree(apiData, { mode = 'flow' } = {}) {
     const spans = Array.isArray(apiData?.spans) ? apiData.spans : []
-
-    // defensive: wenn API mal nur nodes liefert
-    const normalized = spans.length
-        ? spans
-        : (Array.isArray(apiData?.nodes)
-            ? apiData.nodes.map(n => ({
-                sequence: n.sequence ?? 0,
-                name: n.id ?? '',
-                duration_ms: n.duration_ms ?? 0,
-                meta: n.meta ?? {},
-            }))
-            : [])
-
-    // sort by sequence (wichtig!)
-    normalized.sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
-
-    // Debug logs nur innerhalb der Funktion (nie auf Module-Level!)
-    console.log('[traceTree] mode=', mode, 'normalized=', normalized.length)
-    if (normalized.length) console.log('[traceTree] first=', normalized[0])
+    spans.sort((a, b) => (a.sequence ?? 0) - (b.sequence ?? 0))
 
     if (mode === 'debug') {
-        return [
-            {
-                id: 'debug.spans',
-                label: 'Raw spans (Debug)',
-                duration_ms: null,
-                meta: {},
-                children: normalized.map(s => toNode(s)),
-            },
-        ]
+        return [{
+            id: 'debug.spans',
+            label: 'Raw spans (Debug)',
+            duration_ms: null,
+            meta: {},
+            children: spans.map(toNode),
+        }]
     }
 
-    // FLOW mode: prefix tree
-    const rootMap = new Map()
+    const byId = new Map()
+    const roots = []
 
-    for (const s of normalized) {
-        // wichtig: "name" muss existieren, fallback auf id
-        const name = String(s.name ?? s.id ?? '')
-        if (!name) continue
+    for (const s of spans) {
+        const id = String(s.span_id || '')
+        if (!id) continue
 
-        const parts = name.split('.')
-        let currentMap = rootMap
-        let currentPath = ''
+        byId.set(id, {
+            id,
+            label: mapLabel(String(s.name ?? '')),
+            duration_ms: Number(s.duration_ms ?? 0),
+            meta: (s.meta && typeof s.meta === 'object') ? s.meta : {},
+            children: [],
+            _parent: s.parent_span_id ? String(s.parent_span_id) : null,
+            _seq: Number(s.sequence ?? 0),
+        })
+    }
 
-        for (let i = 0; i < parts.length; i++) {
-            const part = parts[i]
-            currentPath = currentPath ? `${currentPath}.${part}` : part
-
-            if (!currentMap.has(part)) {
-                currentMap.set(part, {
-                    id: currentPath,
-                    label: part,
-                    duration_ms: null,
-                    meta: {},
-                    childrenMap: new Map(),
-                    leaf: null,
-                })
-            }
-
-            const node = currentMap.get(part)
-
-            if (i === parts.length - 1) {
-                // leaf = echter Span
-                node.leaf = toNode({ ...s, name })
-            }
-
-            currentMap = node.childrenMap
+    for (const node of byId.values()) {
+        if (node._parent && byId.has(node._parent)) {
+            byId.get(node._parent).children.push(node)
+        } else {
+            roots.push(node)
         }
     }
 
-    // Map -> Array + merge leaf/meta
-    const roots = [...rootMap.values()].map(v => materialize(v))
-    console.log('[traceTree] roots=', roots.length)
+    function sortRec(n) {
+        n.children.sort((a, b) => a._seq - b._seq)
+        n.children.forEach(sortRec)
+    }
+
+    roots.sort((a, b) => a._seq - b._seq)
+    roots.forEach(sortRec)
+
+    function strip(n) {
+        delete n._parent
+        delete n._seq
+        n.children.forEach(strip)
+    }
+    roots.forEach(strip)
+
     return roots
 }
 
-function toNode(span) {
-    const id = String(span.name ?? span.id ?? '')
-
-    // Meta: bevorzugt "meta" object, fallback auf meta_json string
-    const meta =
-        span.meta && typeof span.meta === 'object'
-            ? span.meta
-            : (span.meta_json && typeof span.meta_json === 'string'
-                ? (safeJson(span.meta_json) ?? {})
-                : {})
-
+function toNode(s) {
     return {
-        id,
-        label: mapLabel(id), // Mapping (schöne Namen)
-        duration_ms: Number(span.duration_ms ?? 0),
-        meta,
+        id: String(s.span_id || ''),
+        label: mapLabel(String(s.name ?? '')),
+        duration_ms: Number(s.duration_ms ?? 0),
+        meta: (s.meta && typeof s.meta === 'object') ? s.meta : {},
         children: [],
-    }
-}
-
-function materialize(entry) {
-    const children = [...entry.childrenMap.values()].map(v => materialize(v))
-
-    // wenn leaf existiert: leaf wird “Knoten” + children darunter
-    if (entry.leaf) {
-        return {
-            ...entry.leaf,
-            children,
-        }
-    }
-
-    // nur group node
-    return {
-        id: entry.id,
-        label: entry.label,
-        duration_ms: null,
-        meta: {},
-        children,
-    }
-}
-
-function safeJson(s) {
-    try {
-        return JSON.parse(s)
-    } catch {
-        return null
     }
 }

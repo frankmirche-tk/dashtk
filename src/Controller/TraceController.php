@@ -20,51 +20,24 @@ final class TraceController extends AbstractController
             return $this->json(['error' => 'Trace not found'], 404);
         }
 
-        // ✅ Spans sicher sortieren
-        usort(
-            $spans,
-            static fn(array $a, array $b) => ((int)($a['sequence'] ?? 0)) <=> ((int)($b['sequence'] ?? 0))
-        );
-
-        // nodes/edges als "lineare Kette" – fürs Frontend reicht das völlig
-        $nodes = [];
-        $edges = [];
-
-        $prev = null;
-        foreach ($spans as $span) {
-            $name = (string)($span['name'] ?? '');
-            if ($name === '') {
-                continue;
-            }
-
-            $nodes[] = [
-                'id' => $name,
-                'label' => $name,
-                'duration_ms' => (int)($span['duration_ms'] ?? 0),
-                'sequence' => (int)($span['sequence'] ?? 0),
-                'meta' => json_decode((string)($span['meta_json'] ?? '[]'), true) ?: [],
+        $out = array_map(static function (array $s): array {
+            return [
+                'sequence' => (int)($s['sequence'] ?? 0),
+                'name' => (string)($s['name'] ?? ''),
+                'span_id' => (string)($s['span_id'] ?? ''),
+                'parent_span_id' => $s['parent_span_id'] !== null ? (string)$s['parent_span_id'] : null,
+                'started_at_ms' => (int)($s['started_at_ms'] ?? 0),
+                'ended_at_ms' => (int)($s['ended_at_ms'] ?? 0),
+                'duration_ms' => (int)($s['duration_ms'] ?? 0),
+                'meta' => $s['meta_json'] ? (json_decode((string)$s['meta_json'], true) ?: []) : [],
             ];
-
-            if ($prev !== null) {
-                $edges[] = ['from' => $prev, 'to' => $name];
-            }
-            $prev = $name;
-        }
+        }, $spans);
 
         return $this->json([
             'trace_id' => $traceId,
-            'total_ms' => (int)($trace['total_ms'] ?? 0),
-            'nodes' => $nodes,
-            'edges' => $edges,
-            // optional: spans raw (praktisch für Debug / später)
-            'spans' => array_map(static function (array $s): array {
-                return [
-                    'sequence' => (int)($s['sequence'] ?? 0),
-                    'name' => (string)($s['name'] ?? ''),
-                    'duration_ms' => (int)($s['duration_ms'] ?? 0),
-                    'meta' => json_decode((string)($s['meta_json'] ?? '[]'), true) ?: [],
-                ];
-            }, $spans),
+            'view' => (string)($trace['view'] ?? ''),
+            'exported_at' => (string)($trace['exported_at'] ?? ''),
+            'spans' => $out,
         ]);
     }
 }

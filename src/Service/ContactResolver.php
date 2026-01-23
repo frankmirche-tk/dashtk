@@ -1,17 +1,21 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Service;
 
 use App\Attribute\TrackUsage;
+use App\Tracing\Trace;
+
 
 /**
  * Resolves internal contact and branch information from local JSON files.
  *
- * Purpose / Privacy intent:
+ * Privacy / policy:
  * - This resolver is explicitly designed to keep contact/branch lookup local.
  * - Data from these JSON files must NOT be sent to external AI providers.
- * - The result can be used by higher-level services (e.g. SupportChatService) to
- *   respond with verified contact details without leaking personal data.
+ * - Higher-level services can use the result to respond with verified contact details
+ *   without leaking personal data.
  *
  * Data sources:
  * - var/data/kontakt_personen.json
@@ -19,14 +23,15 @@ use App\Attribute\TrackUsage;
  *
  * Matching strategy (high level):
  * 1) Branch code match (exact / normalized), e.g. "COSU", "LPGU"
- * 2) Person match by name tokens and additionally by department/company/notes
- *
- * Usage tracking:
- * - Marked as a tracked entry point via #[TrackUsage]
- * - Explicitly increments UsageTracker for deterministic reporting / linting
+ * 2) Person match by name tokens and additional fields (department/company/notes)
  */
 final class ContactResolver
 {
+    /**
+     * Usage tracking key for this resolver entry point.
+     */
+    public const USAGE_KEY_RESOLVE = 'contact_resolver.resolve';
+
     /**
      * Absolute path to the local JSON file containing persons.
      */
@@ -36,11 +41,6 @@ final class ContactResolver
      * Absolute path to the local JSON file containing branches/filialen.
      */
     private string $branchesFile;
-
-    /**
-     * Usage tracking key for this resolver entry point.
-     */
-    private const USAGE_KEY_RESOLVE = 'contact_resolver.resolve';
 
     /**
      * In-memory cache of decoded persons JSON.
@@ -56,14 +56,12 @@ final class ContactResolver
      */
     private ?array $branches = null;
 
-    /**
-     * @param string       $projectDir    Symfony project root directory (kernel.project_dir).
-     * @param UsageTracker $usageTracker  Usage tracker for deterministic counting/reporting.
-     */
-    public function __construct(string $projectDir, private readonly UsageTracker $usageTracker)
-    {
-        $this->personsFile  = $projectDir . '/var/data/kontakt_personen.json';
-        $this->branchesFile = $projectDir . '/var/data/kontakt_filialen.json';
+    public function __construct(
+        string $projectDir,
+        private readonly UsageTracker $usageTracker
+    ) {
+        $this->personsFile  = rtrim($projectDir, '/') . '/var/data/kontakt_personen.json';
+        $this->branchesFile = rtrim($projectDir, '/') . '/var/data/kontakt_filialen.json';
     }
 
     /**
@@ -80,24 +78,26 @@ final class ContactResolver
      * - confidence: float 0..1 (rounded to 2 decimals for persons)
      * - data: original record payload (array)
      *
-     * Notes:
-     * - This method is a "business entry point" for local contact lookup and is tracked.
-     * - $limit is applied after ranking/sorting (persons) or after match collection (branches).
-     *
-     * @param string $query Raw user query (may contain casing/umlauts/punctuation).
-     * @param int    $limit Maximum number of matches to return.
+     * @param string     $query Raw user query (may contain casing/umlauts/punctuation).
+     * @param int        $limit Maximum number of matches to return (applied after ranking/slicing).
+     * @param Trace|null $trace Optional trace for UI tree/debugging.
      *
      * @return array{
      *   query: string,
      *   query_norm: string,
      *   type: 'branch'|'person'|'none',
-     *   matches: array<int, array<string, mixed>>
+     *   matches: array<int, array{
+     *     id: string,
+     *     label: string,
+     *     confidence: float,
+     *     data: array<string, mixed>
+     *   }>
      * }
      */
     #[TrackUsage(self::USAGE_KEY_RESOLVE, weight: 3)]
-    public function resolve(string $query, int $limit = 5): array
+    public function resolve(string $query, int $limit = 5, ?Trace $trace = null): array
     {
-        // Explicit tracking call (required by policy / linting)
+        // deterministic usage tracking (policy/linting requirement)
         $this->usageTracker->increment(self::USAGE_KEY_RESOLVE);
 
         $query = trim($query);
@@ -112,9 +112,42 @@ final class ContactResolver
             ];
         }
 
-        // 1) Branch code check (COSU/LPGU etc.)
-        $branchMatches = $this->matchBranchCode($query, $qNorm);
-        if (count($branchMatches) > 0) {
+        // Preload JSON with spans (so "why fast/slow" is visible in trace tree)
+        if ($trace) {
+            $trace->span('contact.load.persons_json', function () {
+                $this->loadPersons();
+                return null;
+            }, [
+                'file' => basename($this->personsFile),
+                'cache_hit' => $this->persons !== null,
+                'policy' => 'local_only',
+            ]);
+
+            $trace->span('contact.load.branches_json', function () {
+                $this->loadBranches();
+                return null;
+            }, [
+                'file' => basename($this->branchesFile),
+                'cache_hit' => $this->branches !== null,
+                'policy' => 'local_only',
+            ]);
+        } else {
+            // ensure loaded anyway
+            $this->loadPersons();
+            $this->loadBranches();
+        }
+
+        // 1) Branch code check
+        $branchMatches = $trace
+            ? $trace->span('contact.match.branch', function () use ($query, $qNorm) {
+                return $this->matchBranchCode($query, $qNorm);
+            }, [
+                'query_len' => mb_strlen($query),
+                'policy' => 'local_only',
+            ])
+            : $this->matchBranchCode($query, $qNorm);
+
+        if ($branchMatches !== []) {
             return [
                 'query' => $query,
                 'query_norm' => $qNorm,
@@ -123,9 +156,17 @@ final class ContactResolver
             ];
         }
 
-        // 2) Person matching (first/last name, company/department/notes)
-        $personMatches = $this->matchPersons($query, $qNorm);
-        if (count($personMatches) > 0) {
+        // 2) Person matching
+        $personMatches = $trace
+            ? $trace->span('contact.match.person', function () use ($query, $qNorm) {
+                return $this->matchPersons($query, $qNorm);
+            }, [
+                'query_len' => mb_strlen($query),
+                'policy' => 'local_only',
+            ])
+            : $this->matchPersons($query, $qNorm);
+
+        if ($personMatches !== []) {
             return [
                 'query' => $query,
                 'query_norm' => $qNorm,
@@ -148,57 +189,60 @@ final class ContactResolver
      * @param string $queryRaw Raw user query.
      * @param string $qNorm    Normalized query (already computed).
      *
-     * @return array<int, array<string, mixed>> List of branch matches.
+     * @return array<int, array{
+     *   id: string,
+     *   label: string,
+     *   confidence: float,
+     *   data: array<string, mixed>
+     * }>
      */
     private function matchBranchCode(string $queryRaw, string $qNorm): array
     {
         $branches = $this->loadBranches();
 
-        // Candidate (raw) "cosu" -> "COSU"
-        $candidate = strtoupper((string)(preg_replace('/\s+/', '', $queryRaw) ?? ''));
-        // Normalized (defensive) to handle special chars
+        $candidate = strtoupper((string) (preg_replace('/\s+/', '', $queryRaw) ?? ''));
         $candidateNorm = $this->normalize($queryRaw);
 
         $results = [];
+
         foreach ($branches as $b) {
             $code = strtoupper((string)($b['filialenNr'] ?? ''));
             if ($code === '') {
                 continue;
             }
 
-            // Primary: exact code match
             $isExact = ($candidate === $code);
+            $isNorm  = ($candidateNorm !== '' && $candidateNorm === $this->normalize($code));
 
-            // Fallback: normalized comparison
-            $isNorm = ($candidateNorm !== '' && $candidateNorm === $this->normalize($code));
-
-            if ($isExact || $isNorm) {
-                $filialenId = $b['filialenId'] ?? null;
-
-                $results[] = [
-                    'id' => (string)($b['id'] ?? ($filialenId ?? $code)),
-                    'label' => sprintf(
-                        '%s – %s – %s',
-                        $filialenId !== null ? (string)$filialenId : '?',
-                        (string)($b['filialenNr'] ?? ''),
-                        (string)($b['anschrift'] ?? '')
-                    ),
-                    'confidence' => 0.99,
-                    'data' => [
-                        'filialenId'    => $b['filialenId'] ?? null,
-                        'filialenNr'    => $b['filialenNr'] ?? null,
-                        'anschrift'     => $b['anschrift'] ?? null,
-                        'strasse'       => $b['strasse'] ?? null,
-                        'plz'           => $b['plz'] ?? null,
-                        'ort'           => $b['ort'] ?? null,
-                        'telefon'       => $b['telefon'] ?? null,
-                        'email'         => $b['email'] ?? null,
-                        'zusatz'        => $b['zusatz'] ?? null,
-                        'gln'           => $b['gln'] ?? null,
-                        'ecTerminalId'  => $b['ecTerminalId'] ?? null,
-                    ],
-                ];
+            if (!$isExact && !$isNorm) {
+                continue;
             }
+
+            $filialenId = $b['filialenId'] ?? null;
+
+            $results[] = [
+                'id' => (string)($b['id'] ?? ($filialenId ?? $code)),
+                'label' => sprintf(
+                    '%s – %s – %s',
+                    $filialenId !== null ? (string)$filialenId : '?',
+                    (string)($b['filialenNr'] ?? ''),
+                    (string)($b['anschrift'] ?? '')
+                ),
+                'confidence' => 0.99,
+                'data' => [
+                    'filialenId'    => $b['filialenId'] ?? null,
+                    'filialenNr'    => $b['filialenNr'] ?? null,
+                    'anschrift'     => $b['anschrift'] ?? null,
+                    'strasse'       => $b['strasse'] ?? null,
+                    'plz'           => $b['plz'] ?? null,
+                    'ort'           => $b['ort'] ?? null,
+                    'telefon'       => $b['telefon'] ?? null,
+                    'email'         => $b['email'] ?? null,
+                    'zusatz'        => $b['zusatz'] ?? null,
+                    'gln'           => $b['gln'] ?? null,
+                    'ecTerminalId'  => $b['ecTerminalId'] ?? null,
+                ],
+            ];
         }
 
         return $results;
@@ -207,7 +251,7 @@ final class ContactResolver
     /**
      * Match persons by name tokens and additional fields (department/company/notes).
      *
-     * Scoring (rough guideline):
+     * Scoring guideline:
      * - 0.98: first + last name token hit
      * - 0.90: exact last name
      * - 0.75: exact first name
@@ -217,13 +261,17 @@ final class ContactResolver
      * @param string $queryRaw Raw query (currently only used for symmetry/debugging).
      * @param string $qNorm    Normalized query.
      *
-     * @return array<int, array<string, mixed>> Ranked list of person matches.
+     * @return array<int, array{
+     *   id: string,
+     *   label: string,
+     *   confidence: float,
+     *   data: array<string, mixed>
+     * }>
      */
     private function matchPersons(string $queryRaw, string $qNorm): array
     {
         $persons = $this->loadPersons();
 
-        // Tokenization: "Frank Müller" => ["frank","mueller"]
         $tokens = array_values(array_filter(
             preg_split('/\s+/', $qNorm) ?: [],
             static fn($t) => $t !== ''
@@ -244,11 +292,11 @@ final class ContactResolver
 
             $score = 0.0;
 
-            if ($qNorm === $lastNorm && $lastNorm !== '') {
+            if ($qNorm !== '' && $qNorm === $lastNorm && $lastNorm !== '') {
                 $score = max($score, 0.90);
             }
 
-            if ($qNorm === $firstNorm && $firstNorm !== '') {
+            if ($qNorm !== '' && $qNorm === $firstNorm && $firstNorm !== '') {
                 $score = max($score, 0.75);
             }
 
@@ -260,11 +308,11 @@ final class ContactResolver
                 }
             }
 
-            if ($score < 0.90) {
-                if ($qNorm !== '' && (
-                        ($lastNorm !== '' && str_contains($lastNorm, $qNorm)) ||
-                        ($firstNorm !== '' && str_contains($firstNorm, $qNorm))
-                    )) {
+            if ($score < 0.90 && $qNorm !== '') {
+                if (
+                    ($lastNorm !== '' && str_contains($lastNorm, $qNorm)) ||
+                    ($firstNorm !== '' && str_contains($firstNorm, $qNorm))
+                ) {
                     $score = max($score, 0.60);
                 }
             }
@@ -279,26 +327,27 @@ final class ContactResolver
                 }
             }
 
-            if ($score > 0.0) {
-                $label = trim(sprintf(
-                    '%s %s – %s (%s)',
-                    (string)($p['first_name'] ?? ''),
-                    (string)($p['last_name'] ?? ''),
-                    (string)($p['department'] ?? ''),
-                    (string)($p['location'] ?? '')
-                ));
-
-                $results[] = [
-                    'id' => (string)($p['id'] ?? ''),
-                    'label' => $label,
-                    'confidence' => round($score, 2),
-                    'data' => $p,
-                ];
+            if ($score <= 0.0) {
+                continue;
             }
+
+            $label = trim(sprintf(
+                '%s %s – %s (%s)',
+                (string)($p['first_name'] ?? ''),
+                (string)($p['last_name'] ?? ''),
+                (string)($p['department'] ?? ''),
+                (string)($p['location'] ?? '')
+            ));
+
+            $results[] = [
+                'id' => (string)($p['id'] ?? ''),
+                'label' => $label,
+                'confidence' => round($score, 2),
+                'data' => $p,
+            ];
         }
 
-        // Sort: highest confidence first, then label
-        usort($results, static function ($a, $b) {
+        usort($results, static function (array $a, array $b): int {
             $c = ($b['confidence'] <=> $a['confidence']);
             if ($c !== 0) {
                 return $c;

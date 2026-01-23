@@ -8,6 +8,7 @@ use App\AI\AiChatGateway;
 use App\Attribute\TrackUsage;
 use App\Entity\SupportSolution;
 use App\Repository\SupportSolutionRepository;
+use App\Service\ContactResolver; // <-- NEU
 use App\Tracing\Trace;
 use Psr\Log\LoggerInterface;
 use Symfony\Contracts\Cache\CacheInterface;
@@ -25,6 +26,7 @@ final class SupportChatService
         private readonly CacheInterface $cache,
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly UsageTracker $usageTracker,
+        private readonly ContactResolver $contactResolver, // <-- NEU
     ) {}
 
     private function span(?Trace $trace, string $name, callable $fn, array $meta = [])
@@ -69,6 +71,91 @@ final class SupportChatService
             ]);
         }
 
+        /**
+         * BRANCH B0 (NEU): Local Contact Resolver (Privacy: local_only, send_to_ai=false)
+         *
+         * Ziel:
+         * - Wenn User nach Kontaktdaten / Filialen / Personen fragt, lösen wir das lokal aus JSON.
+         * - Diese Daten dürfen NICHT an externe Provider gehen.
+         * - Der Schritt erscheint im Trace als Child-Span unter support_chat.ask.
+         */
+        $contactHint = $this->span($trace, 'contact.intent.detect', function () use ($message) {
+            $m = mb_strtolower($message);
+
+            // einfache Heuristik (pragmatisch, kann später erweitert werden)
+            $keywords = [
+                'kontakt', 'kontaktperson', 'ansprechpartner', 'telefon', 'tel', 'email', 'e-mail',
+                'filiale', 'filialen', 'standort', 'adresse', 'anschrift', 'öffnungszeiten',
+                'cosu', 'lpgu', // branch code examples
+            ];
+
+            foreach ($keywords as $k) {
+                if (str_contains($m, $k)) {
+                    return ['hit' => true, 'keyword' => $k];
+                }
+            }
+
+            // Wenn User nur ein kurzes Token schreibt, lassen wir resolve trotzdem zu (z.B. "COSU")
+            $len = mb_strlen(trim($m));
+            return ['hit' => ($len > 0 && $len <= 8), 'keyword' => null];
+        }, [
+            'msg_len' => mb_strlen($message),
+        ]);
+
+        $contactResult = $this->span($trace, 'contact.resolve', function () use ($message, $trace) {
+            // Resolver bekommt Trace optional -> kann Unterspans schreiben
+            return $this->contactResolver->resolve($message, 5, $trace);
+        }, [
+            'policy' => 'local_only',
+            'send_to_ai' => false,
+            'source' => 'var/data/kontakt_*.json',
+        ]);
+
+        // Wenn intent positiv ODER resolver hat matches -> wir antworten local-only und stoppen AI-Flow
+        $hasContactMatches = is_array($contactResult) && !empty($contactResult['matches']);
+        $intentHit = (bool)($contactHint['hit'] ?? false);
+
+        if ($intentHit || $hasContactMatches) {
+            $answer = $this->span($trace, 'contact.answer.build', function () use ($contactResult) {
+                $type = (string)($contactResult['type'] ?? 'none');
+                $matches = $contactResult['matches'] ?? [];
+
+                if (!is_array($matches) || $matches === []) {
+                    return "Ich habe lokal keine passenden Kontaktdaten gefunden. Bitte nenne mir einen Namen, eine FilialenNr (z.B. COSU) oder einen Standort.";
+                }
+
+                $lines = [];
+                if ($type === 'branch') {
+                    $lines[] = "Gefundene Filiale(n) (lokal):";
+                } elseif ($type === 'person') {
+                    $lines[] = "Gefundene Kontaktperson(en) (lokal):";
+                } else {
+                    $lines[] = "Lokale Treffer:";
+                }
+
+                foreach ($matches as $m) {
+                    $label = (string)($m['label'] ?? '');
+                    $conf = isset($m['confidence']) ? (string)$m['confidence'] : '';
+                    $lines[] = "- {$label}" . ($conf !== '' ? " (Confidence {$conf})" : '');
+                }
+
+                $lines[] = "";
+                $lines[] = "Hinweis: Diese Kontaktdaten wurden **lokal** aus JSON ermittelt und **nicht** an einen AI-Provider gesendet.";
+
+                return implode("\n", $lines);
+            }, [
+                'type' => (string)($contactResult['type'] ?? 'none'),
+                'match_count' => is_array($contactResult['matches'] ?? null) ? count($contactResult['matches']) : 0,
+            ]);
+
+            return [
+                'answer' => $answer,
+                'matches' => [],
+                'modeHint' => 'contact_local',
+                'contact' => $contactResult,
+            ];
+        }
+
         // BRANCH B: AI + DB
         $matches = $this->span($trace, 'kb.match', function () use ($message) {
             return $this->findMatches($message);
@@ -102,7 +189,7 @@ final class SupportChatService
             return $this->buildKbContext($matches);
         }, [
             'match_count' => count($matches),
-            'kb_chars' => is_array($matches) ? null : null,
+            'kb_chars' => null,
         ]);
 
         $context = $this->span($trace, 'ai.context_defaults', function () use ($context) {
@@ -184,7 +271,8 @@ final class SupportChatService
         ];
     }
 
-    private function answerDbOnly(string $sessionId, int $solutionId): array
+
+private function answerDbOnly(string $sessionId, int $solutionId): array
     {
         $solution = $this->solutions->find($solutionId);
 

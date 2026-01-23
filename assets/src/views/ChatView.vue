@@ -13,17 +13,18 @@
                 <router-link class="btn" to="/kb">Wissen bearbeiten</router-link>
                 <button class="btn" @click="newChat">Neuer Chat</button>
 
-                <!-- ✅ TRACE BUTTON -->
+                <!-- ✅ TRACE BUTTONS (DEV only) -->
                 <button
-                    v-if="lastTraceId"
+                    v-if="isDev && lastTraceId"
                     class="btn"
                     @click="openTrace"
                     title="Letzten Request-Flow anzeigen"
                 >
                     Flow anzeigen
                 </button>
+
                 <button
-                    v-if="lastTraceId"
+                    v-if="isDev && lastTraceId"
                     class="btn"
                     @click="exportTrace"
                     title="Trace als JSON exportieren"
@@ -83,9 +84,10 @@ import ChatComposer from '@/components/chat/ChatComposer.vue'
  */
 const router = useRouter()
 const lastTraceId = ref(null)
+const isDev = import.meta.env.DEV
 
 function openTrace() {
-    if (!lastTraceId.value) return
+    if (!isDev || !lastTraceId.value) return
     router.push({ name: 'trace_view', params: { traceId: lastTraceId.value } })
 }
 
@@ -208,23 +210,35 @@ async function send(textFromComposer) {
     sending.value = true
 
     try {
-        // 1) Contact resolve
-        const { data: c } = await axios.post('/api/contact/resolve', { query: text })
+// 1) Contact resolve
+        const uiSpanContact = 'ui.ChatView.send.contactResolve'
+        const uiAtContact = Date.now()
+
+        const { data: c } = await axios.post(
+            '/api/contact/resolve',
+            { query: text },
+            {
+                headers: {
+                    'X-UI-Span': uiSpanContact,
+                    'X-UI-At': String(uiAtContact),
+                },
+            }
+        )
+
+// IMPORTANT: trace_id übernehmen (Backend muss ihn liefern)
+        lastTraceId.value = c?.trace_id ?? null
 
         if (c?.type && c.type !== 'none' && Array.isArray(c.matches) && c.matches.length > 0) {
-            lastTraceId.value = null
             for (const hit of c.matches) {
                 messages.value.push({
                     role: 'info',
                     content: '',
-                    contactCard: {
-                        type: c.type,
-                        data: hit.data,
-                    }
+                    contactCard: { type: c.type, data: hit.data },
                 })
             }
             return
         }
+
 
         // 2) Normaler KI-Chat
         const uiSpan = 'ui.ChatView.send.normal'
@@ -233,6 +247,15 @@ async function send(textFromComposer) {
         // 2) HTTP-Span "axios"
         const httpSpan = 'http.api.chat'
         const httpAt = Date.now()
+
+        const headers = {}
+
+        if (isDev) {
+            headers['X-UI-Span'] = uiSpan
+            headers['X-UI-At'] = String(uiAt)
+            headers['X-UI-Http-Span'] = httpSpan
+            headers['X-UI-Http-At'] = String(httpAt)
+        }
 
         const { data } = await axios.post(
             '/api/chat',
@@ -244,12 +267,7 @@ async function send(textFromComposer) {
             },
             {
                 headers: {
-                    'X-UI-Span': uiSpan,
-                    'X-UI-At': String(uiAt),
-
-                    // NEU: eigener HTTP-Span (für Tree)
-                    'X-UI-Http-Span': httpSpan,
-                    'X-UI-Http-At': String(httpAt),
+                    headers
                 },
             }
         )
@@ -363,12 +381,8 @@ function onNextStep() {
  * Wenn dein Controller aktuell trace_id liest, kannst du es unten wieder zurückdrehen.
  */
 async function exportTrace() {
-    if (!lastTraceId.value) return
-
-    await axios.post('/api/trace/export', {
-        traceId: lastTraceId.value,
-        view: 'ChatView.vue',
-    })
+    if (!isDev || !lastTraceId.value) return
+    await axios.post('/api/trace/export', { traceId: lastTraceId.value, view: 'ChatView.vue' })
 }
 </script>
 
