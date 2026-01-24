@@ -8,9 +8,9 @@ use App\AI\AiChatGateway;
 use App\Attribute\TrackUsage;
 use App\Entity\SupportSolution;
 use App\Repository\SupportSolutionRepository;
-use App\Service\ContactResolver; // <-- NEU
 use App\Tracing\Trace;
 use Psr\Log\LoggerInterface;
+use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
 
@@ -20,16 +20,27 @@ final class SupportChatService
     private const MAX_HISTORY_MESSAGES = 18;
     private const USAGE_KEY_ASK = 'support_chat.ask';
 
+    /**
+     * Choice list (user can answer "1", "2", "3" in the same single input line).
+     */
+    private const CHOICES_TTL_SECONDS = 1800; // 30min
+    private const MAX_CHOICES = 8;
+
+    private readonly bool $isDev;
+
     public function __construct(
         private readonly AiChatGateway $aiChat,
         private readonly SupportSolutionRepository $solutions,
         private readonly CacheInterface $cache,
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly UsageTracker $usageTracker,
-        private readonly ContactResolver $contactResolver, // <-- NEU
-    ) {}
+        private readonly ContactResolver $contactResolver,
+        KernelInterface $kernel,
+    ) {
+        $this->isDev = $kernel->getEnvironment() === 'dev';
+    }
 
-    private function span(?Trace $trace, string $name, callable $fn, array $meta = [])
+    private function span(?Trace $trace, string $name, callable $fn, array $meta = []): mixed
     {
         if ($trace) {
             return $trace->span($name, $fn, $meta);
@@ -62,7 +73,21 @@ final class SupportChatService
             });
         }
 
-        // BRANCH A: DB-only
+        /**
+         * BRANCH 0: numeric selection ("1", "2", "3") from last results
+         * (keeps the single input line UX).
+         */
+        $selection = $this->span($trace, 'choice.try_resolve', function () use ($sessionId, $message) {
+            return $this->resolveNumericSelection($sessionId, $message);
+        });
+
+        if (is_array($selection)) {
+            return $selection;
+        }
+
+        /**
+         * BRANCH A: DB-only (explicit click from UI, existing flow)
+         */
         if ($dbOnlySolutionId !== null) {
             return $this->span($trace, 'db_only.answer', function () use ($sessionId, $dbOnlySolutionId) {
                 return $this->answerDbOnly($sessionId, $dbOnlySolutionId);
@@ -72,21 +97,14 @@ final class SupportChatService
         }
 
         /**
-         * BRANCH B0 (NEU): Local Contact Resolver (Privacy: local_only, send_to_ai=false)
-         *
-         * Ziel:
-         * - Wenn User nach Kontaktdaten / Filialen / Personen fragt, lösen wir das lokal aus JSON.
-         * - Diese Daten dürfen NICHT an externe Provider gehen.
-         * - Der Schritt erscheint im Trace als Child-Span unter support_chat.ask.
+         * BRANCH B0: Local Contact Resolver (privacy: local_only, send_to_ai=false)
          */
         $contactHint = $this->span($trace, 'contact.intent.detect', function () use ($message) {
             $m = mb_strtolower($message);
 
-            // einfache Heuristik (pragmatisch, kann später erweitert werden)
             $keywords = [
                 'kontakt', 'kontaktperson', 'ansprechpartner', 'telefon', 'tel', 'email', 'e-mail',
                 'filiale', 'filialen', 'standort', 'adresse', 'anschrift', 'öffnungszeiten',
-                'cosu', 'lpgu', // branch code examples
             ];
 
             foreach ($keywords as $k) {
@@ -95,7 +113,7 @@ final class SupportChatService
                 }
             }
 
-            // Wenn User nur ein kurzes Token schreibt, lassen wir resolve trotzdem zu (z.B. "COSU")
+            // Allow very short tokens (e.g. branch code)
             $len = mb_strlen(trim($m));
             return ['hit' => ($len > 0 && $len <= 8), 'keyword' => null];
         }, [
@@ -103,7 +121,6 @@ final class SupportChatService
         ]);
 
         $contactResult = $this->span($trace, 'contact.resolve', function () use ($message, $trace) {
-            // Resolver bekommt Trace optional -> kann Unterspans schreiben
             return $this->contactResolver->resolve($message, 5, $trace);
         }, [
             'policy' => 'local_only',
@@ -111,58 +128,171 @@ final class SupportChatService
             'source' => 'var/data/kontakt_*.json',
         ]);
 
-        // Wenn intent positiv ODER resolver hat matches -> wir antworten local-only und stoppen AI-Flow
         $hasContactMatches = is_array($contactResult) && !empty($contactResult['matches']);
         $intentHit = (bool)($contactHint['hit'] ?? false);
 
         if ($intentHit || $hasContactMatches) {
-            $answer = $this->span($trace, 'contact.answer.build', function () use ($contactResult) {
+            $payload = $this->span($trace, 'contact.answer.build', function () use ($contactResult) {
                 $type = (string)($contactResult['type'] ?? 'none');
                 $matches = $contactResult['matches'] ?? [];
 
                 if (!is_array($matches) || $matches === []) {
-                    return "Ich habe lokal keine passenden Kontaktdaten gefunden. Bitte nenne mir einen Namen, eine FilialenNr (z.B. COSU) oder einen Standort.";
+                    return [
+                        'answer' => "Ich habe lokal keine passenden Kontaktdaten gefunden. Bitte nenne mir einen Namen, eine FilialenNr (z.B. COSU) oder einen Standort.",
+                        'choices' => [],
+                    ];
                 }
 
                 $lines = [];
-                if ($type === 'branch') {
-                    $lines[] = "Gefundene Filiale(n) (lokal):";
-                } elseif ($type === 'person') {
-                    $lines[] = "Gefundene Kontaktperson(en) (lokal):";
-                } else {
-                    $lines[] = "Lokale Treffer:";
-                }
+                $lines[] = $type === 'branch' ? "Gefundene Filiale(n):"
+                    : ($type === 'person' ? "Gefundene Kontaktperson(en):" : "Treffer:");
 
+                $choices = [];
+                $i = 1;
                 foreach ($matches as $m) {
                     $label = (string)($m['label'] ?? '');
-                    $conf = isset($m['confidence']) ? (string)$m['confidence'] : '';
-                    $lines[] = "- {$label}" . ($conf !== '' ? " (Confidence {$conf})" : '');
+                    if ($label === '') {
+                        continue;
+                    }
+                    $lines[] = "{$i}) {$label}";
+                    $choices[] = [
+                        'kind' => 'contact',
+                        'label' => $label,
+                        'payload' => $m,
+                    ];
+                    $i++;
+                    if ($i > self::MAX_CHOICES) {
+                        break;
+                    }
                 }
 
-                $lines[] = "";
-                $lines[] = "Hinweis: Diese Kontaktdaten wurden **lokal** aus JSON ermittelt und **nicht** an einen AI-Provider gesendet.";
+                if ($choices !== []) {
+                    $lines[] = "";
+                    $lines[] = "Antworte mit **1–" . count($choices) . "**, um einen Eintrag zu öffnen.";
+                }
 
-                return implode("\n", $lines);
-            }, [
-                'type' => (string)($contactResult['type'] ?? 'none'),
-                'match_count' => is_array($contactResult['matches'] ?? null) ? count($contactResult['matches']) : 0,
-            ]);
+                if ($this->isDev) {
+                    $lines[] = "";
+                    $lines[] = "DEV-Hinweis: Kontakt wurde lokal gelöst (nicht an AI gesendet).";
+                }
+
+                return [
+                    'answer' => implode("\n", $lines),
+                    'choices' => $choices,
+                ];
+            });
+
+            if (!empty($payload['choices'])) {
+                $this->storeChoices($sessionId, $payload['choices']);
+            }
 
             return [
-                'answer' => $answer,
+                'answer' => $payload['answer'] ?? '',
                 'matches' => [],
                 'modeHint' => 'contact_local',
                 'contact' => $contactResult,
+                'choices' => $payload['choices'] ?? [],
             ];
         }
 
-        // BRANCH B: AI + DB
+        /**
+         * BRANCH B1: KB match (DB) – can yield SOP and FORM.
+         */
         $matches = $this->span($trace, 'kb.match', function () use ($message) {
             return $this->findMatches($message);
         }, [
             'query_len' => mb_strlen($message),
         ]);
 
+        /**
+         * BRANCH B1a: If user likely asks for a FORM/document, answer DB-only with a selection list
+         * (no AI call necessary).
+         */
+        $formIntent = $this->span($trace, 'form.intent.detect', function () use ($message, $matches) {
+            $m = mb_strtolower($message);
+            $keywords = ['formular', 'form', 'dokument', 'pdf', 'antrag', 'vorlage'];
+            foreach ($keywords as $k) {
+                if (str_contains($m, $k)) {
+                    return true;
+                }
+            }
+
+            // if we already matched a FORM with good score
+            foreach ($matches as $hit) {
+                if (($hit['type'] ?? null) === 'FORM' && (int)($hit['score'] ?? 0) >= 6) {
+                    return true;
+                }
+            }
+
+            return false;
+        });
+
+        if ($formIntent) {
+            $formAnswer = $this->span($trace, 'form.answer.build', function () use ($matches) {
+                $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
+                $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+
+                if ($forms === []) {
+                    return [
+                        'answer' => "Ich habe kein passendes Formular gefunden. Nenne mir bitte den genauen Namen (z.B. „Reisekosten Antrag“) oder ergänze 1–2 Stichwörter.",
+                        'choices' => [],
+                        'matches' => $matches,
+                    ];
+                }
+
+                $lines = [];
+                $lines[] = "Ich habe passende **Formulare** gefunden:";
+                $choices = [];
+
+                $i = 1;
+                foreach ($forms as $f) {
+                    $title = (string)($f['title'] ?? '');
+                    $updated = (string)($f['updatedAt'] ?? '');
+                    $lines[] = "{$i}) {$title}" . ($updated !== '' ? " (zuletzt aktualisiert: {$updated})" : '');
+                    $choices[] = [
+                        'kind' => 'form',
+                        'label' => $title,
+                        'payload' => $f,
+                    ];
+                    $i++;
+                    if ($i > self::MAX_CHOICES) {
+                        break;
+                    }
+                }
+
+                if ($sops !== []) {
+                    $lines[] = "";
+                    $lines[] = "Zusätzlich gibt es passende SOPs:";
+                    foreach (array_slice($sops, 0, 3) as $s) {
+                        $lines[] = "- " . (string)($s['title'] ?? '');
+                    }
+                }
+
+                $lines[] = "";
+                $lines[] = "Antworte mit **1–" . count($choices) . "**, um ein Formular zu öffnen.";
+
+                return [
+                    'answer' => implode("\n", $lines),
+                    'choices' => $choices,
+                    'matches' => $matches,
+                ];
+            });
+
+            if (!empty($formAnswer['choices'])) {
+                $this->storeChoices($sessionId, $formAnswer['choices']);
+            }
+
+            return [
+                'answer' => $formAnswer['answer'] ?? '',
+                'matches' => $formAnswer['matches'] ?? $matches,
+                'modeHint' => 'form_db',
+                'choices' => $formAnswer['choices'] ?? [],
+            ];
+        }
+
+        /**
+         * BRANCH C: AI + DB (SOP guidance)
+         */
         $history = $this->span($trace, 'cache.history_load', function () use ($sessionId) {
             return $this->loadHistory($sessionId);
         }, [
@@ -189,7 +319,6 @@ final class SupportChatService
             return $this->buildKbContext($matches);
         }, [
             'match_count' => count($matches),
-            'kb_chars' => null,
         ]);
 
         $context = $this->span($trace, 'ai.context_defaults', function () use ($context) {
@@ -201,13 +330,13 @@ final class SupportChatService
         ]);
 
         $model = $this->span($trace, 'ai.model_resolve', function () use ($provider, $model) {
-            if ($model === null || trim((string) $model) === '') {
+            if ($model === null || trim((string)$model) === '') {
                 if ($provider === 'openai') {
-                    $model = (string) ($_ENV['OPENAI_DEFAULT_MODEL'] ?? $_SERVER['OPENAI_DEFAULT_MODEL'] ?? '');
+                    $model = (string)($_ENV['OPENAI_DEFAULT_MODEL'] ?? $_SERVER['OPENAI_DEFAULT_MODEL'] ?? '');
                 } elseif ($provider === 'gemini') {
-                    $model = (string) ($_ENV['GEMINI_DEFAULT_MODEL'] ?? $_SERVER['GEMINI_DEFAULT_MODEL'] ?? '');
+                    $model = (string)($_ENV['GEMINI_DEFAULT_MODEL'] ?? $_SERVER['GEMINI_DEFAULT_MODEL'] ?? '');
                 }
-                $model = trim((string) $model);
+                $model = trim((string)$model);
                 $model = $model !== '' ? $model : null;
             }
             return $model;
@@ -240,15 +369,19 @@ final class SupportChatService
         } catch (\Throwable $e) {
             $this->supportSolutionLogger->error('chat_execute_failed', [
                 'sessionId' => $sessionId,
-                'message'   => $message,
-                'error'     => $e->getMessage(),
-                'class'     => $e::class,
-                'provider'  => $provider,
-                'model'     => $model,
+                'message' => $message,
+                'error' => $e->getMessage(),
+                'class' => $e::class,
+                'provider' => $provider,
+                'model' => $model,
             ]);
 
+            $msg = $this->isDev
+                ? ('Fehler beim Erzeugen der Antwort (DEV): ' . $e->getMessage())
+                : 'Fehler beim Erzeugen der Antwort. Bitte später erneut versuchen.';
+
             return [
-                'answer' => 'Fehler beim Erzeugen der Antwort. Bitte Logs prüfen.',
+                'answer' => $msg,
                 'matches' => $matches,
                 'modeHint' => 'ai_with_db',
             ];
@@ -264,15 +397,21 @@ final class SupportChatService
             'ttl_s' => self::SESSION_TTL_SECONDS,
         ]);
 
+        // Optional: store KB choices for numeric selection (SOP-only)
+        $kbChoices = $this->buildKbChoices($matches);
+        if ($kbChoices !== []) {
+            $this->storeChoices($sessionId, $kbChoices);
+        }
+
         return [
             'answer' => $answer,
             'matches' => $matches,
             'modeHint' => 'ai_with_db',
+            'choices' => $kbChoices,
         ];
     }
 
-
-private function answerDbOnly(string $sessionId, int $solutionId): array
+    private function answerDbOnly(string $sessionId, int $solutionId): array
     {
         $solution = $this->solutions->find($solutionId);
 
@@ -294,8 +433,8 @@ private function answerDbOnly(string $sessionId, int $solutionId): array
         foreach ($stepsEntities as $st) {
             $stepsPayload[] = [
                 'id' => $st->getId(),
-                'stepNo' => (int) $st->getStepNo(),
-                'instruction' => (string) $st->getInstruction(),
+                'stepNo' => (int)$st->getStepNo(),
+                'instruction' => (string)$st->getInstruction(),
                 'expectedResult' => $st->getExpectedResult(),
                 'nextIfFailed' => $st->getNextIfFailed(),
                 'mediaPath' => $st->getMediaPath(),
@@ -344,7 +483,7 @@ private function answerDbOnly(string $sessionId, int $solutionId): array
             if (!$s instanceof SupportSolution) {
                 continue;
             }
-            $mapped[] = $this->mapMatch($s, (int) ($m['score'] ?? 0));
+            $mapped[] = $this->mapMatch($s, (int)($m['score'] ?? 0));
         }
 
         return $mapped;
@@ -352,17 +491,34 @@ private function answerDbOnly(string $sessionId, int $solutionId): array
 
     private function mapMatch(SupportSolution $solution, int $score): array
     {
-        $id = (int) $solution->getId();
+        $id = (int)$solution->getId();
         $iri = '/api/support_solutions/' . $id;
-        $stepsUrl = '/api/support_solution_steps?solution=' . rawurlencode($iri);
 
-        return [
+        $type = $solution->getType();
+        $updatedAt = $solution->getUpdatedAt()->format('Y-m-d H:i');
+
+        $base = [
             'id' => $id,
-            'title' => (string) $solution->getTitle(),
+            'title' => (string)$solution->getTitle(),
             'score' => $score,
             'url' => $iri,
-            'stepsUrl' => $stepsUrl,
+            'type' => $type,
+            'updatedAt' => $updatedAt,
         ];
+
+        if ($type === 'FORM') {
+            return $base + [
+                    'mediaType' => $solution->getMediaType(),
+                    'externalMediaProvider' => $solution->getExternalMediaProvider(),
+                    'externalMediaUrl' => $solution->getExternalMediaUrl(),
+                    'externalMediaId' => $solution->getExternalMediaId(),
+                ];
+        }
+
+        $stepsUrl = '/api/support_solution_steps?solution=' . rawurlencode($iri);
+        return $base + [
+                'stepsUrl' => $stepsUrl,
+            ];
     }
 
     private function buildKbContext(array $matches): string
@@ -371,9 +527,14 @@ private function answerDbOnly(string $sessionId, int $solutionId): array
             return '';
         }
 
+        $sops = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+        if ($sops === []) {
+            return '';
+        }
+
         $lines = [];
         $lines[] = 'WISSENSDATENBANK (SOPs) – nutze diese vorrangig, wenn passend:';
-        foreach ($matches as $hit) {
+        foreach ($sops as $hit) {
             $lines[] = sprintf(
                 '- SOP #%d: %s (Score %d) IRI: %s',
                 $hit['id'],
@@ -429,6 +590,161 @@ private function answerDbOnly(string $sessionId, int $solutionId): array
     private function historyCacheKey(string $sessionId): string
     {
         return 'support_chat.history.' . sha1($sessionId);
+    }
+
+    private function choicesCacheKey(string $sessionId): string
+    {
+        return 'support_chat.choices.' . sha1($sessionId);
+    }
+
+    /**
+     * @param array<int, array{kind:string,label:string,payload:array}> $choices
+     */
+    private function storeChoices(string $sessionId, array $choices): void
+    {
+        $key = $this->choicesCacheKey($sessionId);
+
+        $choices = array_values(array_slice($choices, 0, self::MAX_CHOICES));
+
+        $this->cache->delete($key);
+        $this->cache->get($key, function (ItemInterface $item) use ($choices) {
+            $item->expiresAfter(self::CHOICES_TTL_SECONDS);
+            return $choices;
+        });
+    }
+
+    /**
+     * @return array<int, array{kind:string,label:string,payload:array}>
+     */
+    private function loadChoices(string $sessionId): array
+    {
+        $key = $this->choicesCacheKey($sessionId);
+
+        $val = $this->cache->get($key, function (ItemInterface $item) {
+            $item->expiresAfter(self::CHOICES_TTL_SECONDS);
+            return [];
+        });
+
+        return is_array($val) ? $val : [];
+    }
+
+    /**
+     * Resolve numeric selection ("1", "2", "3") into a final answer.
+     * Returns NULL if not a numeric selection or no stored choices exist.
+     */
+    private function resolveNumericSelection(string $sessionId, string $message): ?array
+    {
+        $m = trim($message);
+        if ($m === '' || !preg_match('/^\d+$/', $m)) {
+            return null;
+        }
+
+        $idx = (int)$m;
+        if ($idx <= 0) {
+            return null;
+        }
+
+        $choices = $this->loadChoices($sessionId);
+        if ($choices === []) {
+            return [
+                'answer' => "Ich habe keine Auswahl mehr gespeichert. Bitte formuliere die Anfrage erneut (z.B. „Formular Reisekosten“).",
+                'matches' => [],
+                'modeHint' => 'choice_empty',
+            ];
+        }
+
+        $choice = $choices[$idx - 1] ?? null;
+        if (!is_array($choice)) {
+            return [
+                'answer' => "Bitte wähle eine Zahl zwischen 1 und " . count($choices) . ".",
+                'matches' => [],
+                'modeHint' => 'choice_out_of_range',
+                'choices' => $choices,
+            ];
+        }
+
+        $kind = (string)($choice['kind'] ?? '');
+        $label = (string)($choice['label'] ?? '');
+        $payload = is_array($choice['payload'] ?? null) ? $choice['payload'] : [];
+
+        if ($kind === 'form') {
+            $url = (string)($payload['externalMediaUrl'] ?? $payload['url'] ?? '');
+            $updated = (string)($payload['updatedAt'] ?? '');
+            $lines = [];
+            $lines[] = "Formular: {$label}";
+            if ($updated !== '') {
+                $lines[] = "Zuletzt aktualisiert: {$updated}";
+            }
+            if ($url !== '') {
+                $lines[] = "Link: {$url}";
+            }
+            $lines[] = "";
+            $lines[] = "Möchtest du ein anderes Formular aus der Liste öffnen (z.B. „2“) oder suchst du etwas anderes?";
+
+            return [
+                'answer' => implode("\n", $lines),
+                'matches' => [],
+                'modeHint' => 'choice_form',
+                'selected' => $choice,
+            ];
+        }
+
+        if ($kind === 'contact') {
+            $lines = [];
+            $lines[] = "Kontakt: {$label}";
+            foreach (['phone' => 'Telefon', 'email' => 'E-Mail', 'address' => 'Adresse'] as $k => $title) {
+                if (!empty($payload[$k])) {
+                    $lines[] = "{$title}: " . (string)$payload[$k];
+                }
+            }
+            $lines[] = "";
+            $lines[] = "Soll ich noch etwas anderes nachschlagen (z.B. eine andere Filiale oder Person)?";
+
+            return [
+                'answer' => implode("\n", $lines),
+                'matches' => [],
+                'modeHint' => 'choice_contact',
+                'selected' => $choice,
+            ];
+        }
+
+        if ($kind === 'sop') {
+            $id = (int)($payload['id'] ?? 0);
+            if ($id > 0) {
+                return $this->answerDbOnly($sessionId, $id);
+            }
+        }
+
+        return [
+            'answer' => "Ich konnte diese Auswahl nicht auflösen. Bitte formuliere die Anfrage erneut.",
+            'matches' => [],
+            'modeHint' => 'choice_unknown',
+        ];
+    }
+
+    /**
+     * Build selectable SOP choices from matches (used as fallback for "1/2/3").
+     *
+     * @param array<int, array<string, mixed>> $matches
+     * @return array<int, array{kind:string,label:string,payload:array}>
+     */
+    private function buildKbChoices(array $matches): array
+    {
+        $sops = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+        $choices = [];
+        foreach ($sops as $s) {
+            $id = (int)($s['id'] ?? 0);
+            $title = (string)($s['title'] ?? '');
+            if ($id <= 0 || $title === '') {
+                continue;
+            }
+            $choices[] = [
+                'kind' => 'sop',
+                'label' => $title,
+                'payload' => ['id' => $id],
+            ];
+        }
+        return array_values(array_slice($choices, 0, self::MAX_CHOICES));
     }
 
     private function newSessionIdFallback(): string

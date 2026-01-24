@@ -20,21 +20,42 @@ use Doctrine\Common\Collections\Collection;
 use Doctrine\ORM\Mapping as ORM;
 use Symfony\Component\Serializer\Attribute\Groups;
 use Symfony\Component\Validator\Constraints as Assert;
+use App\State\SupportSolutionProcessor;
+use Symfony\Component\Validator\GroupSequenceProviderInterface;
+use Symfony\Component\Validator\Constraints\GroupSequence;
+
+
 
 #[ApiResource(
     operations: [
-        // ✅ Liste schlank
-        new GetCollection(normalizationContext: ['groups' => ['solution:list']]),
+        new GetCollection(
+            normalizationContext: ['groups' => ['solution:list']]
+        ),
 
-        // ✅ Detail “deep”
-        new Get(normalizationContext: ['groups' => ['solution:read']]),
+        new Get(
+            normalizationContext: ['groups' => ['solution:read']]
+        ),
 
-        new Post(denormalizationContext: ['groups' => ['solution:write']]),
-        new Put(denormalizationContext: ['groups' => ['solution:write']]),
-        new Patch(denormalizationContext: ['groups' => ['solution:write']]),
+        // CREATE
+        new Post(
+            processor: SupportSolutionProcessor::class,
+            denormalizationContext: ['groups' => ['solution:write']],
+            normalizationContext: ['groups' => ['solution:read']]
+        ),
+        new Put(
+            processor: SupportSolutionProcessor::class,
+            denormalizationContext: ['groups' => ['solution:write']]
+        ),
+        new Patch(
+            processor: SupportSolutionProcessor::class,
+            denormalizationContext: ['groups' => ['solution:write']]
+        ),
+
         new Delete(),
     ],
 )]
+
+
 #[ApiFilter(SearchFilter::class, properties: [
     'title' => 'partial',
     'symptoms' => 'partial',
@@ -46,7 +67,8 @@ use Symfony\Component\Validator\Constraints as Assert;
 #[ORM\Entity]
 #[ORM\Table(name: 'support_solution')]
 #[ORM\HasLifecycleCallbacks]
-class SupportSolution
+#[Assert\GroupSequenceProvider]
+class SupportSolution implements GroupSequenceProviderInterface
 {
     #[Groups(['solution:list', 'solution:read'])]
     #[ORM\Id]
@@ -61,9 +83,10 @@ class SupportSolution
     private string $title = '';
 
     #[Groups(['solution:list', 'solution:read', 'solution:write'])]
-    #[Assert\NotBlank]
-    #[ORM\Column(type: 'text')]
-    private string $symptoms = '';
+    #[Assert\NotBlank(groups: ['sop'])]
+    #[ORM\Column(type: 'text', nullable: true)]
+    private ?string $symptoms = null;
+
 
     #[Groups(['solution:list', 'solution:read', 'solution:write'])]
     #[ORM\Column(name: 'context_notes', type: 'text', nullable: true)]
@@ -100,6 +123,56 @@ class SupportSolution
     #[ORM\OrderBy(['stepNo' => 'ASC'])]
     private Collection $steps;
 
+    /**
+     * Defines the solution type.
+     *
+     * Possible values:
+     * - SOP  (step-based solution)
+     * - FORM (document / external form)
+     */
+    #[Groups(['solution:read', 'solution:write'])]
+    #[ORM\Column(type: 'string', length: 16)]
+    private string $type = 'SOP';
+
+    /**
+     * Indicates how the primary medium is stored.
+     *
+     * Possible values:
+     * - internal (uploaded file)
+     * - external (reference only)
+     */
+    #[Groups(['solution:read', 'solution:write'])]
+    #[ORM\Column(type: 'string', length: 16, nullable: true)]
+    private ?string $mediaType = null;
+
+    /**
+     * External media provider identifier (e.g. "google_drive").
+     *
+     * Only set when mediaType = external.
+     */
+    #[Groups(['solution:read', 'solution:write'])]
+    #[ORM\Column(type: 'string', length: 64, nullable: true)]
+    private ?string $externalMediaProvider = null;
+
+    /**
+     * External media URL (e.g. Google Drive file URL).
+     *
+     * Only set when mediaType = external.
+     */
+    #[Groups(['solution:read', 'solution:write'])]
+    #[ORM\Column(type: 'string', length: 2048, nullable: true)]
+    private ?string $externalMediaUrl = null;
+
+    /**
+     * Optional external file identifier (e.g. Google Drive fileId).
+     *
+     * Used for previews or future integrations.
+     */
+    #[Groups(['solution:read', 'solution:write'])]
+    #[ORM\Column(type: 'string', length: 255, nullable: true)]
+    private ?string $externalMediaId = null;
+
+
     public function __construct()
     {
         $this->keywords = new ArrayCollection();
@@ -120,8 +193,8 @@ class SupportSolution
     public function getTitle(): string { return $this->title; }
     public function setTitle(string $title): self { $this->title = $title; return $this; }
 
-    public function getSymptoms(): string { return $this->symptoms; }
-    public function setSymptoms(string $symptoms): self { $this->symptoms = $symptoms; return $this; }
+    public function getSymptoms(): ?string { return $this->symptoms; }
+    public function setSymptoms(?string $symptoms): self { $this->symptoms = $symptoms; return $this; }
 
     public function getContextNotes(): ?string { return $this->contextNotes; }
     public function setContextNotes(?string $contextNotes): self { $this->contextNotes = $contextNotes; return $this; }
@@ -182,4 +255,55 @@ class SupportSolution
         $this->updatedAt = $updatedAt;
         return $this;
     }
+    public function getType(): string
+    {
+        return $this->type;
+    }
+
+    public function setType(string $type): self
+    {
+        $this->type = $type;
+        return $this;
+    }
+
+    public function isForm(): bool
+    {
+        return $this->type === 'FORM';
+    }
+
+    public function getMediaType(): ?string
+    {
+        return $this->mediaType;
+    }
+
+    public function isExternalMedia(): bool
+    {
+        return $this->mediaType === 'external';
+    }
+
+    public function getExternalMediaProvider(): ?string
+    {
+        return $this->externalMediaProvider;
+    }
+
+    public function getExternalMediaUrl(): ?string
+    {
+        return $this->externalMediaUrl;
+    }
+
+    public function getExternalMediaId(): ?string
+    {
+        return $this->externalMediaId;
+    }
+
+    public function getGroupSequence(): GroupSequence|array
+    {
+        if ($this->type === 'FORM') {
+            return new GroupSequence(['Default', 'form']);
+        }
+
+        return new GroupSequence(['Default', 'sop']);
+    }
+
+
 }

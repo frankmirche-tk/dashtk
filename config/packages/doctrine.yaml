@@ -8,6 +8,10 @@ doctrine:
 
         profiling_collect_backtrace: '%kernel.debug%'
         use_savepoints: true
+
+        # Prevent doctrine diff/migrations from dropping trace tables
+        # (these tables are not mapped as entities on purpose)
+        schema_filter: '~^(?!ai_traces$|ai_trace_spans$).*~'
     orm:
         auto_generate_proxy_classes: true
         enable_lazy_ghost_objects: true

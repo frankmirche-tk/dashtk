@@ -85,6 +85,13 @@ services:
         arguments:
             $projectDir: '%kernel.project_dir%'
 
+    App\State\SupportSolutionProcessor:
+        arguments:
+            $doctrinePersistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
+
+    App\Service\FormSourceProvider:
+        arguments:
+            $projectDir: '%kernel.project_dir%'
 
 
 
