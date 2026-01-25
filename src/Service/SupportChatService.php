@@ -246,9 +246,14 @@ final class SupportChatService
             'query_len' => mb_strlen($message),
         ]);
 
+        $matches = $this->dedupeMatchesById($matches);
+
         // Split for downstream usage
         $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
         $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+
+        $sops = $this->filterSopsDuplicatingFormTitles($sops, $forms); // ✅ neu
+
 
         // Build FORM choices whenever FORM matches exist (like SOP suggestions)
         $formChoices = [];
@@ -292,7 +297,17 @@ final class SupportChatService
                 $n = 1;
                 foreach ($formChoices as $c) {
                     $updated = (string)($c['payload']['updatedAt'] ?? '');
-                    $lines[] = "{$n}) {$c['label']}" . ($updated !== '' ? " (zuletzt aktualisiert: {$updated})" : '');
+                    $symptoms = trim((string)($c['payload']['symptoms'] ?? ''));
+
+                    $line = "{$n}) {$c['label']}" . ($updated !== '' ? " (zuletzt aktualisiert: {$updated})" : '');
+
+                    // ✅ Symptoms als Kurzbeschreibung
+                    if ($symptoms !== '') {
+                        // Neue Zeile + eingerückt, damit es optisch dazugehört
+                        $line .= "\n   ↳ " . $symptoms;
+                    }
+
+                    $lines[] = $line;
                     $n++;
                 }
                 $lines[] = "";
@@ -411,10 +426,12 @@ final class SupportChatService
                 ? ('Fehler beim Erzeugen der Antwort (DEV): ' . $e->getMessage())
                 : 'Fehler beim Erzeugen der Antwort. Bitte später erneut versuchen.';
 
+            $sopsOnly = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+
             return [
                 'answer' => $msg,
-                'matches' => $matches,
-                'choices' => $formChoices, // keep choices visible even when AI failed
+                'matches' => $sopsOnly,
+                'choices' => $formChoices, // Formulare weiter anzeigen
                 'modeHint' => 'ai_with_db',
             ];
         }
@@ -429,28 +446,34 @@ final class SupportChatService
             'ttl_s' => self::SESSION_TTL_SECONDS,
         ]);
 
-        // SOP choices for numeric selection (SOP-only)
+        // SOP choices nur für Numeric-Selection (nicht fürs UI)
         $kbChoices = $this->buildKbChoices($matches);
 
-        // Merge choices: Forms first, then SOPs (keeps UX: "Formulare" block first)
-        $allChoices = [];
+// Für "1/2/3" speichern wir Forms + SOPs im Cache
+        $storedChoices = [];
         if ($formChoices !== []) {
-            $allChoices = array_merge($allChoices, $formChoices);
+            $storedChoices = array_merge($storedChoices, $formChoices);
         }
         if ($kbChoices !== []) {
-            $allChoices = array_merge($allChoices, $kbChoices);
+            $storedChoices = array_merge($storedChoices, $kbChoices);
+        }
+        if ($storedChoices !== []) {
+            $this->storeChoices($sessionId, $storedChoices);
         }
 
-        if ($allChoices !== []) {
-            $this->storeChoices($sessionId, $allChoices);
-        }
+// UI: matches nur SOPs, choices nur Formulare (damit kein doppelter SOP-Block entsteht)
+        $sopsOnly = array_values(array_filter(
+            $matches,
+            static fn(array $m) => ($m['type'] ?? null) !== 'FORM'
+        ));
 
         return [
             'answer' => $answer,
-            'matches' => $matches,
+            'matches' => $sopsOnly,
             'modeHint' => 'ai_with_db',
-            'choices' => $allChoices,
+            'choices' => $formChoices, // ✅ NUR Formulare -> "Auswahl" verschwindet bei reinen SOPs
         ];
+
     }
 
     /**
@@ -566,6 +589,7 @@ final class SupportChatService
             'url' => $iri,
             'type' => $type,
             'updatedAt' => $updatedAt,
+            'symptoms' => (string)($solution->getSymptoms() ?? ''),
         ];
 
         if ($type === 'FORM') {
@@ -779,6 +803,11 @@ final class SupportChatService
             $provider = $payload['externalMediaProvider'] ?? null;
             $externalUrl = $payload['externalMediaUrl'] ?? null;
             $externalId = $payload['externalMediaId'] ?? null;
+            $symptoms = (string)($payload['symptoms'] ?? '');
+
+            if ($symptoms !== '') {
+                $lines[] = "Hinweis: {$symptoms}";
+            }
 
             // Preview-URL: prefer URL, else derive from provider+id (e.g., Google Drive)
             $previewUrl = $this->formResolver->buildPreviewUrl(
@@ -817,6 +846,7 @@ final class SupportChatService
                     'updatedAt' => $updated,
                     'url' => $previewUrl ?: $fallbackUrl,
                     'provider' => (string)($provider ?? ''),
+                    'symptoms' => $symptoms,
                 ],
             ];
         }
@@ -887,4 +917,70 @@ final class SupportChatService
     {
         return bin2hex(random_bytes(16));
     }
+
+    /**
+     * Deduplicate matches by solution id (keeps the first occurrence).
+     *
+     * @param array<int, array<string,mixed>> $matches
+     * @return array<int, array<string,mixed>>
+     */
+    private function dedupeMatchesById(array $matches): array
+    {
+        $seen = [];
+        $out = [];
+
+        foreach ($matches as $m) {
+            $id = (int)($m['id'] ?? 0);
+            if ($id <= 0) {
+                continue;
+            }
+            if (isset($seen[$id])) {
+                continue;
+            }
+            $seen[$id] = true;
+            $out[] = $m;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Entfernt SOP-Treffer, deren Titel bereits als FORM vorkommt.
+     * Das verhindert „doppelte“ Anzeige (Formular + SOP mit gleichem Namen).
+     *
+     * @param array<int, array<string,mixed>> $sops
+     * @param array<int, array<string,mixed>> $forms
+     * @return array<int, array<string,mixed>>
+     */
+    private function filterSopsDuplicatingFormTitles(array $sops, array $forms): array
+    {
+        if ($forms === [] || $sops === []) {
+            return $sops;
+        }
+
+        $formTitles = [];
+        foreach ($forms as $f) {
+            $t = $this->normalizeTitle((string)($f['title'] ?? ''));
+            if ($t !== '') {
+                $formTitles[$t] = true;
+            }
+        }
+
+        return array_values(array_filter($sops, function (array $s) use ($formTitles) {
+            $t = $this->normalizeTitle((string)($s['title'] ?? ''));
+            return $t === '' ? true : !isset($formTitles[$t]);
+        }));
+    }
+
+    /**
+     * Normalisiert Titel für Vergleich (lowercase, trim, single spaces).
+     */
+    private function normalizeTitle(string $title): string
+    {
+        $t = mb_strtolower(trim($title));
+        $t = preg_replace('/\s+/', ' ', $t) ?? $t;
+        return $t;
+    }
+
+
 }

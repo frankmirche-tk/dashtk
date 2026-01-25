@@ -137,6 +137,11 @@
                             <div class="v">{{ m.formCard.updatedAt }}</div>
                         </div>
 
+                        <div class="row" v-if="m.formCard.symptoms">
+                            <div class="k">📝 Hinweis</div>
+                            <div class="v">{{ m.formCard.symptoms }}</div>
+                        </div>
+
                         <div class="row" v-if="m.formCard.provider">
                             <div class="k">🔌 Provider</div>
                             <div class="v">{{ m.formCard.provider }}</div>
@@ -162,9 +167,20 @@
                             :key="i"
                             class="kb-item"
                         >
-                            <div>
-                                {{ i+1 }}) {{ c.label }}
+                            <div class="kb-item-main">
+                                <div class="kb-item-title">
+                                    {{ i+1 }}) {{ c.label }}
+                                </div>
+
+                                <!-- ✅ Symptoms/ Kurzbeschreibung für Formulare -->
+                                <div
+                                    v-if="c.kind === 'form' && c.payload?.symptoms"
+                                    class="kb-item-sub"
+                                >
+                                    ↳ {{ c.payload.symptoms }}
+                                </div>
                             </div>
+
                             <div class="kb-actions">
                                 <button class="btn small" @click="$emit('choose', i+1)">
                                     Öffnen
@@ -179,9 +195,11 @@
                     <div class="kb-title">Passende SOPs aus der Datenbank:</div>
                     <ul class="kb-list">
                         <li v-for="hit in m.matches" :key="hit.id" class="kb-item">
-                            <a :href="hit.url" target="_blank" rel="noreferrer">
-                                {{ hit.title }} (Score {{ hit.score }})
-                            </a>
+                            <div class="kb-item-main">
+                                <a :href="hit.url" target="_blank" rel="noreferrer">
+                                    {{ hit.title }} (Score {{ hit.score }})
+                                </a>
+                            </div>
 
                             <div class="kb-actions">
                                 <button class="btn small" @click="$emit('db-only', hit.id)">
@@ -247,8 +265,14 @@ const emit = defineEmits([
 .kb { margin-top: 10px; padding: 10px; border: 1px dashed #aaa; border-radius: 10px; background: #fafafa; }
 .kb-title { font-weight: 700; margin-bottom: 6px; }
 .kb-list { margin: 0; padding-left: 18px; }
+.kb-item { display:flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin: 10px 0; }
 .kb-item a{ color:#111; text-decoration: none; font-weight: 650; }
 .kb-item a:hover{ text-decoration: underline; text-underline-offset: 3px; }
+
+.kb-item-main { flex: 1; min-width: 0; }
+.kb-item-title { font-weight: 650; }
+.kb-item-sub { margin-top: 6px; opacity: 0.8; font-size: 0.95em; line-height: 1.35; white-space: pre-wrap; }
+
 .kb-actions{ display:flex; gap:10px; margin-top:8px; }
 
 .btn{
