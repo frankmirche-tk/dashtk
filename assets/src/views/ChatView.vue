@@ -13,7 +13,6 @@
                 <router-link class="btn" to="/kb">Wissen bearbeiten</router-link>
                 <button class="btn" @click="newChat">Neuer Chat</button>
 
-                <!-- ✅ TRACE BUTTONS (DEV only) -->
                 <button
                     v-if="isDev && lastTraceId"
                     class="btn"
@@ -40,6 +39,7 @@
             :roleLabel="roleLabel"
             @db-only="useDbStepsOnly"
             @contact-selected="onContactSelected"
+            @choose="onChoose"
         >
             <template #avatar>
                 <div v-if="avatarOfferEnabled && pendingGuide && !avatarEnabled" class="avatar-offer">
@@ -69,6 +69,7 @@
         />
     </div>
 </template>
+
 <script setup>
 import axios from 'axios'
 import { ref, computed } from 'vue'
@@ -210,7 +211,7 @@ async function send(textFromComposer) {
     sending.value = true
 
     try {
-// 1) Contact resolve
+        // 1) Contact resolve
         const uiSpanContact = 'ui.ChatView.send.contactResolve'
         const uiAtContact = Date.now()
 
@@ -225,7 +226,6 @@ async function send(textFromComposer) {
             }
         )
 
-// IMPORTANT: trace_id übernehmen (Backend muss ihn liefern)
         lastTraceId.value = c?.trace_id ?? null
 
         if (c?.type && c.type !== 'none' && Array.isArray(c.matches) && c.matches.length > 0) {
@@ -239,12 +239,10 @@ async function send(textFromComposer) {
             return
         }
 
-
         // 2) Normaler KI-Chat
         const uiSpan = 'ui.ChatView.send.normal'
         const uiAt = Date.now()
 
-        // 2) HTTP-Span "axios"
         const httpSpan = 'http.api.chat'
         const httpAt = Date.now()
 
@@ -257,6 +255,7 @@ async function send(textFromComposer) {
             headers['X-UI-Http-At'] = String(httpAt)
         }
 
+        // ✅ FIX: axios headers korrekt übergeben (nicht verschachteln)
         const { data } = await axios.post(
             '/api/chat',
             {
@@ -265,11 +264,7 @@ async function send(textFromComposer) {
                 provider: provider.value,
                 model: model.value,
             },
-            {
-                headers: {
-                    headers
-                },
-            }
+            { headers }
         )
 
         lastTraceId.value = data.trace_id ?? null
@@ -287,6 +282,8 @@ async function send(textFromComposer) {
             role: 'assistant',
             content: `(${providerModelLabel(p, m)}) ${data.answer ?? '[leer]'}`,
             matches: data.matches ?? [],
+            choices: data.choices ?? [],
+            formCard: data.formCard ?? null,
             steps: mapSteps(data.steps),
             provider: p,
             model: m ?? null,
@@ -342,6 +339,8 @@ async function useDbStepsOnly(solutionId) {
             role: 'assistant',
             content: `(${providerModelLabel(p, m)}) ${data.answer ?? '[leer]'}`,
             matches: data.matches ?? [],
+            choices: data.choices ?? [],
+            formCard: data.formCard ?? null,
             steps: mapSteps(data.steps),
             provider: p,
             model: m ?? null,
@@ -349,6 +348,15 @@ async function useDbStepsOnly(solutionId) {
     } finally {
         sending.value = false
     }
+}
+
+/**
+ * CHOICE click (Formular / Auswahl)
+ */
+function onChoose(idx) {
+    const n = Number(idx)
+    if (!Number.isFinite(n) || n <= 0) return
+    send(String(n))
 }
 
 /**
@@ -377,15 +385,12 @@ function onNextStep() {
 
 /**
  * Trace Export
- * Wichtig: Backend erwartet i.d.R. "traceId" (nicht trace_id).
- * Wenn dein Controller aktuell trace_id liest, kannst du es unten wieder zurückdrehen.
  */
 async function exportTrace() {
     if (!isDev || !lastTraceId.value) return
     await axios.post('/api/trace/export', { traceId: lastTraceId.value, view: 'ChatView.vue' })
 }
 </script>
-
 
 <style scoped>
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }

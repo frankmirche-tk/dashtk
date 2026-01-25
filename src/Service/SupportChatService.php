@@ -14,6 +14,16 @@ use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
 
+/**
+ * Central chat orchestration service.
+ *
+ * Responsibilities:
+ * - Maintain chat session history (cache)
+ * - Execute local resolvers first (ContactResolver, FormResolver)
+ * - Execute KB/DB match for SOP + FORM (SupportSolutionRepository)
+ * - Run AI only when appropriate (and/or as fallback)
+ * - Provide "choices" for numeric selection UX (user replies "1", "2", "3")
+ */
 final class SupportChatService
 {
     private const SESSION_TTL_SECONDS = 3600; // 1h
@@ -35,11 +45,21 @@ final class SupportChatService
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly UsageTracker $usageTracker,
         private readonly ContactResolver $contactResolver,
+        private readonly FormResolver $formResolver,
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
     }
 
+    /**
+     * Convenience trace wrapper to measure sub-operations.
+     *
+     * @param Trace|null $trace Trace instance (optional)
+     * @param string $name Span name
+     * @param callable():mixed $fn Work function
+     * @param array<string,mixed> $meta Span metadata
+     * @return mixed
+     */
     private function span(?Trace $trace, string $name, callable $fn, array $meta = []): mixed
     {
         if ($trace) {
@@ -48,6 +68,28 @@ final class SupportChatService
         return $fn();
     }
 
+    /**
+     * Main chat entrypoint.
+     *
+     * Flow priority:
+     * 1) Numeric selection resolution (choices cached)
+     * 2) DB-only answer (explicit SOP click)
+     * 3) ContactResolver (local-only)
+     * 4) KB match (DB): yields SOP and FORM
+     *    - If user typed form-keywords (pdf/form/formular/...), then always respond DB-only (no AI)
+     *    - Else: always expose FORM as choices (like SOP suggestions) while still allowing AI
+     * 5) AI call with KB context as guidance (SOPs only)
+     *
+     * @param string $sessionId Session identifier (client provided)
+     * @param string $message User message
+     * @param int|null $dbOnlySolutionId If set, returns the SOP steps directly (no AI)
+     * @param string $provider AI provider name (e.g. gemini/openai)
+     * @param string|null $model Optional model override
+     * @param array<string,mixed> $context Optional AI context
+     * @param Trace|null $trace Optional trace instance
+     *
+     * @return array<string,mixed> Response payload for the frontend (answer, matches, choices, steps, etc.)
+     */
     #[TrackUsage(self::USAGE_KEY_ASK, weight: 5)]
     public function ask(
         string $sessionId,
@@ -204,90 +246,79 @@ final class SupportChatService
             'query_len' => mb_strlen($message),
         ]);
 
+        // Split for downstream usage
+        $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
+        $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+
+        // Build FORM choices whenever FORM matches exist (like SOP suggestions)
+        $formChoices = [];
+        if ($forms !== []) {
+            $i = 1;
+            foreach ($forms as $f) {
+                $title = (string)($f['title'] ?? '');
+                if ($title === '') {
+                    continue;
+                }
+                $formChoices[] = [
+                    'kind' => 'form',
+                    'label' => $title,
+                    'payload' => $f,
+                ];
+                $i++;
+                if ($i > self::MAX_CHOICES) {
+                    break;
+                }
+            }
+        }
+
         /**
-         * BRANCH B1a: If user likely asks for a FORM/document, answer DB-only with a selection list
-         * (no AI call necessary).
+         * RULE: AI is NOT used when the search explicitly contains form-keywords.
+         * (pdf, form, formular, dokument, antrag, vorlage)
+         *
+         * In that case we answer purely DB-driven (forms as choices, plus SOPs as matches).
          */
-        $formIntent = $this->span($trace, 'form.intent.detect', function () use ($message, $matches) {
-            $m = mb_strtolower($message);
-            $keywords = ['formular', 'form', 'dokument', 'pdf', 'antrag', 'vorlage'];
-            foreach ($keywords as $k) {
-                if (str_contains($m, $k)) {
-                    return true;
-                }
-            }
+        $hasFormKeywords = $this->span($trace, 'form.keyword.detect', function () use ($message) {
+            return $this->formResolver->hasFormKeywords($message);
+        }, [
+            'query_len' => mb_strlen($message),
+        ]);
 
-            // if we already matched a FORM with good score
-            foreach ($matches as $hit) {
-                if (($hit['type'] ?? null) === 'FORM' && (int)($hit['score'] ?? 0) >= 6) {
-                    return true;
-                }
-            }
-
-            return false;
-        });
-
-        if ($formIntent) {
-            $formAnswer = $this->span($trace, 'form.answer.build', function () use ($matches) {
-                $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
-                $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
-
-                if ($forms === []) {
-                    return [
-                        'answer' => "Ich habe kein passendes Formular gefunden. Nenne mir bitte den genauen Namen (z.B. „Reisekosten Antrag“) oder ergänze 1–2 Stichwörter.",
-                        'choices' => [],
-                        'matches' => $matches,
-                    ];
-                }
+        if ($hasFormKeywords) {
+            if ($formChoices !== []) {
+                $this->storeChoices($sessionId, $formChoices);
 
                 $lines = [];
                 $lines[] = "Ich habe passende **Formulare** gefunden:";
-                $choices = [];
-
-                $i = 1;
-                foreach ($forms as $f) {
-                    $title = (string)($f['title'] ?? '');
-                    $updated = (string)($f['updatedAt'] ?? '');
-                    $lines[] = "{$i}) {$title}" . ($updated !== '' ? " (zuletzt aktualisiert: {$updated})" : '');
-                    $choices[] = [
-                        'kind' => 'form',
-                        'label' => $title,
-                        'payload' => $f,
-                    ];
-                    $i++;
-                    if ($i > self::MAX_CHOICES) {
-                        break;
-                    }
+                $n = 1;
+                foreach ($formChoices as $c) {
+                    $updated = (string)($c['payload']['updatedAt'] ?? '');
+                    $lines[] = "{$n}) {$c['label']}" . ($updated !== '' ? " (zuletzt aktualisiert: {$updated})" : '');
+                    $n++;
                 }
-
-                if ($sops !== []) {
-                    $lines[] = "";
-                    $lines[] = "Zusätzlich gibt es passende SOPs:";
-                    foreach (array_slice($sops, 0, 3) as $s) {
-                        $lines[] = "- " . (string)($s['title'] ?? '');
-                    }
-                }
-
                 $lines[] = "";
-                $lines[] = "Antworte mit **1–" . count($choices) . "**, um ein Formular zu öffnen.";
+                $lines[] = "Antworte mit **1–" . count($formChoices) . "**, um ein Formular zu öffnen.";
 
                 return [
                     'answer' => implode("\n", $lines),
-                    'choices' => $choices,
-                    'matches' => $matches,
+                    'matches' => $sops,
+                    'choices' => $formChoices,
+                    'modeHint' => 'form_kw_db',
                 ];
-            });
-
-            if (!empty($formAnswer['choices'])) {
-                $this->storeChoices($sessionId, $formAnswer['choices']);
             }
 
+            // Keyword present, but no forms found: no AI (as requested)
             return [
-                'answer' => $formAnswer['answer'] ?? '',
-                'matches' => $formAnswer['matches'] ?? $matches,
-                'modeHint' => 'form_db',
-                'choices' => $formAnswer['choices'] ?? [],
+                'answer' => "Ich habe kein passendes Formular gefunden. Bitte prüfe die Schreibweise oder ergänze 1–2 Stichwörter (z.B. „Etikettendruck Formular“).",
+                'matches' => $sops,
+                'choices' => [],
+                'modeHint' => 'form_kw_empty',
             ];
+        }
+
+        // Without form keywords: always store form choices (so numeric selection works),
+        // but do NOT early-return. We allow AI to answer normally.
+        if ($formChoices !== []) {
+            $this->storeChoices($sessionId, $formChoices);
         }
 
         /**
@@ -383,6 +414,7 @@ final class SupportChatService
             return [
                 'answer' => $msg,
                 'matches' => $matches,
+                'choices' => $formChoices, // keep choices visible even when AI failed
                 'modeHint' => 'ai_with_db',
             ];
         }
@@ -397,20 +429,37 @@ final class SupportChatService
             'ttl_s' => self::SESSION_TTL_SECONDS,
         ]);
 
-        // Optional: store KB choices for numeric selection (SOP-only)
+        // SOP choices for numeric selection (SOP-only)
         $kbChoices = $this->buildKbChoices($matches);
+
+        // Merge choices: Forms first, then SOPs (keeps UX: "Formulare" block first)
+        $allChoices = [];
+        if ($formChoices !== []) {
+            $allChoices = array_merge($allChoices, $formChoices);
+        }
         if ($kbChoices !== []) {
-            $this->storeChoices($sessionId, $kbChoices);
+            $allChoices = array_merge($allChoices, $kbChoices);
+        }
+
+        if ($allChoices !== []) {
+            $this->storeChoices($sessionId, $allChoices);
         }
 
         return [
             'answer' => $answer,
             'matches' => $matches,
             'modeHint' => 'ai_with_db',
-            'choices' => $kbChoices,
+            'choices' => $allChoices,
         ];
     }
 
+    /**
+     * Answer a single SOP by ID, returning its step list (DB-only).
+     *
+     * @param string $sessionId Current session
+     * @param int $solutionId SOP ID
+     * @return array<string,mixed>
+     */
     private function answerDbOnly(string $sessionId, int $solutionId): array
     {
         $solution = $this->solutions->find($solutionId);
@@ -468,6 +517,12 @@ final class SupportChatService
         ];
     }
 
+    /**
+     * Run KB matching in DB to find the best SupportSolutions.
+     *
+     * @param string $message User query
+     * @return array<int, array<string,mixed>> Mapped matches (SOP or FORM)
+     */
     private function findMatches(string $message): array
     {
         $message = trim($message);
@@ -489,6 +544,13 @@ final class SupportChatService
         return $mapped;
     }
 
+    /**
+     * Map a SupportSolution entity to a UI-friendly match array.
+     *
+     * @param SupportSolution $solution
+     * @param int $score
+     * @return array<string,mixed>
+     */
     private function mapMatch(SupportSolution $solution, int $score): array
     {
         $id = (int)$solution->getId();
@@ -521,6 +583,12 @@ final class SupportChatService
             ];
     }
 
+    /**
+     * Builds AI context from SOP matches only (FORM is excluded).
+     *
+     * @param array<int, array<string,mixed>> $matches
+     * @return string
+     */
     private function buildKbContext(array $matches): string
     {
         if ($matches === []) {
@@ -548,6 +616,12 @@ final class SupportChatService
         return implode("\n", $lines);
     }
 
+    /**
+     * Load chat history from cache.
+     *
+     * @param string $sessionId
+     * @return array<int, array{role:string,content:string}>
+     */
     private function loadHistory(string $sessionId): array
     {
         $key = $this->historyCacheKey($sessionId);
@@ -560,6 +634,12 @@ final class SupportChatService
         return is_array($val) ? $val : [];
     }
 
+    /**
+     * Save chat history into cache.
+     *
+     * @param string $sessionId
+     * @param array<int, array{role:string,content:string}> $history
+     */
     private function saveHistory(string $sessionId, array $history): void
     {
         $key = $this->historyCacheKey($sessionId);
@@ -572,6 +652,12 @@ final class SupportChatService
         });
     }
 
+    /**
+     * Keep system prompt + last N messages.
+     *
+     * @param array<int, array{role:string,content:string}> $history
+     * @return array<int, array{role:string,content:string}>
+     */
     private function trimHistory(array $history): array
     {
         $system = [];
@@ -587,17 +673,26 @@ final class SupportChatService
         return array_merge($system, $rest);
     }
 
+    /**
+     * Cache key for history.
+     */
     private function historyCacheKey(string $sessionId): string
     {
         return 'support_chat.history.' . sha1($sessionId);
     }
 
+    /**
+     * Cache key for numeric selection choices.
+     */
     private function choicesCacheKey(string $sessionId): string
     {
         return 'support_chat.choices.' . sha1($sessionId);
     }
 
     /**
+     * Store choices list for numeric selection.
+     *
+     * @param string $sessionId
      * @param array<int, array{kind:string,label:string,payload:array}> $choices
      */
     private function storeChoices(string $sessionId, array $choices): void
@@ -614,6 +709,9 @@ final class SupportChatService
     }
 
     /**
+     * Load choices list for numeric selection.
+     *
+     * @param string $sessionId
      * @return array<int, array{kind:string,label:string,payload:array}>
      */
     private function loadChoices(string $sessionId): array
@@ -630,7 +728,14 @@ final class SupportChatService
 
     /**
      * Resolve numeric selection ("1", "2", "3") into a final answer.
-     * Returns NULL if not a numeric selection or no stored choices exist.
+     *
+     * Returns NULL if:
+     * - message is not a pure integer
+     * - or idx <= 0
+     *
+     * @param string $sessionId
+     * @param string $message
+     * @return array<string,mixed>|null
      */
     private function resolveNumericSelection(string $sessionId, string $message): ?array
     {
@@ -668,24 +773,51 @@ final class SupportChatService
         $payload = is_array($choice['payload'] ?? null) ? $choice['payload'] : [];
 
         if ($kind === 'form') {
-            $url = (string)($payload['externalMediaUrl'] ?? $payload['url'] ?? '');
             $updated = (string)($payload['updatedAt'] ?? '');
+
+            // robust: provider/url/id aus payload lesen
+            $provider = $payload['externalMediaProvider'] ?? null;
+            $externalUrl = $payload['externalMediaUrl'] ?? null;
+            $externalId = $payload['externalMediaId'] ?? null;
+
+            // Preview-URL: prefer URL, else derive from provider+id (e.g., Google Drive)
+            $previewUrl = $this->formResolver->buildPreviewUrl(
+                is_string($provider) ? $provider : null,
+                is_string($externalUrl) ? $externalUrl : null,
+                is_string($externalId) ? $externalId : null
+            );
+
+            // fallback: internal API detail URL
+            $fallbackUrl = (string)($payload['url'] ?? '');
+            $urlForText = $previewUrl ?: $fallbackUrl;
+
             $lines = [];
-            $lines[] = "Formular: {$label}";
+            $lines[] = "✅ **Formular geöffnet:** {$label}";
             if ($updated !== '') {
                 $lines[] = "Zuletzt aktualisiert: {$updated}";
             }
-            if ($url !== '') {
-                $lines[] = "Link: {$url}";
+
+            if ($urlForText !== '') {
+                $lines[] = "Link: {$urlForText}";
+            } else {
+                $lines[] = "Link: (keine Vorschau-URL verfügbar – bitte Formular-Eintrag prüfen)";
             }
+
             $lines[] = "";
             $lines[] = "Möchtest du ein anderes Formular aus der Liste öffnen (z.B. „2“) oder suchst du etwas anderes?";
 
             return [
                 'answer' => implode("\n", $lines),
                 'matches' => [],
+                'choices' => [],
                 'modeHint' => 'choice_form',
                 'selected' => $choice,
+                'formCard' => [
+                    'title' => $label,
+                    'updatedAt' => $updated,
+                    'url' => $previewUrl ?: $fallbackUrl,
+                    'provider' => (string)($provider ?? ''),
+                ],
             ];
         }
 
@@ -724,6 +856,7 @@ final class SupportChatService
 
     /**
      * Build selectable SOP choices from matches (used as fallback for "1/2/3").
+     * FORM entries are excluded on purpose (handled via $formChoices in ask()).
      *
      * @param array<int, array<string, mixed>> $matches
      * @return array<int, array{kind:string,label:string,payload:array}>
@@ -747,6 +880,9 @@ final class SupportChatService
         return array_values(array_slice($choices, 0, self::MAX_CHOICES));
     }
 
+    /**
+     * Generate a fallback session id when the client did not provide one.
+     */
     private function newSessionIdFallback(): string
     {
         return bin2hex(random_bytes(16));

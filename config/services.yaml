@@ -91,10 +91,6 @@ services:
         arguments:
             $doctrinePersistProcessor: '@api_platform.doctrine.orm.state.persist_processor'
 
-    App\Service\FormSourceProvider:
-        arguments:
-            $projectDir: '%kernel.project_dir%'
-
     App\Service\GoogleDriveService:
         arguments:
             $credentialsPath: '%google_drive_credentials_path%'
@@ -102,6 +98,8 @@ services:
     App\Controller\GoogleDriveBrowserController:
         arguments:
             $rootFolderId: '%env(string:GOOGLE_DRIVE_FOLDER_ID)%'
+
+    App\Service\FormResolver: ~
 
 
 

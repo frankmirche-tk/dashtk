@@ -1,5 +1,4 @@
 <template>
-    <!-- Avatar/Offer EINMAL über dem Chat -->
     <slot name="avatar" />
 
     <div class="chat">
@@ -9,7 +8,7 @@
             <div class="content">
                 <pre v-if="!m.contactCard" class="pre">{{ m.content }}</pre>
 
-                <!-- Kontaktkarte: schön formatiert -->
+                <!-- Kontaktkarte -->
                 <div v-if="m.contactCard" class="contactCard">
                     <div class="contactTitle">
                         <span v-if="m.contactCard.type === 'branch'">🏬</span>
@@ -126,7 +125,56 @@
                     </div>
                 </div>
 
-                <!-- Treffer aus KB -->
+                <!-- ✅ formCard -->
+                <div v-if="m.formCard" class="contactCard">
+                    <div class="contactTitle">
+                        📄 <strong>{{ m.formCard.title }}</strong>
+                    </div>
+
+                    <div class="contactGrid">
+                        <div class="row" v-if="m.formCard.updatedAt">
+                            <div class="k">🕒 Stand</div>
+                            <div class="v">{{ m.formCard.updatedAt }}</div>
+                        </div>
+
+                        <div class="row" v-if="m.formCard.provider">
+                            <div class="k">🔌 Provider</div>
+                            <div class="v">{{ m.formCard.provider }}</div>
+                        </div>
+
+                        <div class="row" v-if="m.formCard.url">
+                            <div class="k">🔗 Vorschau</div>
+                            <div class="v">
+                                <a :href="m.formCard.url" target="_blank" rel="noreferrer">Formular öffnen</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- ✅ Choices klickbar (Formularliste; sonst generische Auswahl) -->
+                <div v-if="m.role === 'assistant' && m.choices?.length" class="kb">
+                    <div class="kb-title" v-if="m.choices.some(c => c.kind === 'form')">Passende Formulare:</div>
+                    <div class="kb-title" v-else>Auswahl:</div>
+
+                    <ul class="kb-list">
+                        <li
+                            v-for="(c, i) in (m.choices.some(x => x.kind === 'form') ? m.choices.filter(x => x.kind === 'form') : m.choices)"
+                            :key="i"
+                            class="kb-item"
+                        >
+                            <div>
+                                {{ i+1 }}) {{ c.label }}
+                            </div>
+                            <div class="kb-actions">
+                                <button class="btn small" @click="$emit('choose', i+1)">
+                                    Öffnen
+                                </button>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- SOP Treffer -->
                 <div v-if="m.role === 'assistant' && m.matches?.length" class="kb">
                     <div class="kb-title">Passende SOPs aus der Datenbank:</div>
                     <ul class="kb-list">
@@ -147,18 +195,18 @@
                     </ul>
                 </div>
 
-                <!-- Steps inkl. Media -->
+                <!-- Steps -->
                 <div v-if="m.steps?.length" class="stepsBox">
                     <div class="stepsTitle">Schritte:</div>
                     <ol class="stepsList">
                         <li v-for="s in m.steps" :key="s.id || s.no">
                             <span class="stepText">{{ s.text }}</span>
                             <span v-if="s.mediaUrl" class="stepMedia">
-                —
-                <a :href="s.mediaUrl" target="_blank" rel="noreferrer">
-                  {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
-                </a>
-              </span>
+                                —
+                                <a :href="s.mediaUrl" target="_blank" rel="noreferrer">
+                                    {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
+                                </a>
+                            </span>
                         </li>
                     </ol>
                 </div>
@@ -169,13 +217,6 @@
 </template>
 
 <script setup>
-/**
- * ChatMessages.vue
- * Fix:
- * - declare props (messages, roleLabel)
- * - declare emits (db-only, contact-selected)
- */
-
 const props = defineProps({
     messages: {
         type: Array,
@@ -192,16 +233,9 @@ const props = defineProps({
 const emit = defineEmits([
     'db-only',
     'contact-selected',
+    'choose',
 ])
-
-/**
- * Optional helper, falls du Buttons o.ä. im Template hast:
- * emit('db-only', solutionId)
- * emit('contact-selected', payload)
- */
 </script>
-
-
 
 <style scoped>
 .chat { border: 1px solid #ddd; border-radius: 12px; padding: 16px; min-height: 360px; background: #fff; }
