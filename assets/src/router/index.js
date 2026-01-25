@@ -9,7 +9,7 @@ const routes = [
     { path: '/', name: 'chat', component: ChatView },
     { path: '/kb', name: 'kb_list', component: SupportSolutionListView, meta: { inMenu: true } },
     { path: '/kb/new', name: 'kb_new', component: SupportSolutionCreateView, meta: { inMenu: true } },
-    { path: '/kb/:id', name: 'kb_edit', component: SupportSolutionEditView, props: true },
+    { path: '/kb/edit/:id', name: 'kb_edit', component: SupportSolutionEditView, props: true },
     { path: '/traces/:traceId', name: 'trace_view', component: TraceView, props: true },
 ]
 

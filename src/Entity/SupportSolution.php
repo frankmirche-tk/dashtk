@@ -304,6 +304,30 @@ class SupportSolution implements GroupSequenceProviderInterface
 
         return new GroupSequence(['Default', 'sop']);
     }
+    public function setMediaType(?string $mediaType): self
+    {
+        $this->mediaType = $mediaType;
+        return $this;
+    }
+
+    public function setExternalMediaProvider(?string $externalMediaProvider): self
+    {
+        $this->externalMediaProvider = $externalMediaProvider;
+        return $this;
+    }
+
+    public function setExternalMediaUrl(?string $externalMediaUrl): self
+    {
+        $this->externalMediaUrl = $externalMediaUrl;
+        return $this;
+    }
+
+    public function setExternalMediaId(?string $externalMediaId): self
+    {
+        $this->externalMediaId = $externalMediaId;
+        return $this;
+    }
+
 
 
 }

@@ -17,7 +17,7 @@
                 <div class="muted">{{ s.symptoms }}</div>
 
                 <div class="row">
-                    <router-link class="btn" :to="`/kb/${s.id}`">Bearbeiten</router-link>
+                    <router-link class="btn" :to="`/kb/edit/${s.id}`">Bearbeiten</router-link>
                     <a class="btn" :href="`/api/support_solutions/${s.id}`" target="_blank">API</a>
                 </div>
             </div>

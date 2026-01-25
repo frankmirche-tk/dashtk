@@ -13,16 +13,15 @@
             <section class="card">
                 <h2>1) SupportSolution</h2>
 
-                <label>Titel</label>
-                <input class="input" v-model="form.title" />
+                <div class="row" style="align-items:flex-end; gap:14px;">
+                    <div style="min-width: 220px;">
+                        <label>Typ</label>
+                        <select class="input" v-model="form.type">
+                            <option value="SOP">SOP (mit Steps)</option>
+                            <option value="FORM">FORM (externes Formular / Dokument)</option>
+                        </select>
+                    </div>
 
-                <label>Symptome</label>
-                <textarea class="textarea" v-model="form.symptoms"></textarea>
-
-                <label>Kontext / Notizen</label>
-                <textarea class="textarea" v-model="form.contextNotes"></textarea>
-
-                <div class="row">
                     <div>
                         <label>Priority</label>
                         <input class="input small" type="number" v-model.number="form.priority" />
@@ -38,12 +37,152 @@
                     </button>
                 </div>
 
+                <label>Titel</label>
+                <input class="input" v-model="form.title" />
+
+                <label>
+                    Symptome
+                    <span v-if="form.type === 'FORM'" class="hint">(optional)</span>
+                </label>
+                <textarea class="textarea" v-model="form.symptoms"></textarea>
+
+                <label>Kontext / Notizen</label>
+                <textarea class="textarea" v-model="form.contextNotes"></textarea>
+
                 <div v-if="savedMsg" class="ok">{{ savedMsg }}</div>
+            </section>
+
+            <!-- FORM -->
+            <section class="card" v-if="form.type === 'FORM'">
+                <h2>2) Formular</h2>
+
+                <div class="hint">
+                    Hier hinterlegst du den Link zu einem externen Formular/Dokument (z.B. Google Drive).
+                    In Phase 1 reicht „URL + Provider + optional File-ID“.
+                </div>
+
+                <div class="row" style="gap:14px; align-items:flex-end; margin-top:10px;">
+                    <div style="min-width: 240px;">
+                        <label>Media Type</label>
+                        <select class="input" v-model="form.mediaType">
+                            <option value="external">external (Link)</option>
+                            <option value="internal" disabled>internal (Upload) – später</option>
+                        </select>
+                    </div>
+
+                    <div style="min-width: 240px;">
+                        <label>Provider</label>
+                        <select class="input" v-model="form.externalMediaProvider">
+                            <option value="google_drive">google_drive</option>
+                        </select>
+                    </div>
+
+
+
+                </div>
+
+                <!-- Ordner -->
+                <div class="row" style="align-items:flex-end; gap:14px; margin-top:12px;">
+                    <div style="flex:1">
+                        <label>Google Drive Ordner (optional)</label>
+                        <select
+                            class="input"
+                            v-model="selectedFolderId"
+                            :disabled="foldersLoading || driveFolders.length === 0"
+                            @change="onPickFolder"
+                        >
+                            <option value="">
+                                {{ foldersLoading ? 'Lade Ordner…' : '— bitte auswählen —' }}
+                            </option>
+                            <option v-for="f in driveFolders" :key="f.id" :value="f.id">
+                                {{ f.name }} ({{ f.mimeType }})
+                            </option>
+                        </select>
+
+                        <div class="hint" style="margin-top:6px;">
+                            Quelle: <code>/api/forms/google-drive/folders</code> (Root: GOOGLE_DRIVE_FOLDER_ID)
+                        </div>
+                    </div>
+
+
+
+                    <button class="btn" @click="loadDriveFolders" :disabled="foldersLoading">
+                        Ordner aktualisieren
+                    </button>
+                </div>
+
+                <!-- Dateien -->
+                <div class="row" style="align-items:flex-end; gap:14px; margin-top:12px;">
+                    <div style="flex:1">
+                        <label>Google Drive Datei (optional)</label>
+                        <select
+                            class="input"
+                            v-model="selectedFileId"
+                            :disabled="filesLoading || driveFiles.length === 0"
+                            @change="onPickDriveFile"
+                        >
+                            <option value="">
+                                {{ filesLoading ? 'Lade Dateien…' : '— bitte auswählen —' }}
+                            </option>
+                            <option v-for="f in driveFiles" :key="f.id" :value="f.id">
+                                {{ f.name }} ({{ f.mimeType }})
+                            </option>
+                        </select>
+
+                        <div class="hint" style="margin-top:6px;">
+                            Quelle:
+                            <code>/api/forms/google-drive?folderId={{ selectedFolderId || '(root)' }}</code>
+                        </div>
+                    </div>
+
+                    <button class="btn" @click="loadDriveFiles" :disabled="filesLoading">
+                        Dateien aktualisieren
+                    </button>
+                </div>
+
+                <label>Externe URL</label>
+                <input class="input" v-model="form.externalMediaUrl" placeholder="https://drive.google.com/file/d/.../view" />
+
+                <label>Externe ID (optional)</label>
+                <input class="input" v-model="form.externalMediaId" placeholder="z.B. Google Drive fileId" />
+
+                <button
+                    class="btn primary"
+                    @click="swapFormFromSelection"
+                    :disabled="savingForm || (!selectedFileId && !form.externalMediaUrl)"
+                    title="Übernimmt die aktuell ausgewählte Drive-Datei (oder die URL im Feld) und speichert"
+                >
+                    Formular tauschen
+                </button>
+
+                <button
+                    class="btn danger"
+                    v-if="form.externalMediaUrl || form.externalMediaId"
+                    @click="removeForm"
+                    :disabled="savingForm"
+                >
+                    Entfernen
+                </button>
+
+                <div v-if="formMsg" class="ok">{{ formMsg }}</div>
+                <div class="row" style="margin-top:10px;">
+                    <a
+                        v-if="form.externalMediaUrl"
+                        class="btn"
+                        :href="form.externalMediaUrl"
+                        target="_blank"
+                        rel="noreferrer"
+                    >
+                        ↗ Link öffnen
+                    </a>
+
+                    <div class="hint">Tipp: Für In-App Preview später <code>/preview</code> nutzen.</div>
+                </div>
             </section>
 
             <!-- Keywords -->
             <section class="card">
-                <h2>2) Keywords</h2>
+                <h2>3) Keywords</h2>
 
                 <div class="row">
                     <button class="btn" @click="addKeywordRow">+ Keyword</button>
@@ -63,9 +202,9 @@
                 <div v-if="kwMsg" class="ok">{{ kwMsg }}</div>
             </section>
 
-            <!-- Steps -->
-            <section class="card">
-                <h2>3) Steps</h2>
+            <!-- Steps (nur SOP) -->
+            <section class="card" v-if="form.type !== 'FORM'">
+                <h2>4) Steps</h2>
 
                 <div class="row">
                     <button class="btn" @click="addStepRow">+ Step</button>
@@ -157,7 +296,7 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import axios from 'axios'
 import { uuid } from '../utils/uuid'
@@ -169,21 +308,38 @@ const loading = ref(true)
 const error = ref('')
 
 const saving = ref(false)
+const savingForm = ref(false)
 const savingKeywords = ref(false)
 const savingSteps = ref(false)
 
 const savedMsg = ref('')
+const formMsg = ref('')
 const kwMsg = ref('')
 const stMsg = ref('')
 
 const uploadingStepId = ref(null)
 
+// Google Drive (Edit)
+const driveFolders = ref([])   // [{id,name,mimeType}]
+const driveFiles = ref([])     // [{id,name,mimeType,webViewLink}]
+const foldersLoading = ref(false)
+const filesLoading = ref(false)
+const selectedFolderId = ref('')
+const selectedFileId = ref('')
+
 const form = ref({
+    type: 'SOP',
     title: '',
     symptoms: '',
     contextNotes: '',
     priority: 0,
     active: true,
+
+    // FORM fields
+    mediaType: null,
+    externalMediaProvider: null,
+    externalMediaUrl: '',
+    externalMediaId: '',
 })
 
 const keywords = ref([]) // [{id?, keyword, weight, _key}]
@@ -191,19 +347,76 @@ const steps = ref([])    // [{id?, stepNo, instruction, expectedResult, nextIfFa
 
 function key() { return uuid() }
 
+/** ===== Google Drive helpers ===== */
+async function loadDriveFolders() {
+    foldersLoading.value = true
+    try {
+        const { data } = await axios.get('/api/forms/google-drive/folders')
+        driveFolders.value = Array.isArray(data?.folders) ? data.folders : []
+    } catch (e) {
+        driveFolders.value = []
+    } finally {
+        foldersLoading.value = false
+    }
+}
+
+async function loadDriveFiles() {
+    filesLoading.value = true
+    try {
+        const params = {}
+        if (selectedFolderId.value) params.folderId = selectedFolderId.value
+        const { data } = await axios.get('/api/forms/google-drive', { params })
+        driveFiles.value = Array.isArray(data?.files) ? data.files : []
+
+        // falls beim Edit schon eine ID gesetzt ist -> preselect
+        const currentId = (form.value.externalMediaId || '').trim()
+        if (currentId && driveFiles.value.some(f => f.id === currentId)) {
+            selectedFileId.value = currentId
+        }
+    } catch (e) {
+        driveFiles.value = []
+    } finally {
+        filesLoading.value = false
+    }
+}
+
+function onPickFolder() {
+    selectedFileId.value = ''
+    // bei Ordnerwechsel Liste neu laden
+    loadDriveFiles()
+}
+
+function onPickDriveFile() {
+    const f = driveFiles.value.find(x => x.id === selectedFileId.value)
+    if (!f) return
+
+    form.value.mediaType = 'external'
+    form.value.externalMediaProvider = 'google_drive'
+    form.value.externalMediaUrl = f.webViewLink ?? ''
+    form.value.externalMediaId = f.id ?? ''
+}
+
+/** ===== Load all ===== */
 async function loadAll() {
     loading.value = true
     error.value = ''
     try {
         const sol = await axios.get(`/api/support_solutions/${id.value}`)
         form.value = {
+            type: sol.data.type ?? 'SOP',
             title: sol.data.title ?? '',
             symptoms: sol.data.symptoms ?? '',
             contextNotes: sol.data.contextNotes ?? sol.data.context_notes ?? '',
             priority: sol.data.priority ?? 0,
             active: sol.data.active ?? true,
+
+            mediaType: sol.data.mediaType ?? null,
+            externalMediaProvider: sol.data.externalMediaProvider ?? null,
+            externalMediaUrl: sol.data.externalMediaUrl ?? '',
+            externalMediaId: sol.data.externalMediaId ?? '',
         }
 
+        // Keywords
         const kwRes = await axios.get('/api/support_solution_keywords', {
             params: { solution: `/api/support_solutions/${id.value}` },
         })
@@ -215,25 +428,35 @@ async function loadAll() {
             _key: key(),
         }))
 
-        const stRes = await axios.get('/api/support_solution_steps', {
-            params: { solution: `/api/support_solutions/${id.value}` },
-        })
-        const stItems = stRes.data.member ?? stRes.data
-        steps.value = stItems
-            .map(s => ({
-                id: s.id,
-                stepNo: s.stepNo ?? 1,
-                instruction: s.instruction ?? '',
-                expectedResult: s.expectedResult ?? '',
-                nextIfFailed: s.nextIfFailed ?? '',
-                // Media-Felder (kommen aus solution:read Groups)
-                mediaUrl: s.mediaUrl ?? null,
-                mediaMimeType: s.mediaMimeType ?? null,
-                mediaOriginalName: s.mediaOriginalName ?? null,
-                _pendingFile: null,
-                _key: key(),
-            }))
-            .sort((a, b) => a.stepNo - b.stepNo)
+        // Steps (nur SOP sinnvoll)
+        if (form.value.type !== 'FORM') {
+            const stRes = await axios.get('/api/support_solution_steps', {
+                params: { solution: `/api/support_solutions/${id.value}` },
+            })
+            const stItems = stRes.data.member ?? stRes.data
+            steps.value = stItems
+                .map(s => ({
+                    id: s.id,
+                    stepNo: s.stepNo ?? 1,
+                    instruction: s.instruction ?? '',
+                    expectedResult: s.expectedResult ?? '',
+                    nextIfFailed: s.nextIfFailed ?? '',
+                    mediaUrl: s.mediaUrl ?? null,
+                    mediaMimeType: s.mediaMimeType ?? null,
+                    mediaOriginalName: s.mediaOriginalName ?? null,
+                    _pendingFile: null,
+                    _key: key(),
+                }))
+                .sort((a, b) => a.stepNo - b.stepNo)
+        } else {
+            steps.value = []
+        }
+
+        // Google Drive: wenn FORM -> Ordner/Dateien vorbereiten
+        if (form.value.type === 'FORM' && (form.value.externalMediaProvider || 'google_drive') === 'google_drive') {
+            if (driveFolders.value.length === 0) await loadDriveFolders()
+            await loadDriveFiles()
+        }
 
     } catch (e) {
         error.value = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Laden'
@@ -242,6 +465,7 @@ async function loadAll() {
     }
 }
 
+/** ===== Save base solution ===== */
 async function saveSolution() {
     saving.value = true
     savedMsg.value = ''
@@ -249,15 +473,22 @@ async function saveSolution() {
         await axios.patch(
             `/api/support_solutions/${id.value}`,
             {
+                type: form.value.type,
                 title: form.value.title,
-                symptoms: form.value.symptoms,
-                contextNotes: form.value.contextNotes,
+                symptoms: (form.value.symptoms ?? '').trim() === '' ? null : form.value.symptoms,
+                contextNotes: (form.value.contextNotes ?? '').trim() === '' ? null : form.value.contextNotes,
                 priority: form.value.priority,
                 active: form.value.active,
             },
             { headers: { 'Content-Type': 'application/merge-patch+json' } }
         )
         savedMsg.value = '✅ Stammdaten gespeichert'
+
+        // wenn auf FORM umgestellt wurde -> Drive laden
+        if (form.value.type === 'FORM') {
+            if (driveFolders.value.length === 0) await loadDriveFolders()
+            await loadDriveFiles()
+        }
     } catch (e) {
         error.value = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Speichern'
     } finally {
@@ -265,6 +496,81 @@ async function saveSolution() {
     }
 }
 
+/** ===== Save form fields ===== */
+async function saveForm() {
+    savingForm.value = true
+    formMsg.value = ''
+    try {
+        await axios.patch(
+            `/api/support_solutions/${id.value}`,
+            {
+                mediaType: form.value.mediaType ?? 'external',
+                externalMediaProvider: form.value.externalMediaProvider ?? 'google_drive',
+                externalMediaUrl: (form.value.externalMediaUrl ?? '').trim() === '' ? null : form.value.externalMediaUrl,
+                externalMediaId: (form.value.externalMediaId ?? '').trim() === '' ? null : form.value.externalMediaId,
+            },
+            { headers: { 'Content-Type': 'application/merge-patch+json' } }
+        )
+        formMsg.value = '✅ Formular-Link gespeichert'
+    } catch (e) {
+        error.value = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Speichern des Formulars'
+    } finally {
+        savingForm.value = false
+    }
+}
+
+async function swapFormFromSelection() {
+    // Wenn eine Drive-Datei gewählt ist -> Felder übernehmen
+    if (selectedFileId.value) {
+        const f = driveFiles.value.find(x => x.id === selectedFileId.value)
+        if (f) {
+            form.value.mediaType = 'external'
+            form.value.externalMediaProvider = 'google_drive'
+            form.value.externalMediaUrl = f.webViewLink ?? ''
+            form.value.externalMediaId = f.id ?? ''
+        }
+    } else {
+        // sonst: User hat manuell URL/ID eingegeben -> nur Defaults setzen
+        form.value.mediaType ||= 'external'
+        form.value.externalMediaProvider ||= 'google_drive'
+    }
+
+    await saveForm()
+}
+
+/** ===== Formulare ändern/Tauschen/entfernn ===== */
+async function removeForm() {
+    savingForm.value = true
+    formMsg.value = ''
+    try {
+        await axios.patch(
+            `/api/support_solutions/${id.value}`,
+            {
+                mediaType: null,
+                externalMediaProvider: null,
+                externalMediaUrl: null,
+                externalMediaId: null,
+            },
+            { headers: { 'Content-Type': 'application/merge-patch+json' } }
+        )
+
+        // UI leeren
+        form.value.mediaType = null
+        form.value.externalMediaProvider = null
+        form.value.externalMediaUrl = ''
+        form.value.externalMediaId = ''
+        selectedFileId.value = ''
+
+        formMsg.value = '✅ Formular-Link entfernt'
+    } catch (e) {
+        error.value = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Entfernen'
+    } finally {
+        savingForm.value = false
+    }
+}
+
+
+/** ===== Keywords ===== */
 function addKeywordRow() {
     keywords.value.push({ id: null, keyword: '', weight: 5, _key: key() })
 }
@@ -311,6 +617,7 @@ async function saveKeywords() {
     }
 }
 
+/** ===== Steps ===== */
 function addStepRow() {
     const nextNo = steps.value.length ? Math.max(...steps.value.map(s => s.stepNo)) + 1 : 1
     steps.value.push({
@@ -330,8 +637,6 @@ function addStepRow() {
 async function removeStep(idx) {
     const st = steps.value[idx]
     if (st.id) {
-        // Optional: vorher Media löschen ist nicht zwingend, weil onDelete CASCADE am Step greift,
-        // Datei im FS bleibt aber evtl. liegen. (Kann man später per Cleanup lösen.)
         await axios.delete(`/api/support_solution_steps/${st.id}`)
     }
     steps.value.splice(idx, 1)
@@ -367,14 +672,12 @@ async function saveSteps() {
                 const res = await axios.post('/api/support_solution_steps', payload, {
                     headers: { 'Content-Type': 'application/ld+json' },
                 })
-                // ApiPlatform gibt id evtl. als "@id" (IRI) zurück – robust auslesen:
                 const iri = res.data?.['@id'] || ''
                 const newId = iri ? iri.split('/').pop() : (res.data?.id ?? null)
                 s.id = newId
             }
         }
 
-        // Nach dem Speichern neu laden, damit media-Felder (falls vorhanden) korrekt rein kommen
         await loadAll()
         stMsg.value = '✅ Steps gespeichert'
     } catch (e) {
@@ -398,7 +701,6 @@ async function doUpload(step) {
         const fd = new FormData()
         fd.append('file', step._pendingFile)
 
-        // Upload-Endpoint aus dem Backend Controller:
         const { data } = await axios.post(`/api/support_solution_steps/${step.id}/media`, fd, {
             headers: { 'Content-Type': 'multipart/form-data' }
         })
@@ -430,6 +732,19 @@ async function removeMedia(step) {
     }
 }
 
+/** Wenn der User im Edit den Typ umstellt -> Drive-Listen laden */
+watch(
+    () => form.value.type,
+    async (t) => {
+        if (t === 'FORM') {
+            form.value.mediaType ||= 'external'
+            form.value.externalMediaProvider ||= 'google_drive'
+            if (driveFolders.value.length === 0) await loadDriveFolders()
+            await loadDriveFiles()
+        }
+    }
+)
+
 loadAll()
 </script>
 
@@ -457,6 +772,9 @@ label { display:block; margin: 8px 0 4px; font-weight: 600; }
 .mediaMeta { font-size: 12px; color: #666; margin-top: 6px; }
 .mediaHint { font-size: 12px; color: #666; margin-top: 10px; }
 .file { width: 100%; }
+
+.hint { color:#666; font-size: 13px; }
+
 @media (max-width: 900px) {
     .mediaRow { grid-template-columns: 1fr; }
 }

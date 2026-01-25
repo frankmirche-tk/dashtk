@@ -22,3 +22,6 @@
 # recommended (usually already there in many projects)
 /var/
 /vendor/
+#Google Drive API Credentials
+/config/secrets/google-drive/
+*.json

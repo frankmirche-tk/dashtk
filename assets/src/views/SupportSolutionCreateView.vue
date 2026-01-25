@@ -1,366 +1,635 @@
 <template>
     <div class="page">
-        <header class="topbar">
+        <div class="row top">
             <h1>Neues Support-Thema</h1>
-            <div class="actions">
-                <router-link class="btn" to="/">← zurück zum Chat</router-link>
-            </div>
-        </header>
+            <router-link class="btn" to="/kb">← zurück zum Chat</router-link>
+        </div>
+
+        <div v-if="error" class="error">{{ error }}</div>
 
         <div class="grid">
             <!-- 1) Thema -->
             <section class="card">
                 <h2>1) Thema / SupportSolution</h2>
 
-                <label class="label">Titel</label>
-                <input class="input" v-model.trim="solution.title" placeholder="z.B. Papierstau beheben – HP LaserJet ..." />
+                <div class="row" style="align-items:flex-end; gap:14px;">
+                    <div style="min-width: 220px;">
+                        <label class="label">Typ</label>
+                        <select class="input" v-model="solution.type">
+                            <option value="SOP">SOP (mit Steps)</option>
+                            <option value="FORM">FORM (externes Formular / Dokument)</option>
+                        </select>
+                    </div>
 
-                <label class="label">Symptome</label>
-                <textarea class="textarea" v-model.trim="solution.symptoms" rows="3"
-                          placeholder="z.B. Meldung Papierstau, Druck bricht ab, Papier klemmt ..." />
+                    <label class="row" style="gap:8px; margin-left:auto;">
+                        <input type="checkbox" v-model="solution.active" />
+                        aktiv
+                    </label>
+
+                    <div style="min-width: 140px;">
+                        <label class="label">Priority</label>
+                        <input class="input" type="number" v-model.number="solution.priority" />
+                    </div>
+                </div>
+
+                <label class="label">Titel</label>
+                <input class="input" v-model="solution.title" placeholder="z.B. Papierstau beheben – HP LaserJet ..." />
+
+                <label class="label">
+                    Symptome
+                    <span v-if="solution.type === 'FORM'" class="hint">(optional)</span>
+                </label>
+                <textarea
+                    class="textarea"
+                    v-model="solution.symptoms"
+                    :placeholder="solution.type === 'FORM'
+                        ? 'Optional: Wann ist dieses Formular relevant?'
+                        : 'z.B. Meldung Papierstau, Druck bricht ab …'"
+                ></textarea>
 
                 <label class="label">Kontext / Notizen</label>
-                <textarea class="textarea" v-model.trim="solution.contextNotes" rows="3"
-                          placeholder="z.B. Häufig nach Papierwechsel. Keywords: ... (optional)" />
+                <textarea class="textarea" v-model="solution.contextNotes" placeholder="Optional: Hinweise / Kontext"></textarea>
 
-                <div class="row">
-                    <div>
-                        <label class="label">Priority</label>
-                        <input class="input" type="number" v-model.number="solution.priority" min="0" max="100" />
-                    </div>
-                    <div class="checkbox">
-                        <input id="active" type="checkbox" v-model="solution.active" />
-                        <label for="active">aktiv</label>
-                    </div>
-                </div>
+                <div v-if="errors.solution" class="error">{{ errors.solution }}</div>
 
-                <div class="row">
-                    <button class="btn primary" :disabled="saving || createdSolutionId" @click="createSolution">
-                        {{ createdSolutionId ? `✅ Angelegt (#${createdSolutionId})` : 'SupportSolution anlegen' }}
+                <div class="row" style="margin-top:12px;">
+                    <button class="btn primary" @click="createSolution" :disabled="saving  || !!createdSolutionId">
+                        SupportSolution speichern
                     </button>
-                    <span class="hint" v-if="createdSolutionId">Jetzt Keywords & Steps hinzufügen.</span>
-                </div>
 
-                <p class="error" v-if="errors.solution">{{ errors.solution }}</p>
+                    <div v-if="createdSolutionId" class="ok">
+                        ✅ Angelegt: ID {{ createdSolutionId }}
+                        <router-link class="btn" :to="`/kb/edit/${createdSolutionId}`">Jetzt bearbeiten</router-link>
+                    </div>
+                </div>
             </section>
 
             <!-- 2) Keywords -->
             <section class="card">
                 <h2>2) Keywords</h2>
 
-                <div class="hint">
-                    Pro Keyword optional Gewicht (1–10). Beispiel: <code>wlan</code>, <code>drucker offline</code>, <code>warteschlange</code>
-                </div>
+                <div class="hint">Pro Keyword optional Gewicht (1–10). Beispiel: wlan, drucker offline, warteschlange</div>
 
-                <div class="list">
-                    <div v-for="(k, idx) in keywords" :key="idx" class="list-row">
-                        <input class="input" v-model.trim="k.keyword" placeholder="keyword" />
-                        <input class="input small" type="number" v-model.number="k.weight" min="1" max="10" />
-                        <button class="btn danger" @click="removeKeyword(idx)">✕</button>
+                <div class="grid">
+                    <div class="kwRow" v-for="(k, idx) in keywords" :key="idx">
+                        <input class="input" v-model="k.keyword" placeholder="keyword" />
+                        <input class="input small" type="number" min="1" max="10" v-model.number="k.weight" />
+                        <button class="btn danger" @click="removeKeywordRow(idx)">x</button>
                     </div>
                 </div>
 
-                <div class="row">
-                    <button class="btn" @click="addKeyword">+ Keyword</button>
-                    <button class="btn primary" :disabled="saving || !createdSolutionId || keywords.length === 0" @click="saveKeywords">
+                <div class="row" style="margin-top:10px;">
+                    <button class="btn" @click="addKeywordRow">+ Keyword</button>
+                    <button class="btn primary" @click="saveKeywords" :disabled="savingKeywords">
                         Keywords speichern
                     </button>
                 </div>
 
-                <p class="error" v-if="errors.keywords">{{ errors.keywords }}</p>
-                <p class="ok" v-if="saved.keywords">✅ Keywords gespeichert</p>
+                <div v-if="errors.keywords" class="error">{{ errors.keywords }}</div>
+                <div v-if="kwMsg" class="ok">{{ kwMsg }}</div>
             </section>
 
-            <!-- 3) Steps -->
-            <section class="card full">
-                <h2>3) Steps</h2>
+            <!-- 3) Formular (nur FORM) -->
+            <section class="card full" v-if="solution.type === 'FORM'">
+                <h2>3) Formular</h2>
 
                 <div class="hint">
-                    Steps werden mit <code>stepNo</code> gespeichert (1..n). Empfehlung: klare Aktion + erwartetes Ergebnis + nächster Schritt falls fehlgeschlagen.
-                    <br>
-                    Optional kannst du pro Step eine Datei hochladen (Bild/GIF/PDF/MP4). Diese wird später als „Bildhilfe / PDF“ angezeigt.
+                    Hier hinterlegst du den Link zu einem externen Formular/Dokument (z.B. Google Drive).
+                    Auswahl wird automatisch gespeichert (auch bei Wechsel).
                 </div>
 
-                <div class="steps">
-                    <div v-for="(s, idx) in steps" :key="idx" class="step">
-                        <div class="step-head">
-                            <strong>Step {{ s.stepNo }}</strong>
-                            <button class="btn danger" @click="removeStep(idx)">Entfernen</button>
-                        </div>
+                <div class="row" style="gap:14px; align-items:flex-end; margin-top:10px;">
+                    <div style="min-width: 240px;">
+                        <label class="label">Media Type</label>
+                        <select class="input" v-model="solution.mediaType">
+                            <option value="external">external (Link)</option>
+                            <option value="internal" disabled>internal (Upload) – später</option>
+                        </select>
+                    </div>
 
-                        <label class="label">Instruction</label>
-                        <textarea class="textarea" v-model.trim="s.instruction" rows="2" placeholder="Was soll der Mitarbeiter tun?" />
-
-                        <div class="two">
-                            <div>
-                                <label class="label">Expected Result (optional)</label>
-                                <textarea class="textarea" v-model.trim="s.expectedResult" rows="2" placeholder="Woran erkennt man Erfolg?" />
-                            </div>
-                            <div>
-                                <label class="label">Next if failed (optional)</label>
-                                <textarea class="textarea" v-model.trim="s.nextIfFailed" rows="2" placeholder="Wenn es nicht klappt: was als nächstes?" />
-                            </div>
-                        </div>
-
-                        <!-- Media Upload erst NACH dem Speichern (wenn Step-ID existiert) -->
-                        <div class="media" v-if="createdSolutionId">
-                            <div class="media-hint">
-                                Media pro Step: erst „Steps speichern“, dann kannst du Upload/Replace machen (da Step-ID benötigt wird).
-                            </div>
-                        </div>
+                    <div style="min-width: 240px;">
+                        <label class="label">Provider</label>
+                        <select class="input" v-model="solution.externalMediaProvider">
+                            <option value="google_drive">google_drive</option>
+                        </select>
                     </div>
                 </div>
 
+                <!-- Ordner -->
+                <div class="row" style="align-items:flex-end; gap:14px; margin-top:10px;">
+                    <div style="flex:1">
+                        <label class="label">Google Drive Ordner</label>
+                        <select
+                            class="input"
+                            v-model="selectedDriveFolderId"
+                            :disabled="driveFoldersLoading"
+                        >
+                            <option value="">
+                                {{ driveFoldersLoading ? 'Lade Ordner…' : '— bitte auswählen —' }}
+                            </option>
+                            <option v-for="f in driveFolders" :key="f.id" :value="f.id">
+                                {{ f.name }} ({{ f.mimeType }})
+                            </option>
+                        </select>
+
+                        <div class="hint" style="margin-top:6px;">
+                            Quelle: <code>/api/forms/google-drive/folders</code> (Root: <code>GOOGLE_DRIVE_FOLDER_ID</code>)
+                        </div>
+                    </div>
+
+                    <button class="btn" @click="loadDriveFolders" :disabled="driveFoldersLoading">
+                        Ordner aktualisieren
+                    </button>
+                </div>
+
+                <!-- Dateien -->
+                <div class="row" style="align-items:flex-end; gap:14px; margin-top:10px;">
+                    <div style="flex:1">
+                        <label class="label">Google Drive Datei</label>
+                        <select
+                            class="input"
+                            v-model="selectedDriveFileId"
+                            :disabled="driveFilesLoading || !selectedDriveFolderId || driveFiles.length === 0"
+                            @change="onPickDriveFile"
+                        >
+                            <option value="">
+                                {{
+                                    !selectedDriveFolderId
+                                        ? '— zuerst Ordner wählen —'
+                                        : (driveFilesLoading ? 'Lade Dateien…' : '— bitte auswählen —')
+                                }}
+                            </option>
+
+                            <option v-for="f in driveFiles" :key="f.id" :value="f.id">
+                                {{ f.name }} ({{ f.mimeType }})
+                            </option>
+                        </select>
+
+                        <div class="hint" style="margin-top:6px;">
+                            Quelle: <code>/api/forms/google-drive?folderId={{ selectedDriveFolderId || '...' }}</code>
+                        </div>
+                    </div>
+
+                    <button class="btn" @click="loadDriveFiles(selectedDriveFolderId)" :disabled="driveFilesLoading || !selectedDriveFolderId">
+                        Dateien aktualisieren
+                    </button>
+                </div>
+
+                <label class="label">Externe URL</label>
+                <input class="input" v-model="solution.externalMediaUrl" placeholder="https://drive.google.com/file/d/.../view" />
+
+                <label class="label">Externe ID (optional)</label>
+                <input class="input" v-model="solution.externalMediaId" placeholder="z.B. Google Drive fileId" />
+
+                <div class="row" style="margin-top:12px;">
+                    <div v-if="formMsg" class="ok">{{ formMsg }}</div>
+                    <div v-if="formSavingHint" class="hint">Speichere Formular…</div>
+                </div>
+
+                <div class="row" style="margin-top:10px;" v-if="solution.externalMediaUrl">
+                    <a class="btn" :href="solution.externalMediaUrl" target="_blank" rel="noreferrer">↗ Link öffnen</a>
+                    <div class="hint">Tipp: Für In-App Preview später <code>/preview</code> nutzen.</div>
+                </div>
+
+                <div v-if="errors.form" class="error">{{ errors.form }}</div>
+            </section>
+
+            <!-- 3) SOP Steps (nur SOP) -->
+            <section class="card full" v-else>
+                <h2>3) Steps</h2>
+
                 <div class="row">
-                    <button class="btn" @click="addStep">+ Step</button>
-                    <button class="btn primary" :disabled="saving || !createdSolutionId || steps.length === 0" @click="saveSteps">
+                    <button class="btn" @click="addStepRow">+ Step</button>
+                    <button class="btn primary" @click="saveSteps" :disabled="savingSteps">
                         Steps speichern
                     </button>
                 </div>
 
-                <p class="error" v-if="errors.steps">{{ errors.steps }}</p>
-                <p class="ok" v-if="saved.steps">✅ Steps gespeichert – jetzt kannst du im Edit-Mode Media hochladen.</p>
+                <div class="stepCard" v-for="(st, idx) in steps" :key="idx">
+                    <div class="row" style="justify-content: space-between;">
+                        <strong>Step {{ st.stepNo }}</strong>
+                        <button class="btn danger" @click="removeStepRow(idx)">Entfernen</button>
+                    </div>
 
-                <div v-if="saved.steps" class="row" style="margin-top: 10px;">
-                    <router-link class="btn primary" :to="`/kb/${createdSolutionId}`">
-                        Jetzt Steps + Media bearbeiten
-                    </router-link>
+                    <label class="label">Instruction</label>
+                    <textarea class="textarea" v-model="st.instruction"></textarea>
+
+                    <div class="row">
+                        <div style="flex:1">
+                            <label class="label">Expected Result (optional)</label>
+                            <textarea class="textarea" v-model="st.expectedResult"></textarea>
+                        </div>
+                        <div style="flex:1">
+                            <label class="label">Next if failed (optional)</label>
+                            <textarea class="textarea" v-model="st.nextIfFailed"></textarea>
+                        </div>
+                    </div>
                 </div>
+
+                <div v-if="errors.steps" class="error">{{ errors.steps }}</div>
+                <div v-if="stMsg" class="ok">{{ stMsg }}</div>
             </section>
         </div>
-
-        <section class="card">
-            <h2>Fertig / Export</h2>
-            <div class="row">
-                <button class="btn" @click="resetAll">Neues Thema anfangen</button>
-                <router-link class="btn primary" to="/">Zum Chat</router-link>
-            </div>
-            <div class="hint" v-if="createdSolutionId">
-                Angelegte Solution-ID: <strong>#{{ createdSolutionId }}</strong>
-            </div>
-        </section>
     </div>
 </template>
 
 <script setup>
 import axios from 'axios'
-import { ref, reactive } from 'vue'
+import { ref, reactive, watch } from 'vue'
+import { useRouter } from 'vue-router'
+
+const router = useRouter()
+
 
 const saving = ref(false)
+const savingKeywords = ref(false)
+const savingSteps = ref(false)
+
 const createdSolutionId = ref(null)
 
-const errors = reactive({ solution: '', keywords: '', steps: '' })
-const saved = reactive({ keywords: false, steps: false })
+const error = ref('')
+const kwMsg = ref('')
+const stMsg = ref('')
+
+// Autosave Status/Messages
+const formMsg = ref('')
+const formSavingHint = ref(false)
+
+// Drive Ordner + Dateien
+const driveFolders = ref([])
+const driveFoldersLoading = ref(false)
+const selectedDriveFolderId = ref('')
+
+const driveFiles = ref([])
+const driveFilesLoading = ref(false)
+const selectedDriveFileId = ref('')
 
 const solution = reactive({
+    type: 'SOP',
     title: '',
     symptoms: '',
     contextNotes: '',
     priority: 0,
     active: true,
+
+    // FORM-spezifisch
+    mediaType: null, // 'external'
+    externalMediaProvider: null, // 'google_drive'
+    externalMediaUrl: '',
+    externalMediaId: '',
 })
 
 const keywords = ref([{ keyword: '', weight: 5 }])
 const steps = ref([{ stepNo: 1, instruction: '', expectedResult: '', nextIfFailed: '' }])
 
-function apiBase() {
-    return 'http://127.0.0.1:8000'
+const errors = reactive({ solution: '', keywords: '', steps: '', form: '' })
+
+async function loadDriveFolders() {
+    driveFoldersLoading.value = true
+    try {
+        const { data } = await axios.get('/api/forms/google-drive/folders')
+        driveFolders.value = Array.isArray(data?.folders) ? data.folders : []
+    } catch (e) {
+        driveFolders.value = []
+    } finally {
+        driveFoldersLoading.value = false
+    }
+}
+
+async function loadDriveFiles(folderId) {
+    if (!folderId) {
+        driveFiles.value = []
+        selectedDriveFileId.value = ''
+        return
+    }
+
+    driveFilesLoading.value = true
+    try {
+        const { data } = await axios.get('/api/forms/google-drive', { params: { folderId } })
+        driveFiles.value = Array.isArray(data?.files) ? data.files : []
+    } catch (e) {
+        driveFiles.value = []
+    } finally {
+        driveFilesLoading.value = false
+    }
 }
 
 function clearErrors() {
     errors.solution = ''
     errors.keywords = ''
     errors.steps = ''
+    errors.form = ''
+    error.value = ''
 }
 
-function addKeyword() {
-    keywords.value.push({ keyword: '', weight: 3 })
-}
-function removeKeyword(idx) {
-    keywords.value.splice(idx, 1)
-}
+/**
+ * FORM Autosave:
+ * - wenn noch keine Solution existiert -> createSolution() (POST)
+ * - wenn Solution existiert -> PATCH Media Felder
+ */
+async function autoPersistForm() {
+    if (solution.type !== 'FORM') return
 
-function addStep() {
-    const nextNo = steps.value.length ? Math.max(...steps.value.map(s => s.stepNo)) + 1 : 1
-    steps.value.push({ stepNo: nextNo, instruction: '', expectedResult: '', nextIfFailed: '' })
-}
-function removeStep(idx) {
-    steps.value.splice(idx, 1)
-}
-
-async function createSolution() {
-    clearErrors()
-    saved.keywords = false
-    saved.steps = false
-
-    if (!solution.title || !solution.symptoms) {
-        errors.solution = 'Titel und Symptome sind Pflicht.'
+    // klare UX-Messages
+    const title = (solution.title ?? '').trim()
+    if (title === '') {
+        errors.solution = 'Titel noch nicht vergeben.'
         return
     }
 
-    saving.value = true
+    const url = (solution.externalMediaUrl ?? '').trim()
+    if (url === '') {
+        errors.form = 'Bitte erst Formular auswählen.'
+        return
+    }
+
+    // Defaults
+    solution.mediaType ||= 'external'
+    solution.externalMediaProvider ||= 'google_drive'
+
+    // Wenn noch nicht angelegt -> anlegen
+    if (!createdSolutionId.value) {
+        await createSolution()
+        return // createSolution redirected already
+    }
+
+
+    // Schon vorhanden -> PATCH
+    formSavingHint.value = true
     try {
-        const res = await axios.post(`${apiBase()}/api/support_solutions`, {
+        await axios.patch(
+            `/api/support_solutions/${createdSolutionId.value}`,
+            {
+                mediaType: solution.mediaType ?? 'external',
+                externalMediaProvider: solution.externalMediaProvider ?? 'google_drive',
+                externalMediaUrl: solution.externalMediaUrl || null,
+                externalMediaId: solution.externalMediaId || null,
+            },
+            { headers: { 'Content-Type': 'application/merge-patch+json' } }
+        )
+        formMsg.value = '✅ Formular gespeichert'
+    } catch (e) {
+        errors.form = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Speichern des Formulars'
+    } finally {
+        formSavingHint.value = false
+    }
+}
+
+function onPickDriveFile() {
+    clearErrors()
+    formMsg.value = ''
+
+    const f = driveFiles.value.find(x => x.id === selectedDriveFileId.value)
+    if (!f) return
+
+    solution.mediaType = 'external'
+    solution.externalMediaProvider = 'google_drive'
+    solution.externalMediaUrl = f.webViewLink ?? (f.id ? `https://drive.google.com/file/d/${f.id}/view` : '')
+    solution.externalMediaId = f.id ?? ''
+
+    // Autosave sofort (auch beim "Vertan" und neu wählen)
+    autoPersistForm()
+}
+
+watch(
+    () => selectedDriveFolderId.value,
+    async (folderId) => {
+        selectedDriveFileId.value = ''
+        await loadDriveFiles(folderId)
+    }
+)
+
+watch(
+    () => solution.type,
+    (t) => {
+        clearErrors()
+        formMsg.value = ''
+
+        if (t === 'FORM') {
+            solution.mediaType ||= 'external'
+            solution.externalMediaProvider ||= 'google_drive'
+            if (driveFolders.value.length === 0 && !driveFoldersLoading.value) {
+                loadDriveFolders()
+            }
+        } else {
+            selectedDriveFolderId.value = ''
+            selectedDriveFileId.value = ''
+            driveFiles.value = []
+
+            // FORM-Felder sauber resetten
+            solution.mediaType = null
+            solution.externalMediaProvider = null
+            solution.externalMediaUrl = ''
+            solution.externalMediaId = ''
+        }
+    },
+    { immediate: true }
+)
+
+// Optional: wenn URL manuell geändert wird -> autosave (nur wenn bereits angelegt)
+let urlSaveTimer = null
+watch(
+    () => solution.externalMediaUrl,
+    () => {
+        if (solution.type !== 'FORM') return
+        if (!createdSolutionId.value) return
+
+        if (urlSaveTimer) clearTimeout(urlSaveTimer)
+        urlSaveTimer = setTimeout(() => {
+            // nur speichern wenn URL wirklich gesetzt ist
+            if ((solution.externalMediaUrl ?? '').trim() !== '') {
+                autoPersistForm()
+            }
+        }, 600)
+    }
+)
+
+async function createSolution() {
+    clearErrors()
+    saving.value = true
+
+    try {
+        const isForm = solution.type === 'FORM'
+        const title = (solution.title ?? '').trim()
+
+        if (!title) {
+            errors.solution = 'Titel noch nicht vergeben.'
+            return
+        }
+
+        // SOP braucht Symptome
+        if (!isForm && !(solution.symptoms ?? '').trim()) {
+            errors.solution = 'Bei SOP sind Symptome Pflicht.'
+            return
+        }
+
+        // FORM braucht ein Formular (URL oder Auswahl)
+        if (isForm) {
+            const url = (solution.externalMediaUrl ?? '').trim()
+            if (url === '') {
+                errors.form = 'Bitte erst Formular auswählen.'
+                return
+            }
+        }
+
+        const payload = {
+            type: solution.type,
             title: solution.title,
-            symptoms: solution.symptoms,
-            contextNotes: solution.contextNotes || null,
-            priority: Number(solution.priority || 0),
-            active: !!solution.active,
-        }, {
-            headers: { 'Content-Type': 'application/ld+json', 'Accept': 'application/ld+json' }
+            symptoms: (solution.symptoms ?? '').trim() === '' ? null : solution.symptoms,
+            contextNotes: (solution.contextNotes ?? '').trim() === '' ? null : solution.contextNotes,
+            priority: solution.priority ?? 0,
+            active: solution.active ?? true,
+
+            // FORM-Felder
+            mediaType: isForm ? (solution.mediaType ?? 'external') : null,
+            externalMediaProvider: isForm ? (solution.externalMediaProvider ?? 'google_drive') : null,
+            externalMediaUrl: isForm ? (solution.externalMediaUrl || null) : null,
+            externalMediaId: isForm ? (solution.externalMediaId || null) : null,
+        }
+
+        // ✅ WICHTIG: Wenn bereits angelegt -> PATCH statt POST
+        if (createdSolutionId.value) {
+            await axios.patch(
+                `/api/support_solutions/${createdSolutionId.value}`,
+                payload,
+                { headers: { 'Content-Type': 'application/merge-patch+json' } }
+            )
+            return
+        }
+
+        // ✅ sonst neu anlegen -> POST
+        const res = await axios.post('/api/support_solutions', payload, {
+            headers: { 'Content-Type': 'application/ld+json' },
         })
 
         const iri = res.data?.['@id'] || ''
-        const id = iri.split('/').pop()
-        createdSolutionId.value = id ? Number(id) : null
+        const id = iri ? iri.split('/').pop() : (res.data?.id ?? null)
+        createdSolutionId.value = id
 
-        if (!createdSolutionId.value) {
-            errors.solution = 'Konnte ID nicht aus API Response lesen. Prüfe Response im Network Tab.'
+        // ✅ Nach erstem Speichern direkt in Edit wechseln
+        if (id) {
+            router.push(`/kb/edit/${id}`)
         }
     } catch (e) {
-        errors.solution = e?.response?.data?.detail || e.message || 'Unbekannter Fehler'
+        error.value = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Speichern'
     } finally {
         saving.value = false
     }
+}
+
+
+function addKeywordRow() {
+    keywords.value.push({ keyword: '', weight: 5 })
+}
+
+function removeKeywordRow(idx) {
+    if (keywords.value.length <= 1) return
+    keywords.value.splice(idx, 1)
 }
 
 async function saveKeywords() {
     clearErrors()
-    saved.keywords = false
-
     if (!createdSolutionId.value) {
-        errors.keywords = 'Bitte zuerst SupportSolution anlegen.'
+        errors.keywords = 'Bitte zuerst SupportSolution speichern.'
         return
     }
-
-    const cleaned = keywords.value
-        .map(k => ({
-            keyword: (k.keyword || '').trim().toLowerCase(),
-            weight: Math.max(1, Math.min(10, Number(k.weight || 1))),
-        }))
-        .filter(k => k.keyword.length > 0)
-
-    if (cleaned.length === 0) {
-        errors.keywords = 'Bitte mindestens ein Keyword eintragen.'
-        return
-    }
-
-    saving.value = true
+    savingKeywords.value = true
     try {
+        const cleaned = keywords.value
+            .map(k => ({ keyword: (k.keyword ?? '').trim(), weight: k.weight ?? 5 }))
+            .filter(k => k.keyword.length > 0)
+
         for (const k of cleaned) {
-            await axios.post(`${apiBase()}/api/support_solution_keywords`, {
-                solution: `/api/support_solutions/${createdSolutionId.value}`,
-                keyword: k.keyword,
-                weight: k.weight,
-            }, {
-                headers: { 'Content-Type': 'application/ld+json', 'Accept': 'application/ld+json' }
-            })
+            await axios.post(
+                '/api/support_solution_keywords',
+                {
+                    solution: `/api/support_solutions/${createdSolutionId.value}`,
+                    keyword: k.keyword,
+                    weight: k.weight,
+                },
+                { headers: { 'Content-Type': 'application/ld+json' } }
+            )
         }
-        saved.keywords = true
+
+        kwMsg.value = '✅ Keywords gespeichert'
     } catch (e) {
-        errors.keywords = e?.response?.data?.detail || e.message || 'Unbekannter Fehler'
+        errors.keywords = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Speichern der Keywords'
     } finally {
-        saving.value = false
+        savingKeywords.value = false
     }
+}
+
+function addStepRow() {
+    const nextNo = steps.value.length ? Math.max(...steps.value.map(s => s.stepNo)) + 1 : 1
+    steps.value.push({ stepNo: nextNo, instruction: '', expectedResult: '', nextIfFailed: '' })
+}
+
+function removeStepRow(idx) {
+    if (steps.value.length <= 1) return
+    steps.value.splice(idx, 1)
 }
 
 async function saveSteps() {
     clearErrors()
-    saved.steps = false
-
     if (!createdSolutionId.value) {
-        errors.steps = 'Bitte zuerst SupportSolution anlegen.'
+        errors.steps = 'Bitte zuerst SupportSolution speichern.'
         return
     }
-
-    const cleaned = steps.value
-        .map(s => ({
-            stepNo: Number(s.stepNo || 0),
-            instruction: (s.instruction || '').trim(),
-            expectedResult: (s.expectedResult || '').trim() || null,
-            nextIfFailed: (s.nextIfFailed || '').trim() || null,
-        }))
-        .filter(s => s.stepNo > 0 && s.instruction.length > 0)
-
-    if (cleaned.length === 0) {
-        errors.steps = 'Bitte mindestens einen Step mit StepNo + Instruction ausfüllen.'
-        return
-    }
-
-    const stepNos = cleaned.map(s => s.stepNo)
-    const dup = stepNos.find((n, i) => stepNos.indexOf(n) !== i)
-    if (dup) {
-        errors.steps = `StepNo ${dup} ist doppelt. Bitte eindeutig machen.`
-        return
-    }
-
-    saving.value = true
+    savingSteps.value = true
     try {
-        for (const s of cleaned) {
-            await axios.post(`${apiBase()}/api/support_solution_steps`, {
-                solution: `/api/support_solutions/${createdSolutionId.value}`,
-                stepNo: s.stepNo,
-                instruction: s.instruction,
-                expectedResult: s.expectedResult,
-                nextIfFailed: s.nextIfFailed,
-            }, {
-                headers: { 'Content-Type': 'application/ld+json', 'Accept': 'application/ld+json' }
-            })
-        }
-        saved.steps = true
-    } catch (e) {
-        errors.steps = e?.response?.data?.detail || e.message || 'Unbekannter Fehler'
-    } finally {
-        saving.value = false
-    }
-}
+        const cleaned = steps.value
+            .map(s => ({
+                stepNo: s.stepNo ?? 1,
+                instruction: (s.instruction ?? '').trim(),
+                expectedResult: (s.expectedResult ?? '').trim() || null,
+                nextIfFailed: (s.nextIfFailed ?? '').trim() || null,
+            }))
+            .filter(s => s.instruction.length > 0)
+            .sort((a, b) => a.stepNo - b.stepNo)
 
-function resetAll() {
-    createdSolutionId.value = null
-    solution.title = ''
-    solution.symptoms = ''
-    solution.contextNotes = ''
-    solution.priority = 0
-    solution.active = true
-    keywords.value = [{ keyword: '', weight: 5 }]
-    steps.value = [{ stepNo: 1, instruction: '', expectedResult: '', nextIfFailed: '' }]
-    saved.keywords = false
-    saved.steps = false
-    clearErrors()
+        for (const s of cleaned) {
+            await axios.post(
+                '/api/support_solution_steps',
+                {
+                    solution: `/api/support_solutions/${createdSolutionId.value}`,
+                    stepNo: s.stepNo,
+                    instruction: s.instruction,
+                    expectedResult: s.expectedResult,
+                    nextIfFailed: s.nextIfFailed,
+                },
+                { headers: { 'Content-Type': 'application/ld+json' } }
+            )
+        }
+
+        stMsg.value = '✅ Steps gespeichert'
+    } catch (e) {
+        errors.steps = e?.response?.data?.detail ?? e?.message ?? 'Fehler beim Speichern der Steps'
+    } finally {
+        savingSteps.value = false
+    }
 }
 </script>
 
 <style scoped>
-.page { padding: 16px; max-width: 1100px; margin: 0 auto; }
-.topbar { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom: 12px; }
-.actions { display:flex; gap:10px; }
-.grid { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.card { background: #fff; border: 1px solid #e6e6e6; border-radius: 14px; padding: 14px; }
+.page { max-width: 1200px; margin: 0 auto; padding: 20px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.top { justify-content: space-between; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.card { border: 1px solid #eee; border-radius: 16px; padding: 16px; background: #fff; }
 .card.full { grid-column: 1 / -1; }
-.label { display:block; font-size: 12px; margin-top: 10px; margin-bottom: 6px; color:#444; }
-.input { width:100%; padding:10px 12px; border:1px solid #ccc; border-radius: 10px; }
-.input.small { width: 110px; }
-.textarea { width:100%; padding:10px 12px; border:1px solid #ccc; border-radius: 10px; resize: vertical; }
-.row { display:flex; gap: 10px; align-items:center; margin-top: 12px; flex-wrap: wrap; }
-.checkbox { display:flex; gap: 8px; align-items:center; margin-top: 28px; }
-.btn { display:inline-flex; align-items:center; gap:6px; padding:8px 12px; border:1px solid #ccc; border-radius:10px; background:white; cursor:pointer; text-decoration:none; }
-.btn:hover { background:#f7f7f7; }
-.btn.primary { background: #111; color: #fff; border-color:#111; }
-.btn.primary:hover { background:#000; }
-.btn.danger { border-color:#f0b4b4; }
+.label { display:block; margin: 10px 0 6px; font-weight: 700; }
+.input { padding: 10px; border: 1px solid #ddd; border-radius: 10px; width: 100%; }
+.input.small { width: 90px; }
+.textarea { padding: 10px; border: 1px solid #ddd; border-radius: 10px; width: 100%; min-height: 80px; }
+.btn { padding: 10px 14px; border: 1px solid #ddd; border-radius: 10px; background: #fff; cursor: pointer; text-decoration: none; }
+.btn.primary { background: #111; color: #fff; border-color: #111; }
+.btn.danger { border-color: #ffb3b3; color: #a10000; }
+.error { color: #b00020; margin-top: 10px; }
+.ok { color: #087f23; margin-top: 10px; }
+.kwRow { display: grid; grid-template-columns: 1fr 110px 60px; gap: 10px; align-items: center; }
+.stepCard { border: 1px dashed #ddd; border-radius: 14px; padding: 12px; margin: 10px 0; }
 .hint { color:#666; font-size: 13px; }
-.error { color:#b00020; margin-top: 10px; }
-.ok { color:#0a7a2f; margin-top: 10px; }
-.list { margin-top: 10px; display:flex; flex-direction:column; gap: 8px; }
-.list-row { display:flex; gap: 8px; align-items:center; }
-.steps { margin-top: 10px; display:flex; flex-direction:column; gap: 12px; }
-.step { border:1px dashed #ddd; border-radius: 12px; padding: 12px; }
-.step-head { display:flex; justify-content:space-between; align-items:center; gap: 10px; }
-.two { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.media { margin-top: 10px; padding-top: 10px; border-top: 1px solid #eee; }
-.media-hint { font-size: 12px; color: #666; }
-@media (max-width: 900px) {
+@media (max-width: 1000px) {
     .grid { grid-template-columns: 1fr; }
-    .two { grid-template-columns: 1fr; }
 }
 </style>

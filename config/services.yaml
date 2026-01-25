@@ -2,6 +2,8 @@ parameters:
     app.ai.default_provider: '%env(string:AI_DEFAULT_PROVIDER)%'
     app.ai.gemini.default_model: '%env(string:GEMINI_DEFAULT_MODEL)%'
     app.ai.openai.default_model: '%env(string:OPENAI_DEFAULT_MODEL)%'
+    google_drive_credentials_path: '%kernel.project_dir%/config/secrets/google-drive/dashtk-drive-forms-8e313105b242.json'
+
 
 
 services:
@@ -92,6 +94,16 @@ services:
     App\Service\FormSourceProvider:
         arguments:
             $projectDir: '%kernel.project_dir%'
+
+    App\Service\GoogleDriveService:
+        arguments:
+            $credentialsPath: '%google_drive_credentials_path%'
+
+    App\Controller\GoogleDriveBrowserController:
+        arguments:
+            $rootFolderId: '%env(string:GOOGLE_DRIVE_FOLDER_ID)%'
+
+
 
 
 
