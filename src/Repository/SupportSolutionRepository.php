@@ -303,4 +303,50 @@ final class SupportSolutionRepository extends ServiceEntityRepository
         }
     }
 
+    // neuer Code
+
+    public function findNewsletterMatches(
+        array $tokens,
+        \DateTimeInterface $from,
+        \DateTimeInterface $to,
+        int $limit = 25,
+        int $offset = 0
+    ): array {
+        $qb = $this->createQueryBuilder('s');
+
+        $qb
+            ->andWhere('s.active = true')
+            ->andWhere('s.type = :type')
+            ->andWhere('s.category = :category')
+            ->andWhere('s.publishedAt BETWEEN :from AND :to')
+            ->setParameter('type', 'FORM')
+            ->setParameter('category', 'NEWSLETTER')
+            ->setParameter('from', $from)
+            ->setParameter('to', $to);
+
+        if (!empty($tokens)) {
+            $qb
+                ->join('s.keywords', 'k')
+                ->andWhere('k.keyword IN (:tokens)')
+                ->setParameter('tokens', $tokens);
+        }
+
+        $qb
+            ->addSelect(
+                "CASE
+                WHEN s.newsletterEdition = 'SPECIAL' THEN 3
+                WHEN s.newsletterEdition = 'TEIL_2' THEN 2
+                WHEN s.newsletterEdition = 'TEIL_1' THEN 1
+                ELSE 0
+            END AS HIDDEN editionRank"
+            )
+            ->orderBy('s.publishedAt', 'DESC')
+            ->addOrderBy('editionRank', 'DESC')
+            ->setFirstResult($offset)
+            ->setMaxResults($limit);
+
+        return $qb->getQuery()->getResult();
+    }
+
+
 }

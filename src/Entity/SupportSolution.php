@@ -172,6 +172,21 @@ class SupportSolution implements GroupSequenceProviderInterface
     #[ORM\Column(type: 'string', length: 255, nullable: true)]
     private ?string $externalMediaId = null;
 
+    #[ORM\Column(type: 'string', length: 32, options: ['default' => 'GENERAL'])]
+    private string $category = 'GENERAL';
+
+    #[ORM\Column(name: 'published_at', type: 'datetime_immutable', nullable: true)]
+    private ?\DateTimeImmutable $publishedAt = null;
+
+    #[ORM\Column(type: 'integer', nullable: true)]
+    private ?int $newsletterYear = null;
+
+    #[ORM\Column(type: 'smallint', nullable: true)]
+    private ?int $newsletterKw = null;
+
+    #[ORM\Column(type: 'string', length: 16, nullable: true)]
+    private ?string $newsletterEdition = null;
+
 
     public function __construct()
     {
@@ -327,6 +342,47 @@ class SupportSolution implements GroupSequenceProviderInterface
         $this->externalMediaId = $externalMediaId;
         return $this;
     }
+    // neuer Code
+
+    public function getCategory(): string
+    {
+        return $this->category;
+    }
+
+    public function setCategory(string $category): self
+    {
+        $this->category = $category;
+        return $this;
+    }
+
+    public function getPublishedAt(): ?\DateTimeImmutable
+    {
+        return $this->publishedAt;
+    }
+
+    public function setPublishedAt(?\DateTimeImmutable $publishedAt): self
+    {
+        $this->publishedAt = $publishedAt;
+        return $this;
+    }
+
+    public function setNewsletterMeta(
+        int $year,
+        int $kw,
+        string $edition
+    ): self {
+        $this->newsletterYear = $year;
+        $this->newsletterKw = $kw;
+        $this->newsletterEdition = $edition;
+
+        // Montag der KW berechnen
+        $this->publishedAt = (new \DateTimeImmutable())
+            ->setISODate($year, $kw, 1)
+            ->setTime(0, 0);
+
+        return $this;
+    }
+
 
 
 

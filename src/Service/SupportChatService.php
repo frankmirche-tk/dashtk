@@ -55,6 +55,7 @@ final class SupportChatService
         private readonly UsageTracker $usageTracker,
         private readonly ContactResolver $contactResolver,
         private readonly FormResolver $formResolver,
+        private readonly NewsletterResolver $newsletterResolver,
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
@@ -111,6 +112,27 @@ final class SupportChatService
         $sessionId = trim($sessionId);
         $message   = trim($message);
         $provider  = strtolower(trim($provider));
+
+        // neuer Code: "mehr" -> nächste Newsletter-Seite
+        if (mb_strtolower($message) === 'mehr') {
+            $key = 'support_chat.newsletter_paging.' . sha1($sessionId);
+
+            $paging = $this->cache->get($key, fn(ItemInterface $i) => null);
+
+            if (is_array($paging) && isset($paging['query'], $paging['offset'], $paging['pageSize'], $paging['from'], $paging['to'])) {
+                // Simplest: nochmal resolve() mit gleicher Query, aber du würdest hier
+                // idealerweise eine Repository-Methode mit offset/limit bauen.
+                // Für den ersten Wurf: sag ehrlich, dass Paging backendseitig noch nicht paginiert ist.
+                return [
+                    'answer' => "Paging ist vorbereitet, aber die Server-seitige Pagination (offset/limit) bauen wir als nächsten Schritt sauber ins Repository.\n"
+                        . "Sag mir kurz: Sollen wir zuerst **Repository-Pagination** umsetzen oder direkt die **Newsletter-Import/Redaktionsmaske** finalisieren?",
+                    'matches' => [],
+                    'choices' => [],
+                    'modeHint' => 'newsletter_paging_todo',
+                ];
+            }
+        }
+
 
         $this->span($trace, 'usage.increment', function () {
             $this->usageTracker->increment(self::USAGE_KEY_ASK);
@@ -275,6 +297,111 @@ final class SupportChatService
                 'choices' => $payload['choices'] ?? [],
             ];
         }
+
+
+        // neuer Code: NewsletterResolver mit Pending-State (Zeitraum First-Class)
+        // neuer Code: NewsletterResolver mit Pending-State + Logging (NUR EINMAL im Flow)
+        $pendingKey = 'support_chat.newsletter_pending.' . sha1($sessionId);
+        $pagingKey  = 'support_chat.newsletter_paging.' . sha1($sessionId);
+
+// 1) Pending? (wir warten nur noch auf Zeitraum)
+        $pending = $this->cache->get($pendingKey, static fn(ItemInterface $item) => null);
+
+        if (is_array($pending) && ($pending['awaitingRange'] ?? false) === true) {
+            $combined = trim(($pending['query'] ?? 'newsletter') . ' ' . $message);
+
+            $nlPayload = $this->safeResolveNewsletter($sessionId, $combined);
+
+
+            if (is_array($nlPayload)) {
+
+                // paging cachen falls vorhanden
+                if (isset($nlPayload['newsletterPaging']) && is_array($nlPayload['newsletterPaging'])) {
+                    $this->cache->delete($pagingKey);
+                    $this->cache->get($pagingKey, function (ItemInterface $item) use ($nlPayload) {
+                        $item->expiresAfter(1800);
+                        return $nlPayload['newsletterPaging'];
+                    });
+                }
+
+                // Pending löschen sobald wir NICHT mehr nach Zeitraum fragen
+                if (($nlPayload['modeHint'] ?? '') !== 'newsletter_need_range') {
+                    $this->cache->delete($pendingKey);
+                }
+
+                $this->supportSolutionLogger->info('newsletter_mode', [
+                    'sessionId' => $sessionId,
+                    'query' => $combined,
+                    'rawMessage' => $message,
+                    'mode' => (string)($nlPayload['modeHint'] ?? 'newsletter'),
+                    'matchCount' => is_array($nlPayload['matches'] ?? null) ? count($nlPayload['matches']) : 0,
+                    'matchIds' => is_array($nlPayload['matches'] ?? null)
+                        ? array_map(static fn($m) => $m['id'] ?? null, $nlPayload['matches'])
+                        : [],
+                    'choices' => is_array($nlPayload['choices'] ?? null) ? count($nlPayload['choices']) : 0,
+                ]);
+
+                // ✅ WICHTIG: choices speichern, damit "1" aufgelöst werden kann
+                if (!empty($nlPayload['choices']) && is_array($nlPayload['choices'])) {
+                    $this->storeChoices($sessionId, $nlPayload['choices']);
+                }
+
+                return $nlPayload;
+            }
+
+
+            // fallback: pending löschen und normal weiter
+            $this->cache->delete($pendingKey);
+        }
+
+// 2) Normaler Einstieg (User schreibt Newsletter-Intent)
+        $nlPayload = $this->safeResolveNewsletter($sessionId, $message);
+
+
+        if (is_array($nlPayload)) {
+
+            // paging cachen falls vorhanden
+            if (isset($nlPayload['newsletterPaging']) && is_array($nlPayload['newsletterPaging'])) {
+                $this->cache->delete($pagingKey);
+                $this->cache->get($pagingKey, function (ItemInterface $item) use ($nlPayload) {
+                    $item->expiresAfter(1800);
+                    return $nlPayload['newsletterPaging'];
+                });
+            }
+
+            // Wenn Resolver nach Zeitraum fragt -> Pending setzen
+            if (($nlPayload['modeHint'] ?? '') === 'newsletter_need_range') {
+                $this->cache->delete($pendingKey);
+                $this->cache->get($pendingKey, function (ItemInterface $item) use ($message) {
+                    $item->expiresAfter(1800);
+                    return [
+                        'awaitingRange' => true,
+                        'query' => $message,
+                    ];
+                });
+            }
+
+            $this->supportSolutionLogger->info('newsletter_mode', [
+                'sessionId' => $sessionId,
+                'query' => $message,
+                'mode' => (string)($nlPayload['modeHint'] ?? 'newsletter'),
+                'matchCount' => is_array($nlPayload['matches'] ?? null) ? count($nlPayload['matches']) : 0,
+                'matchIds' => is_array($nlPayload['matches'] ?? null)
+                    ? array_map(static fn($m) => $m['id'] ?? null, $nlPayload['matches'])
+                    : [],
+                'choices' => is_array($nlPayload['choices'] ?? null) ? count($nlPayload['choices']) : 0,
+            ]);
+
+            // ✅ WICHTIG: choices speichern, damit "1" aufgelöst werden kann
+            if (!empty($nlPayload['choices']) && is_array($nlPayload['choices'])) {
+                $this->storeChoices($sessionId, $nlPayload['choices']);
+            }
+
+            return $nlPayload;
+        }
+
+
+
 
         /**
          * B1) KB match (DB) – yields SOP and FORM.
@@ -1041,4 +1168,28 @@ final class SupportChatService
         $t = preg_replace('/\s+/', ' ', $t) ?? $t;
         return $t;
     }
+
+    private function safeResolveNewsletter(string $sessionId, string $query): ?array
+    {
+        try {
+            return $this->newsletterResolver->resolve($query);
+        } catch (\Throwable $e) {
+            $this->supportSolutionLogger->error('newsletter_execute_failed', [
+                'sessionId' => $sessionId,
+                'query' => $query,
+                'error' => $e->getMessage(),
+                'class' => $e::class,
+            ]);
+
+            return [
+                'answer' => $this->isDev
+                    ? ('Newsletter-Resolver Fehler (DEV): ' . $e->getMessage())
+                    : 'Newsletter-Suche ist gerade fehlgeschlagen. Bitte dev.log prüfen.',
+                'matches' => [],
+                'choices' => [],
+                'modeHint' => 'newsletter_failed',
+            ];
+        }
+    }
+
 }

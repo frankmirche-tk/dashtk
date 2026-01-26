@@ -62,6 +62,18 @@
                         <router-link class="btn" :to="`/kb/edit/${createdSolutionId}`">Jetzt bearbeiten</router-link>
                     </div>
                 </div>
+                <!-- neuer Code -->
+                <!-- neuer Code -->
+                <div v-if="solution.type === 'FORM'">
+                    <h3 style="margin-top:16px;">Dokument-Typ (optional)</h3>
+                    <p class="hint">
+                        Wenn es sich um einen Newsletter handelt, füge bitte unbedingt Keywords wie „newsletter“, „kw“, „sale“, „rabatt“ hinzu.
+                        Die Zeitfilterung läuft im Chat über createdAt (Montag der KW) bzw. das Datum im Titel.
+                    </p>
+                </div>
+
+
+
             </section>
 
             <!-- 2) Keywords -->
@@ -85,6 +97,8 @@
                     </button>
                 </div>
 
+
+
                 <div v-if="errors.keywords" class="error">{{ errors.keywords }}</div>
                 <div v-if="kwMsg" class="ok">{{ kwMsg }}</div>
             </section>
@@ -92,6 +106,45 @@
             <!-- 3) Formular (nur FORM) -->
             <section class="card full" v-if="solution.type === 'FORM'">
                 <h2>3) Formular</h2>
+
+                <!-- neuer Code: Newsletter-Metadaten -->
+                <div class="row" style="gap:14px; align-items:flex-end; margin-top:10px;">
+                    <div style="min-width: 240px;">
+                        <label class="label">Kategorie</label>
+                        <select class="input" v-model="solution.category">
+                            <option value="GENERAL">GENERAL</option>
+                            <option value="NEWSLETTER">NEWSLETTER</option>
+                        </select>
+                    </div>
+
+                    <div v-if="solution.category === 'NEWSLETTER'" style="min-width: 160px;">
+                        <label class="label">Jahr</label>
+                        <input class="input" type="number" v-model.number="solution.newsletterYear" placeholder="2026" />
+                    </div>
+
+                    <div v-if="solution.category === 'NEWSLETTER'" style="min-width: 160px;">
+                        <label class="label">KW</label>
+                        <input class="input" type="number" min="1" max="53" v-model.number="solution.newsletterKw" placeholder="5" />
+                    </div>
+
+                    <div v-if="solution.category === 'NEWSLETTER'" style="min-width: 200px;">
+                        <label class="label">Edition</label>
+                        <select class="input" v-model="solution.newsletterEdition">
+                            <option value="STANDARD">STANDARD</option>
+                            <option value="TEIL_1">TEIL_1</option>
+                            <option value="TEIL_2">TEIL_2</option>
+                            <option value="SPECIAL">SPECIAL</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div v-if="solution.category === 'NEWSLETTER'" class="hint" style="margin-top:6px;">
+                    Tipp: Titel enthält idealerweise „Newsletter KW x/yyyy“ oder „Specialnewsletter KW x“.
+                </div>
+                <!-- neuer Code: publishedAt Preview -->
+                <div v-if="solution.category === 'NEWSLETTER'" class="hint" style="margin-top:6px;">
+                    Veröffentlichungsdatum (Montag der KW): <code>{{ solution.publishedAt ? solution.publishedAt.slice(0, 10) : '—' }}</code>
+                </div>
 
                 <div class="hint">
                     Hier hinterlegst du den Link zu einem externen Formular/Dokument (z.B. Google Drive).
@@ -272,6 +325,13 @@ const solution = reactive({
     priority: 0,
     active: true,
 
+    // Newsletter / Category
+    category: 'GENERAL',
+    newsletterYear: null,
+    newsletterKw: null,
+    newsletterEdition: 'STANDARD',
+    publishedAt: null,
+
     // FORM-spezifisch
     mediaType: null, // 'external'
     externalMediaProvider: null, // 'google_drive'
@@ -360,6 +420,13 @@ async function autoPersistForm() {
         await axios.patch(
             `/api/support_solutions/${createdSolutionId.value}`,
             {
+
+                category: solution.category ?? 'GENERAL',
+                newsletterYear: solution.category === 'NEWSLETTER' ? (solution.newsletterYear ?? null) : null,
+                newsletterKw: solution.category === 'NEWSLETTER' ? (solution.newsletterKw ?? null) : null,
+                newsletterEdition: solution.category === 'NEWSLETTER' ? (solution.newsletterEdition ?? 'STANDARD') : null,
+                publishedAt: solution.category === 'NEWSLETTER' ? (solution.publishedAt ?? null) : null,
+
                 mediaType: solution.mediaType ?? 'external',
                 externalMediaProvider: solution.externalMediaProvider ?? 'google_drive',
                 externalMediaUrl: solution.externalMediaUrl || null,
@@ -426,6 +493,39 @@ watch(
     { immediate: true }
 )
 
+// neuer Code: Montag der KW automatisch als publishedAt setzen
+watch(
+    () => [solution.category, solution.newsletterYear, solution.newsletterKw],
+    ([cat, y, kw]) => {
+        if (cat !== 'NEWSLETTER') {
+            solution.publishedAt = null
+            return
+        }
+
+        const year = Number(y)
+        const week = Number(kw)
+
+        if (!year || !week || week < 1 || week > 53) {
+            solution.publishedAt = null
+            return
+        }
+
+        // ISO Woche: Montag berechnen (UTC, damit es keine TZ-Verschiebung gibt)
+        const simple = new Date(Date.UTC(year, 0, 1))
+        const dayOfWeek = simple.getUTCDay() || 7
+        const isoWeek1Monday = new Date(simple)
+        isoWeek1Monday.setUTCDate(simple.getUTCDate() - dayOfWeek + 1)
+
+        const targetMonday = new Date(isoWeek1Monday)
+        targetMonday.setUTCDate(isoWeek1Monday.getUTCDate() + (week - 1) * 7)
+
+        // API Platform akzeptiert i.d.R. ISO-String
+        solution.publishedAt = targetMonday.toISOString()
+    },
+    { immediate: true }
+)
+
+
 // Optional: wenn URL manuell geändert wird -> autosave (nur wenn bereits angelegt)
 let urlSaveTimer = null
 watch(
@@ -479,6 +579,14 @@ async function createSolution() {
             contextNotes: (solution.contextNotes ?? '').trim() === '' ? null : solution.contextNotes,
             priority: solution.priority ?? 0,
             active: solution.active ?? true,
+
+            // Newsletter Code
+            category: solution.type === 'FORM' ? (solution.category ?? 'GENERAL') : 'GENERAL',
+            newsletterYear: solution.category === 'NEWSLETTER' ? (solution.newsletterYear ?? null) : null,
+            newsletterKw: solution.category === 'NEWSLETTER' ? (solution.newsletterKw ?? null) : null,
+            newsletterEdition: solution.category === 'NEWSLETTER' ? (solution.newsletterEdition ?? 'STANDARD') : null,
+            publishedAt: solution.category === 'NEWSLETTER' ? (solution.publishedAt ?? null) : null,
+
 
             // FORM-Felder
             mediaType: isForm ? (solution.mediaType ?? 'external') : null,
