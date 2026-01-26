@@ -17,17 +17,26 @@ use Symfony\Contracts\Cache\ItemInterface;
 /**
  * Central chat orchestration service.
  *
- * Responsibilities:
+ * Responsibilities
  * - Maintain chat session history (cache)
  * - Execute local resolvers first (ContactResolver, FormResolver)
  * - Execute KB/DB match for SOP + FORM (SupportSolutionRepository)
  * - Run AI only when appropriate (and/or as fallback)
  * - Provide "choices" for numeric selection UX (user replies "1", "2", "3")
+ *
+ * Logging (monolog channel: support_solution)
+ * - chat_request: before AI call (provider/model, match ids, kb chars)
+ * - chat_response: after AI call (answer chars)
+ * - db_only_response: after SOP click (steps count)
+ * - chat_execute_failed: provider exception
+ * - db_matches (debug): mapped matches (optional)
+ * - contact_resolved / form_keyword_mode (info): branch decisions (optional)
  */
 final class SupportChatService
 {
     private const SESSION_TTL_SECONDS = 3600; // 1h
     private const MAX_HISTORY_MESSAGES = 18;
+
     private const USAGE_KEY_ASK = 'support_chat.ask';
 
     /**
@@ -76,8 +85,8 @@ final class SupportChatService
      * 2) DB-only answer (explicit SOP click)
      * 3) ContactResolver (local-only)
      * 4) KB match (DB): yields SOP and FORM
-     *    - If user typed form-keywords (pdf/form/formular/...), then always respond DB-only (no AI)
-     *    - Else: always expose FORM as choices (like SOP suggestions) while still allowing AI
+     *    - If user typed form-keywords (pdf/form/formular/...), then DB-only for forms (no AI)
+     *    - Else: expose FORM as choices while still allowing AI for diagnosis
      * 5) AI call with KB context as guidance (SOPs only)
      *
      * @param string $sessionId Session identifier (client provided)
@@ -87,8 +96,7 @@ final class SupportChatService
      * @param string|null $model Optional model override
      * @param array<string,mixed> $context Optional AI context
      * @param Trace|null $trace Optional trace instance
-     *
-     * @return array<string,mixed> Response payload for the frontend (answer, matches, choices, steps, etc.)
+     * @return array<string,mixed> Response payload for the frontend
      */
     #[TrackUsage(self::USAGE_KEY_ASK, weight: 5)]
     public function ask(
@@ -115,10 +123,7 @@ final class SupportChatService
             });
         }
 
-        /**
-         * BRANCH 0: numeric selection ("1", "2", "3") from last results
-         * (keeps the single input line UX).
-         */
+        // 0) Numeric selection ("1", "2", "3") from last results
         $selection = $this->span($trace, 'choice.try_resolve', function () use ($sessionId, $message) {
             return $this->resolveNumericSelection($sessionId, $message);
         });
@@ -127,19 +132,25 @@ final class SupportChatService
             return $selection;
         }
 
-        /**
-         * BRANCH A: DB-only (explicit click from UI, existing flow)
-         */
+        // A) DB-only (explicit click from UI)
         if ($dbOnlySolutionId !== null) {
-            return $this->span($trace, 'db_only.answer', function () use ($sessionId, $dbOnlySolutionId) {
+            $result = $this->span($trace, 'db_only.answer', function () use ($sessionId, $dbOnlySolutionId) {
                 return $this->answerDbOnly($sessionId, $dbOnlySolutionId);
-            }, [
-                'solution_id' => $dbOnlySolutionId,
+            }, ['solution_id' => $dbOnlySolutionId]);
+
+            $this->supportSolutionLogger->info('db_only_response', [
+                'sessionId'  => $sessionId,
+                'solutionId' => $dbOnlySolutionId,
+                'stepsCount' => isset($result['steps']) && is_array($result['steps']) ? count($result['steps']) : 0,
             ]);
+
+            return $result;
         }
 
         /**
-         * BRANCH B0: Local Contact Resolver (privacy: local_only, send_to_ai=false)
+         * B0) Local Contact Resolver (privacy: local_only, send_to_ai=false)
+         * - We ALWAYS attempt resolve() (cheap/local).
+         * - We only return early if intentHit OR actual matches exist.
          */
         $contactHint = $this->span($trace, 'contact.intent.detect', function () use ($message) {
             $m = mb_strtolower($message);
@@ -149,18 +160,28 @@ final class SupportChatService
                 'filiale', 'filialen', 'standort', 'adresse', 'anschrift', 'öffnungszeiten',
             ];
 
+            // Tokenisiere grob in Wörter, damit "tel" nicht in "bestellung" matched
+            $tokens = preg_split('/[^\p{L}\p{N}]+/u', $m) ?: [];
+            $tokens = array_values(array_filter($tokens, static fn($t) => $t !== ''));
+
             foreach ($keywords as $k) {
-                if (str_contains($m, $k)) {
+                // "tel" ist kritisch → nur als eigenständiges Token zulassen
+                if (in_array($k, $tokens, true)) {
                     return ['hit' => true, 'keyword' => $k];
                 }
             }
 
-            // Allow very short tokens (e.g. branch code)
-            $len = mb_strlen(trim($m));
-            return ['hit' => ($len > 0 && $len <= 8), 'keyword' => null];
-        }, [
-            'msg_len' => mb_strlen($message),
-        ]);
+            // zusätzlich: "tel:" oder "telefon:" explizit erlauben (falls jemand so schreibt)
+            if (preg_match('/\b(tel|telefon|e-mail|email)\s*:/u', $m)) {
+                return ['hit' => true, 'keyword' => 'contact_explicit'];
+            }
+
+
+            // Kurze Tokens allein sind KEIN sicherer Kontakt-Intent.
+            // Sonst blockieren wir KB/Form/SOP-Suche (z.B. "sislo").
+            return ['hit' => false, 'keyword' => null];
+
+        }, ['msg_len' => mb_strlen($message)]);
 
         $contactResult = $this->span($trace, 'contact.resolve', function () use ($message, $trace) {
             return $this->contactResolver->resolve($message, 5, $trace);
@@ -171,9 +192,27 @@ final class SupportChatService
         ]);
 
         $hasContactMatches = is_array($contactResult) && !empty($contactResult['matches']);
+
+        /**
+         * Nur dann "Kontakt-Modus" ausspielen, wenn
+         * - wirklich Kontakt-Keywords im Text sind (intentHit)
+         * - oder tatsächlich Matches existieren.
+         *
+         * Ohne Matches NICHT returnen, sonst blockiert das KB/FORM/SOP Matching.
+         */
         $intentHit = (bool)($contactHint['hit'] ?? false);
 
-        if ($intentHit || $hasContactMatches) {
+        // Nur dann "Contact-Mode" zurückgeben, wenn wir wirklich Contacts gefunden haben.
+        // Intent alleine darf KB/Forms nicht blockieren.
+        if ($hasContactMatches) {
+            $this->supportSolutionLogger->info('contact_resolved', [
+                'sessionId' => $sessionId,
+                'query' => $message,
+                'intentHit' => $intentHit,
+                'matchCount' => is_array($contactResult['matches'] ?? null) ? count($contactResult['matches']) : 0,
+                'type' => $contactResult['type'] ?? null,
+            ]);
+
             $payload = $this->span($trace, 'contact.answer.build', function () use ($contactResult) {
                 $type = (string)($contactResult['type'] ?? 'none');
                 $matches = $contactResult['matches'] ?? [];
@@ -229,7 +268,7 @@ final class SupportChatService
             }
 
             return [
-                'answer' => $payload['answer'] ?? '',
+                'answer' => (string)($payload['answer'] ?? ''),
                 'matches' => [],
                 'modeHint' => 'contact_local',
                 'contact' => $contactResult,
@@ -238,7 +277,7 @@ final class SupportChatService
         }
 
         /**
-         * BRANCH B1: KB match (DB) – can yield SOP and FORM.
+         * B1) KB match (DB) – yields SOP and FORM.
          */
         $matches = $this->span($trace, 'kb.match', function () use ($message) {
             return $this->findMatches($message);
@@ -252,10 +291,17 @@ final class SupportChatService
         $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
         $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
 
-        $sops = $this->filterSopsDuplicatingFormTitles($sops, $forms); // ✅ neu
+        /**
+         * Optional (your current behavior):
+         * Remove SOP hits whose title already exists as FORM title to avoid "same-name doubles".
+         *
+         * IMPORTANT:
+         * If you WANT a SOP and a FORM with the same title (but different IDs) to show together,
+         * then REMOVE the next line.
+         */
+        $sops = $this->filterSopsDuplicatingFormTitles($sops, $forms);
 
-
-        // Build FORM choices whenever FORM matches exist (like SOP suggestions)
+        // Build FORM choices whenever FORM matches exist
         $formChoices = [];
         if ($forms !== []) {
             $i = 1;
@@ -276,12 +322,7 @@ final class SupportChatService
             }
         }
 
-        /**
-         * RULE: AI is NOT used when the search explicitly contains form-keywords.
-         * (pdf, form, formular, dokument, antrag, vorlage)
-         *
-         * In that case we answer purely DB-driven (forms as choices, plus SOPs as matches).
-         */
+        // RULE: AI is NOT used when the search explicitly contains form-keywords.
         $hasFormKeywords = $this->span($trace, 'form.keyword.detect', function () use ($message) {
             return $this->formResolver->hasFormKeywords($message);
         }, [
@@ -289,6 +330,14 @@ final class SupportChatService
         ]);
 
         if ($hasFormKeywords) {
+            $this->supportSolutionLogger->info('form_keyword_mode', [
+                'sessionId' => $sessionId,
+                'query' => $message,
+                'forms' => count($forms),
+                'sops' => count($sops),
+                'mode' => ($formChoices !== []) ? 'form_kw_db' : 'form_kw_empty',
+            ]);
+
             if ($formChoices !== []) {
                 $this->storeChoices($sessionId, $formChoices);
 
@@ -301,9 +350,8 @@ final class SupportChatService
 
                     $line = "{$n}) {$c['label']}" . ($updated !== '' ? " (zuletzt aktualisiert: {$updated})" : '');
 
-                    // ✅ Symptoms als Kurzbeschreibung
+                    // Symptoms as second line (linefeed)
                     if ($symptoms !== '') {
-                        // Neue Zeile + eingerückt, damit es optisch dazugehört
                         $line .= "\n   ↳ " . $symptoms;
                     }
 
@@ -330,20 +378,22 @@ final class SupportChatService
             ];
         }
 
-        // Without form keywords: always store form choices (so numeric selection works),
-        // but do NOT early-return. We allow AI to answer normally.
+        /**
+         * Without form keywords:
+         * - allow AI to answer normally
+         * - still show form choices in UI if available
+         * - store choices for numeric selection (forms + sops) but return ONLY formChoices to UI
+         */
         if ($formChoices !== []) {
             $this->storeChoices($sessionId, $formChoices);
         }
 
         /**
-         * BRANCH C: AI + DB (SOP guidance)
+         * C) AI + DB (SOP guidance)
          */
         $history = $this->span($trace, 'cache.history_load', function () use ($sessionId) {
             return $this->loadHistory($sessionId);
-        }, [
-            'session_hash' => sha1($sessionId),
-        ]);
+        }, ['session_hash' => sha1($sessionId)]);
 
         $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
             if ($history === []) {
@@ -361,19 +411,16 @@ final class SupportChatService
 
         $history[] = ['role' => 'user', 'content' => $message];
 
+        // Important: KB context only from SOPs, never from FORMs
         $kbContext = $this->span($trace, 'kb.build_context', function () use ($matches) {
             return $this->buildKbContext($matches);
-        }, [
-            'match_count' => count($matches),
-        ]);
+        }, ['match_count' => count($matches)]);
 
         $context = $this->span($trace, 'ai.context_defaults', function () use ($context) {
             $context['usage_key'] ??= self::USAGE_KEY_ASK;
             $context['cache_hit'] ??= false;
             return $context;
-        }, [
-            'usage_key' => $context['usage_key'] ?? self::USAGE_KEY_ASK,
-        ]);
+        }, ['usage_key' => $context['usage_key'] ?? self::USAGE_KEY_ASK]);
 
         $model = $this->span($trace, 'ai.model_resolve', function () use ($provider, $model) {
             if ($model === null || trim((string)$model) === '') {
@@ -386,15 +433,31 @@ final class SupportChatService
                 $model = $model !== '' ? $model : null;
             }
             return $model;
-        }, [
-            'provider' => $provider,
-        ]);
+        }, ['provider' => $provider]);
 
         $trimmedHistory = $this->span($trace, 'history.trim', function () use ($history) {
             return $this->trimHistory($history);
         }, [
             'history_count_in' => count($history),
             'max' => self::MAX_HISTORY_MESSAGES,
+        ]);
+
+        // --- Logging: request
+        $this->supportSolutionLogger->info('chat_request', [
+            'sessionId'      => $sessionId,
+            'message'        => $message,
+            'matchCount'     => count($matches),
+            'matchIds'       => array_map(static fn($m) => $m['id'] ?? null, $matches),
+            'kbContextChars' => strlen($kbContext),
+            'provider'       => $provider,
+            'model'          => $model,
+            'usageKey'       => $context['usage_key'] ?? self::USAGE_KEY_ASK,
+        ]);
+
+        $this->supportSolutionLogger->info('ai_cost_debug', [
+            'usage_key' => $context['usage_key'] ?? self::USAGE_KEY_ASK,
+            'provider'  => $provider,
+            'model'     => $model,
         ]);
 
         try {
@@ -426,16 +489,16 @@ final class SupportChatService
                 ? ('Fehler beim Erzeugen der Antwort (DEV): ' . $e->getMessage())
                 : 'Fehler beim Erzeugen der Antwort. Bitte später erneut versuchen.';
 
-            $sopsOnly = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
-
+            // UI: show SOPs only, keep formChoices so forms remain visible even if AI fails
             return [
                 'answer' => $msg,
-                'matches' => $sopsOnly,
-                'choices' => $formChoices, // Formulare weiter anzeigen
+                'matches' => $sops,
+                'choices' => $formChoices,
                 'modeHint' => 'ai_with_db',
             ];
         }
 
+        // save history
         $history[] = ['role' => 'assistant', 'content' => $answer];
 
         $this->span($trace, 'cache.history_save', function () use ($sessionId, $history) {
@@ -446,10 +509,21 @@ final class SupportChatService
             'ttl_s' => self::SESSION_TTL_SECONDS,
         ]);
 
-        // SOP choices nur für Numeric-Selection (nicht fürs UI)
+        // --- Logging: response
+        $this->supportSolutionLogger->info('chat_response', [
+            'sessionId'   => $sessionId,
+            'answerChars' => strlen($answer),
+            'provider'    => $provider,
+            'model'       => $model,
+        ]);
+
+        /**
+         * Store numeric-selection choices:
+         * - store FORMs + SOPs (so "1/2/3" still works for both types)
+         * UI should render only formChoices (no SOP duplicates).
+         */
         $kbChoices = $this->buildKbChoices($matches);
 
-// Für "1/2/3" speichern wir Forms + SOPs im Cache
         $storedChoices = [];
         if ($formChoices !== []) {
             $storedChoices = array_merge($storedChoices, $formChoices);
@@ -461,25 +535,18 @@ final class SupportChatService
             $this->storeChoices($sessionId, $storedChoices);
         }
 
-// UI: matches nur SOPs, choices nur Formulare (damit kein doppelter SOP-Block entsteht)
-        $sopsOnly = array_values(array_filter(
-            $matches,
-            static fn(array $m) => ($m['type'] ?? null) !== 'FORM'
-        ));
-
         return [
             'answer' => $answer,
-            'matches' => $sopsOnly,
+            'matches' => $sops,
             'modeHint' => 'ai_with_db',
-            'choices' => $formChoices, // ✅ NUR Formulare -> "Auswahl" verschwindet bei reinen SOPs
+            'choices' => $formChoices, // ✅ only forms in UI
         ];
-
     }
 
     /**
      * Answer a single SOP by ID, returning its step list (DB-only).
      *
-     * @param string $sessionId Current session
+     * @param string $sessionId Current session (kept for correlation)
      * @param int $solutionId SOP ID
      * @return array<string,mixed>
      */
@@ -563,6 +630,13 @@ final class SupportChatService
             }
             $mapped[] = $this->mapMatch($s, (int)($m['score'] ?? 0));
         }
+
+        // Optional debug logging (only if you want it; can be noisy)
+        $this->supportSolutionLogger->debug('db_matches', [
+            'message' => $message,
+            'matchCount' => count($mapped),
+            'matchIds' => array_map(static fn($x) => $x['id'] ?? null, $mapped),
+        ]);
 
         return $mapped;
     }
@@ -669,7 +743,6 @@ final class SupportChatService
         $key = $this->historyCacheKey($sessionId);
 
         $this->cache->delete($key);
-
         $this->cache->get($key, function (ItemInterface $item) use ($history) {
             $item->expiresAfter(self::SESSION_TTL_SECONDS);
             return $history;
@@ -697,26 +770,17 @@ final class SupportChatService
         return array_merge($system, $rest);
     }
 
-    /**
-     * Cache key for history.
-     */
     private function historyCacheKey(string $sessionId): string
     {
         return 'support_chat.history.' . sha1($sessionId);
     }
 
-    /**
-     * Cache key for numeric selection choices.
-     */
     private function choicesCacheKey(string $sessionId): string
     {
         return 'support_chat.choices.' . sha1($sessionId);
     }
 
     /**
-     * Store choices list for numeric selection.
-     *
-     * @param string $sessionId
      * @param array<int, array{kind:string,label:string,payload:array}> $choices
      */
     private function storeChoices(string $sessionId, array $choices): void
@@ -733,9 +797,6 @@ final class SupportChatService
     }
 
     /**
-     * Load choices list for numeric selection.
-     *
-     * @param string $sessionId
      * @return array<int, array{kind:string,label:string,payload:array}>
      */
     private function loadChoices(string $sessionId): array
@@ -803,11 +864,7 @@ final class SupportChatService
             $provider = $payload['externalMediaProvider'] ?? null;
             $externalUrl = $payload['externalMediaUrl'] ?? null;
             $externalId = $payload['externalMediaId'] ?? null;
-            $symptoms = (string)($payload['symptoms'] ?? '');
-
-            if ($symptoms !== '') {
-                $lines[] = "Hinweis: {$symptoms}";
-            }
+            $symptoms = trim((string)($payload['symptoms'] ?? ''));
 
             // Preview-URL: prefer URL, else derive from provider+id (e.g., Google Drive)
             $previewUrl = $this->formResolver->buildPreviewUrl(
@@ -824,6 +881,9 @@ final class SupportChatService
             $lines[] = "✅ **Formular geöffnet:** {$label}";
             if ($updated !== '') {
                 $lines[] = "Zuletzt aktualisiert: {$updated}";
+            }
+            if ($symptoms !== '') {
+                $lines[] = "Hinweis: {$symptoms}";
             }
 
             if ($urlForText !== '') {
@@ -885,8 +945,8 @@ final class SupportChatService
     }
 
     /**
-     * Build selectable SOP choices from matches (used as fallback for "1/2/3").
-     * FORM entries are excluded on purpose (handled via $formChoices in ask()).
+     * Build selectable SOP choices from matches (used for numeric "1/2/3").
+     * FORM entries are excluded on purpose (handled separately as formChoices).
      *
      * @param array<int, array<string, mixed>> $matches
      * @return array<int, array{kind:string,label:string,payload:array}>
@@ -910,9 +970,6 @@ final class SupportChatService
         return array_values(array_slice($choices, 0, self::MAX_CHOICES));
     }
 
-    /**
-     * Generate a fallback session id when the client did not provide one.
-     */
     private function newSessionIdFallback(): string
     {
         return bin2hex(random_bytes(16));
@@ -948,6 +1005,9 @@ final class SupportChatService
      * Entfernt SOP-Treffer, deren Titel bereits als FORM vorkommt.
      * Das verhindert „doppelte“ Anzeige (Formular + SOP mit gleichem Namen).
      *
+     * ⚠️ Wenn ihr bewusst ein FORM und ein SOP mit gleichem Titel anzeigen wollt,
+     * dann diese Funktion NICHT anwenden.
+     *
      * @param array<int, array<string,mixed>> $sops
      * @param array<int, array<string,mixed>> $forms
      * @return array<int, array<string,mixed>>
@@ -981,6 +1041,4 @@ final class SupportChatService
         $t = preg_replace('/\s+/', ' ', $t) ?? $t;
         return $t;
     }
-
-
 }

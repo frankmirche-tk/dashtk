@@ -76,18 +76,32 @@ final class SupportSolutionRepository extends ServiceEntityRepository
          * - Score = SUM(keyword.weight)
          * - Nur aktive Solutions
          */
-        $rows = $this->createQueryBuilder('s')
-            ->select('s.id AS id, SUM(k.weight) AS score')
+        $qb = $this->createQueryBuilder('s')
+            ->select('s.id AS id')
+            // Score: exakte Treffer zählen voll, LIKE-Treffer reduziert
+            ->addSelect(
+            // EXAKT: volle weight
+                'SUM(CASE WHEN k.keyword IN (:tokensExact) THEN k.weight ELSE 0 END) ' .
+                // LIKE: halbe weight (kannst du auf 0.3 / 0.7 anpassen)
+                '+ SUM(CASE WHEN (' . $this->buildKeywordLikeOr('k.keyword', $tokens, 'tLike') . ') THEN (k.weight * 0.5) ELSE 0 END) ' .
+                'AS score'
+            )
             ->join('s.keywords', 'k')
             ->andWhere('s.active = true')
-            ->andWhere('k.keyword IN (:tokens)')
-            ->setParameter('tokens', $tokens)
             ->groupBy('s.id')
+            ->having('score > 0')
             ->orderBy('score', 'DESC')
             ->addOrderBy('s.priority', 'DESC')
-            ->setMaxResults($limit)
-            ->getQuery()
-            ->getScalarResult();
+            ->setMaxResults($limit);
+
+        // Parameter: exakt
+        $qb->setParameter('tokensExact', $tokens);
+
+        // Parameter: LIKE pro Token
+        $this->bindLikeParams($qb, $tokens, 'tLike');
+
+        $rows = $qb->getQuery()->getScalarResult();
+
 
         if ($rows === []) {
             return [];
@@ -243,4 +257,50 @@ final class SupportSolutionRepository extends ServiceEntityRepository
 
         return $tokens;
     }
+    /**
+     * Baut eine OR-Kette für LIKE Vergleiche: LOWER(field) LIKE :tLike0 OR ...,
+     * damit mehrwortige / teil-matchende Keywords gefunden werden.
+     *
+     * @param string   $fieldDql z.B. 'k.keyword'
+     * @param string[] $tokens
+     * @param string   $prefix   Parameterprefix
+     */
+    private function buildKeywordLikeOr(string $fieldDql, array $tokens, string $prefix): string
+    {
+        // Wir nutzen LOWER() damit es robust gegen Groß-/Kleinschreibung ist
+        $parts = [];
+        $i = 0;
+        foreach ($tokens as $t) {
+            $t = trim((string)$t);
+            if ($t === '') {
+                continue;
+            }
+            $parts[] = 'LOWER(' . $fieldDql . ') LIKE :' . $prefix . $i;
+            $i++;
+        }
+
+        // wenn keine Tokens: false-Bedingung, damit SQL valide bleibt
+        return $parts !== [] ? '(' . implode(' OR ', $parts) . ')' : '(1 = 0)';
+    }
+
+    /**
+     * Bindet LIKE Parameter passend zu buildKeywordLikeOr().
+     *
+     * @param \Doctrine\ORM\QueryBuilder $qb
+     * @param string[] $tokens
+     * @param string $prefix
+     */
+    private function bindLikeParams(\Doctrine\ORM\QueryBuilder $qb, array $tokens, string $prefix): void
+    {
+        $i = 0;
+        foreach ($tokens as $t) {
+            $t = mb_strtolower(trim((string)$t));
+            if ($t === '') {
+                continue;
+            }
+            $qb->setParameter($prefix . $i, '%' . $t . '%');
+            $i++;
+        }
+    }
+
 }
