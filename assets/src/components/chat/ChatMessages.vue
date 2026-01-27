@@ -278,9 +278,21 @@ const props = defineProps({
 
 defineEmits(['db-only', 'contact-selected', 'choose'])
 
+function normalizeStarList(text) {
+    const s = String(text ?? '')
+
+    // Wenn Sternchen in einer Zeile kommen: " * " -> "\n* "
+    // Zusätzlich: auch "* " am Anfang sauber lassen
+    return s
+        .replace(/\r\n/g, '\n')
+        .replace(/\s\*\s/g, '\n* ')
+        .replace(/^\s*\*\s*/, '* ')
+}
+
+
 // Helferfunktion Links rendern: unterstützt [Label](URL) + normale URLs
 function linkifyParts(text) {
-    const s = String(text ?? '')
+    const s = normalizeStarList(text)
     const parts = []
 
     // 1) [Label](URL)
@@ -389,6 +401,6 @@ a.btn{ display: inline-flex; align-items: center; justify-content: center; text-
 }
 .contactGrid .row:first-child{ border-top: none; }
 .contactGrid .k{ font-weight: 700; color: #111; }
-.contactGrid .v{ color: #222; }
+.contactGrid .v{ color: #222;  white-space: pre-wrap; }
 .contactGrid a{ color: #0f172a; text-decoration: underline; text-underline-offset: 3px; }
 </style>
