@@ -198,8 +198,15 @@
                                 </div>
 
                                 <div v-if="c.kind === 'form' && c.payload?.symptoms" class="kb-item-sub">
-                                    ↳ {{ c.payload.symptoms }}
+                                    ↳
+                                    <template v-for="(p, pi) in linkifyParts(c.payload.symptoms)" :key="pi">
+                                        <span v-if="p.type === 'text'">{{ p.value }}</span>
+                                        <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
+                                            {{ p.label || p.value }}
+                                        </a>
+                                    </template>
                                 </div>
+
                             </div>
 
                             <div class="kb-actions">
