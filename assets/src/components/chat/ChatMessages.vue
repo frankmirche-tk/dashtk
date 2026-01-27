@@ -144,6 +144,69 @@
                         📄 <strong>{{ m.formCard.title }}</strong>
                     </div>
 
+                    <!-- ✅ Newsletter Confirm Card -->
+                    <div v-if="m.newsletterConfirmCard" class="contactCard">
+                        <div class="contactTitle">
+                            ✅ <strong>Newsletter-Insert – Bitte bestätigen</strong>
+                        </div>
+
+                        <div class="contactGrid">
+                            <div class="row">
+                                <div class="k">📌 Title</div>
+                                <div class="v">{{ m.newsletterConfirmCard.preview.title }}</div>
+                            </div>
+
+                            <div class="row">
+                                <div class="k">🗓️ Jahr / KW</div>
+                                <div class="v">
+                                    {{ m.newsletterConfirmCard.preview.newsletter_year }} / {{ m.newsletterConfirmCard.preview.newsletter_kw }}
+                                </div>
+                            </div>
+
+                            <div class="row">
+                                <div class="k">🕒 created_at</div>
+                                <div class="v">{{ m.newsletterConfirmCard.preview.created_at }}</div>
+                            </div>
+
+                            <div class="row">
+                                <div class="k">🕒 updated_at</div>
+                                <div class="v">{{ m.newsletterConfirmCard.preview.updated_at }}</div>
+                            </div>
+
+                            <div class="row">
+                                <div class="k">📅 published_at</div>
+                                <div class="v">{{ m.newsletterConfirmCard.preview.published_at }}</div>
+                            </div>
+
+                            <div class="row">
+                                <div class="k">🔗 Drive</div>
+                                <div class="v">
+                                    <a :href="m.newsletterConfirmCard.preview.drive_url" target="_blank" rel="noreferrer">
+                                        {{ m.newsletterConfirmCard.preview.drive_url }}
+                                    </a>
+                                    <div style="opacity:.8;font-size:13px;margin-top:4px;">
+                                        ID: {{ m.newsletterConfirmCard.preview.drive_id }}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="kb-actions" style="margin-top:10px;">
+                            <button class="btn small" @click="$emit('newsletter-confirm', m.newsletterConfirmCard.draft_id)">
+                                OK einfügen
+                            </button>
+                            <button class="btn small ghost" @click="$emit('newsletter-edit', m.newsletterConfirmCard.draft_id)">
+                                Änderungen senden (per Chat)
+                            </button>
+                        </div>
+
+                        <div v-if="m.newsletterConfirmCard.sqlPreview" class="stepsBox" style="margin-top:12px;">
+                            <div class="stepsTitle">SQL Vorschau:</div>
+                            <div class="pre">{{ m.newsletterConfirmCard.sqlPreview }}</div>
+                        </div>
+                    </div>
+
+
                     <div class="contactGrid">
                         <div class="row" v-if="m.formCard.updatedAt">
                             <div class="k">🕒 Stand</div>
@@ -276,7 +339,8 @@ const props = defineProps({
     },
 })
 
-defineEmits(['db-only', 'contact-selected', 'choose'])
+defineEmits(['db-only', 'contact-selected', 'choose', 'newsletter-confirm', 'newsletter-edit'])
+
 
 function normalizeStarList(text) {
     const s = String(text ?? '')

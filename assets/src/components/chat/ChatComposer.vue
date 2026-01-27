@@ -5,6 +5,14 @@
             <span class="arrow">➜</span>
             <span class="hint-text">Hier starten, wobei können wir dir helfen?</span>
         </div>
+        <!-- ✅ NEU: Upload Row -->
+        <ChatNewsletterUpload
+            :drive-url="driveUrl"
+            :file-name="fileName"
+            @update:driveUrl="$emit('update:driveUrl', $event)"
+            @file-selected="$emit('file-selected', $event)"
+            @file-cleared="$emit('file-cleared')"
+        />
 
         <div class="row">
             <input
@@ -28,19 +36,33 @@
 
 <script setup>
 import { ref, computed, watch, nextTick, onMounted } from 'vue'
+import ChatNewsletterUpload from '@/components/chat/ChatNewsletterUpload.vue'
+
 
 const props = defineProps({
     modelValue: { type: String, default: '' },
     disabled: { type: Boolean, default: false },
 
-    // Steuerung von außen (ChatView):
-    showAttention: { type: Boolean, default: true }, // hint + pulse anzeigen?
-    attentionKey: { type: Number, default: 0 },      // erhöht sich bei "Neuer Chat" -> triggert erneut
+    showAttention: { type: Boolean, default: true },
+    attentionKey: { type: Number, default: 0 },
 
     placeholder: { type: String, default: '' },
+
+    // ✅ neu:
+    driveUrl: { type: String, default: '' },
+    fileName: { type: String, default: '' },
 })
 
-const emit = defineEmits(['update:modelValue', 'submit', 'attention-consumed'])
+const emit = defineEmits([
+    'update:modelValue',
+    'submit',
+    'attention-consumed',
+
+    // ✅ neu:
+    'update:driveUrl',
+    'file-selected',
+    'file-cleared',
+])
 
 const inputEl = ref(null)
 const showHint = ref(false)

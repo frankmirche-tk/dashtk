@@ -30,7 +30,6 @@
                 >
                     Trace exportieren
                 </button>
-
             </div>
         </header>
 
@@ -40,6 +39,8 @@
             @db-only="useDbStepsOnly"
             @contact-selected="onContactSelected"
             @choose="onChoose"
+            @newsletter-confirm="confirmNewsletterInsert"
+            @newsletter-edit="startNewsletterPatch"
         >
             <template #avatar>
                 <div v-if="avatarOfferEnabled && pendingGuide && !avatarEnabled" class="avatar-offer">
@@ -61,9 +62,13 @@
 
         <ChatComposer
             v-model="input"
+            v-model:driveUrl="driveUrl"
+            :fileName="newsletterFileName"
             :disabled="sending"
             :show-attention="inputAttentionEnabled"
             :attention-key="attentionKey"
+            @file-selected="onNewsletterFile"
+            @file-cleared="clearNewsletterFile"
             @submit="send"
             @attention-consumed="inputAttentionEnabled = false"
         />
@@ -93,6 +98,75 @@ function openTrace() {
 }
 
 /**
+ * -------- DEV LOGGING HELPERS --------
+ */
+const debugEnabled = isDev
+const reqSeq = ref(0)
+
+function dlog(...args) {
+    if (!debugEnabled) return
+    // eslint-disable-next-line no-console
+    console.log('[ChatView]', ...args)
+}
+
+function dgroup(title, fn) {
+    if (!debugEnabled) return fn()
+    // eslint-disable-next-line no-console
+    console.groupCollapsed(title)
+    try {
+        return fn()
+    } finally {
+        // eslint-disable-next-line no-console
+        console.groupEnd()
+    }
+}
+
+/**
+ * Optional: Axios Interceptor (nur DEV)
+ */
+if (debugEnabled && !axios.__chatViewInterceptorInstalled) {
+    axios.__chatViewInterceptorInstalled = true
+
+    axios.interceptors.request.use((config) => {
+        const id = ++reqSeq.value
+        config.headers = config.headers || {}
+        config.headers['X-UI-Req-Id'] = String(id)
+
+        dgroup(`HTTP -> ${config.method?.toUpperCase()} ${config.url} (#${id})`, () => {
+            dlog('headers:', config.headers)
+            // Body bei FormData nicht komplett loggen (zu groß), nur Keys
+            if (config.data instanceof FormData) {
+                const keys = []
+                for (const k of config.data.keys()) keys.push(k)
+                dlog('body(FormData) keys:', keys)
+            } else {
+                dlog('body:', config.data)
+            }
+        })
+
+        return config
+    })
+
+    axios.interceptors.response.use(
+        (res) => {
+            const id = res?.config?.headers?.['X-UI-Req-Id']
+            dgroup(`HTTP <- ${res.status} ${res.config?.url} (#${id ?? '?'})`, () => {
+                dlog('data:', res.data)
+            })
+            return res
+        },
+        (err) => {
+            const id = err?.config?.headers?.['X-UI-Req-Id']
+            dgroup(`HTTP !! ERROR ${err?.config?.url ?? ''} (#${id ?? '?'})`, () => {
+                dlog('message:', err?.message)
+                dlog('response:', err?.response?.data)
+            })
+            throw err
+        }
+    )
+}
+
+/**
  * UI State
  */
 const input = ref('')
@@ -102,6 +176,27 @@ const model = ref(null)
 
 const sessionId = ref(sessionStorage.getItem('sessionId') || uuid())
 sessionStorage.setItem('sessionId', sessionId.value)
+
+/**
+ * File Upload / Newsletter state
+ */
+const newsletterFile = ref(null)
+const newsletterFileName = ref('')
+const driveUrl = ref('')
+
+const pendingNewsletterDraftId = ref(null)
+const waitingForNewsletterPatch = ref(false)
+
+function onNewsletterFile(f) {
+    newsletterFile.value = f
+    newsletterFileName.value = f?.name || ''
+    dlog('newsletter file selected:', newsletterFileName.value)
+}
+function clearNewsletterFile() {
+    newsletterFile.value = null
+    newsletterFileName.value = ''
+    dlog('newsletter file cleared')
+}
 
 /**
  * System Message helper
@@ -197,6 +292,105 @@ function pushContactCardMessage(type, match) {
 }
 
 /**
+ * Newsletter: PATCH draft
+ */
+async function patchNewsletterDraft(text) {
+    dlog('newsletter patch ->', { draftId: pendingNewsletterDraftId.value, text })
+
+    const { data } = await axios.post('/api/chat/newsletter/patch', {
+        sessionId: sessionId.value,
+        draftId: pendingNewsletterDraftId.value,
+        message: text,
+        provider: provider.value,
+        model: model.value,
+    })
+
+    lastTraceId.value = data.trace_id ?? null
+
+    messages.value.push({
+        role: 'assistant',
+        content: data.answer ?? 'Aktualisiert. Bitte erneut prüfen.',
+        newsletterConfirmCard: data.confirmCard ?? null,
+    })
+
+    waitingForNewsletterPatch.value = false
+    if (data.draftId) pendingNewsletterDraftId.value = data.draftId
+}
+
+/**
+ * Newsletter: ANALYZE (multipart)
+ */
+async function analyzeNewsletter(text) {
+    dlog('newsletter analyze ->', {
+        text,
+        driveUrl: driveUrl.value,
+        fileName: newsletterFile.value?.name ?? null,
+    })
+
+    const form = new FormData()
+    form.append('sessionId', sessionId.value)
+    form.append('message', text)
+    form.append('provider', provider.value)
+    if (model.value) form.append('model', model.value)
+    if (driveUrl.value) form.append('drive_url', driveUrl.value)
+    if (newsletterFile.value) form.append('file', newsletterFile.value)
+
+    const { data } = await axios.post('/api/chat/newsletter/analyze', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+    })
+
+    lastTraceId.value = data.trace_id ?? null
+
+    if (data.type === 'need_drive') {
+        messages.value.push({ role: 'assistant', content: data.answer })
+        return
+    }
+
+    if (data.type === 'needs_confirmation') {
+        pendingNewsletterDraftId.value = data.draftId ?? null
+        messages.value.push({
+            role: 'assistant',
+            content: data.answer ?? 'Bitte prüfen und bestätigen.',
+            newsletterConfirmCard: data.confirmCard ?? null,
+        })
+        return
+    }
+
+    messages.value.push({ role: 'assistant', content: data.answer ?? '[leer]' })
+}
+
+/**
+ * Newsletter: CONFIRM insert
+ */
+async function confirmNewsletterInsert(draftId) {
+    dlog('newsletter confirm ->', { draftId })
+
+    sending.value = true
+    try {
+        const { data } = await axios.post('/api/chat/newsletter/confirm', {
+            sessionId: sessionId.value,
+            draftId,
+            provider: provider.value,
+            model: model.value,
+        })
+
+        lastTraceId.value = data.trace_id ?? null
+
+        messages.value.push({
+            role: 'assistant',
+            content: data.answer ?? 'OK, eingefügt.',
+        })
+
+        pendingNewsletterDraftId.value = null
+        waitingForNewsletterPatch.value = false
+        clearNewsletterFile()
+        driveUrl.value = ''
+    } finally {
+        sending.value = false
+    }
+}
+
+/**
  * SEND
  */
 async function send(textFromComposer) {
@@ -206,12 +400,41 @@ async function send(textFromComposer) {
     pendingGuide.value = null
     avatarEnabled.value = false
 
+    // push user message once
     messages.value.push({ role: 'user', content: text })
     input.value = ''
-    sending.value = true
 
+    sending.value = true
     try {
-        // 1) Contact resolve
+        const lower = text.toLowerCase()
+
+        // ✅ 0) "Einfügen" als Shortcut: wenn Draft existiert -> CONFIRM
+        // (sonst würdest du wegen newsletterFile.value wieder in analyze landen)
+        if ((lower === 'einfügen' || lower === 'einfuegen' || lower === 'ok einfügen' || lower === 'ok einfuegen')
+            && pendingNewsletterDraftId.value
+            && !waitingForNewsletterPatch.value
+        ) {
+            await confirmNewsletterInsert(pendingNewsletterDraftId.value)
+            return
+        }
+
+        // 1) Patch-Modus hat Priorität
+        if (pendingNewsletterDraftId.value && waitingForNewsletterPatch.value) {
+            await patchNewsletterDraft(text)
+            return
+        }
+
+        // 2) Newsletter Analyze (Keyword oder File)
+        const looksLikeNewsletter = /newsletter\s+einarbeiten/i.test(text)
+
+        // ✅ Nur dann analyze, wenn wirklich Newsletter-Intent ODER noch kein Draft existiert
+        // Wenn Draft existiert und User etwas schreibt, soll er eher patchen oder bestätigen – nicht neu analysieren.
+        if ((looksLikeNewsletter || newsletterFile.value) && !pendingNewsletterDraftId.value) {
+            await analyzeNewsletter(text)
+            return
+        }
+
+        // 3) Contact resolve
         const uiSpanContact = 'ui.ChatView.send.contactResolve'
         const uiAtContact = Date.now()
 
@@ -239,23 +462,16 @@ async function send(textFromComposer) {
             return
         }
 
-        // 2) Normaler KI-Chat
-        const uiSpan = 'ui.ChatView.send.normal'
-        const uiAt = Date.now()
-
-        const httpSpan = 'http.api.chat'
-        const httpAt = Date.now()
-
+        // 4) Normaler KI-Chat
         const headers = {}
 
         if (isDev) {
-            headers['X-UI-Span'] = uiSpan
-            headers['X-UI-At'] = String(uiAt)
-            headers['X-UI-Http-Span'] = httpSpan
-            headers['X-UI-Http-At'] = String(httpAt)
+            headers['X-UI-Span'] = 'ui.ChatView.send.normal'
+            headers['X-UI-At'] = String(Date.now())
+            headers['X-UI-Http-Span'] = 'http.api.chat'
+            headers['X-UI-Http-At'] = String(Date.now())
         }
 
-        // ✅ FIX: axios headers korrekt übergeben (nicht verschachteln)
         const { data } = await axios.post(
             '/api/chat',
             {
@@ -289,6 +505,7 @@ async function send(textFromComposer) {
             model: m ?? null,
         })
     } catch (e) {
+        dlog('send error:', e)
         messages.value.push({
             role: 'assistant',
             content: 'Fehler beim Senden. Bitte dev.log prüfen.',
@@ -351,7 +568,7 @@ async function useDbStepsOnly(solutionId) {
 }
 
 /**
- * CHOICE click (Formular / Auswahl)
+ * CHOICE click
  */
 function onChoose(idx) {
     const n = Number(idx)
@@ -373,6 +590,11 @@ function newChat() {
     inputAttentionEnabled.value = true
     attentionKey.value += 1
     lastTraceId.value = null
+
+    pendingNewsletterDraftId.value = null
+    waitingForNewsletterPatch.value = false
+    clearNewsletterFile()
+    driveUrl.value = ''
 }
 
 function onNextStep() {
@@ -390,7 +612,22 @@ async function exportTrace() {
     if (!isDev || !lastTraceId.value) return
     await axios.post('/api/trace/export', { traceId: lastTraceId.value, view: 'ChatView.vue' })
 }
+
+/**
+ * Newsletter: UI Handlers
+ */
+function startNewsletterPatch(draftId) {
+    pendingNewsletterDraftId.value = draftId
+    waitingForNewsletterPatch.value = true
+    messages.value.push({
+        role: 'assistant',
+        content:
+            'Alles klar – sende mir deine Änderungen als Text (z.B. „published_at auf 2024-12-30“ oder „Drive-Link ist …“). Danach zeige ich dir die Werte erneut zur Bestätigung.',
+    })
+}
 </script>
+
+
 
 <style scoped>
 .wrap { max-width: 900px; margin: 24px auto; padding: 0 16px; font-family: system-ui, sans-serif; }

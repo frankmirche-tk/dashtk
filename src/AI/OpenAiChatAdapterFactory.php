@@ -16,16 +16,23 @@ final readonly class OpenAiChatAdapterFactory implements ProviderChatAdapterFact
 
     public function supports(string $provider): bool
     {
-        return $provider === 'openai';
+        return strtolower(trim($provider)) === 'openai';
     }
 
     public function create(array $options = []): AIChatAdapterInterface
     {
         $model = (string) ($options['model'] ?? $this->defaultModel);
 
+        $context = is_array($options['context'] ?? null) ? $options['context'] : [];
+
+        $responseFormat = $context['response_format'] ?? null; // z.B. ['type' => 'json_object']
+        $temperature    = $context['temperature'] ?? null;     // z.B. 0.2
+
         return new OpenAiChatAdapter(
-            $this->client,
-            $model
+            client: $this->client,
+            model: $model,
+            responseFormat: is_array($responseFormat) ? $responseFormat : null,
+            temperature: is_numeric($temperature) ? (float) $temperature : null,
         );
     }
 }

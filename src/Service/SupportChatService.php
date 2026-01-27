@@ -13,6 +13,9 @@ use Psr\Log\LoggerInterface;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
+use Doctrine\DBAL\Connection;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+
 
 /**
  * Central chat orchestration service.
@@ -56,6 +59,7 @@ final class SupportChatService
         private readonly ContactResolver $contactResolver,
         private readonly FormResolver $formResolver,
         private readonly NewsletterResolver $newsletterResolver,
+        private readonly Connection $db,
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
@@ -1190,6 +1194,567 @@ final class SupportChatService
                 'modeHint' => 'newsletter_failed',
             ];
         }
+    }
+
+
+    // --- Newsletter Draft helpers (SupportChatService)
+
+    private function newsletterDraftKey(string $draftId): string
+    {
+        return 'support_chat.newsletter_draft.' . sha1($draftId);
+    }
+
+    private function extractDriveId(string $driveUrl): string
+    {
+        if (preg_match('~/folders/([a-zA-Z0-9_-]+)~', $driveUrl, $m)) {
+            return $m[1];
+        }
+        return '';
+    }
+
+    private function mondayOfIsoWeek(int $year, int $kw): \DateTimeImmutable
+    {
+        $dt = new \DateTimeImmutable();
+        return $dt->setISODate($year, $kw, 1)->setTime(0, 0, 0);
+    }
+
+    /**
+     * POST /api/chat/newsletter/analyze
+     */
+    public function newsletterAnalyze(
+        string $sessionId,
+        string $message,
+        string $driveUrl,
+        ?UploadedFile $file,
+        string $provider,
+        ?string $model,
+        ?Trace $trace = null
+    ): array {
+        // Newsletter immer OpenAI
+        $provider = 'openai';
+
+        $driveUrl = trim($driveUrl);
+        $driveId = $this->extractDriveId($driveUrl);
+
+        if ($driveId === '') {
+            return [
+                'type' => 'need_drive',
+                'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
+            ];
+        }
+
+        if (!$file instanceof UploadedFile) {
+            return [
+                'type' => 'error',
+                'answer' => 'Kein PDF hochgeladen. Bitte Datei auswählen und erneut senden.',
+            ];
+        }
+
+        // ✅ PDF -> TEXT (pdftotext)
+        $text = $this->extractPdfTextWithPdftotext($file->getPathname());
+        if (trim($text) === '') {
+            return [
+                'type' => 'error',
+                'answer' => 'PDF-Text-Extraktion fehlgeschlagen (pdftotext liefert leer). Bitte PDF prüfen oder Parser wechseln.',
+            ];
+        }
+
+        // ✅ Jahr/KW aus Dateiname ziehen (dein Parser soll auch _Teil2 / _Sondernewsletter tolerieren)
+        $originalName = $file->getClientOriginalName();
+        $parsed = $this->parseYearKwFromFilename($originalName);
+
+        $year = $parsed['year'] ?? null;
+        $kw   = $parsed['kw'] ?? null;
+
+        if (!is_int($year) || $year < 2000 || $year > 2100 || !is_int($kw) || $kw < 1 || $kw > 53) {
+            return [
+                'type' => 'error',
+                'answer' =>
+                    "Konnte **Jahr/KW** nicht sicher aus dem Dateinamen lesen.\n"
+                    . "Erwartet z.B.: `Newsletter_2025_KW53.pdf` oder `Newsletter_2025_KW53_Teil2.pdf`\n"
+                    . "Dateiname war: `{$originalName}`",
+            ];
+        }
+
+        $publishedAt = $this->mondayOfIsoWeek($year, $kw)->format('Y-m-d 00:00:00');
+        $now = $this->nowMidnight();
+
+        // ✅ OpenAI Prompt bauen (Headlines in symptoms, beschreibend in context_notes)
+        $prompt = $this->buildNewsletterPrompt(
+            pdfText: $text,
+            originalFilename: $originalName,
+            year: $year,
+            kw: $kw,
+            driveUrl: $driveUrl
+        );
+
+        // ✅ AI Call (über Gateway, JSON erzwungen)
+        $context = [
+            'response_format' => ['type' => 'json_object'],
+            'temperature' => 0.2,
+            'usage_key' => 'support_chat.newsletter.analyze',
+        ];
+
+        // History so kurz wie möglich: system+user reicht
+        $history = [
+            ['role' => 'system', 'content' => 'Du bist ein sehr präziser Assistent für Newsletter-Parsing und Datenbank-Drafts. Antworte IMMER als reines JSON-Objekt.'],
+            ['role' => 'user', 'content' => $prompt],
+        ];
+
+        try {
+            $rawJson = $this->aiChat->chat(
+                history: $history,
+                kbContext: '',
+                provider: $provider,
+                model: $model,
+                context: $context
+            );
+        } catch (\Throwable $e) {
+            $this->supportSolutionLogger->error('newsletter_ai_failed', [
+                'sessionId' => $sessionId,
+                'file' => $originalName,
+                'year' => $year,
+                'kw' => $kw,
+                'error' => $e->getMessage(),
+                'class' => $e::class,
+            ]);
+
+            return [
+                'type' => 'error',
+                'answer' => $this->isDev
+                    ? ('Newsletter OpenAI Fehler (DEV): ' . $e->getMessage())
+                    : 'Newsletter-Analyse ist fehlgeschlagen. Bitte dev.log prüfen.',
+            ];
+        }
+
+        $ai = $this->decodeNewsletterAiJson($rawJson);
+
+        if ($ai === null) {
+            $this->supportSolutionLogger->warning('newsletter_ai_json_invalid', [
+                'sessionId' => $sessionId,
+                'file' => $originalName,
+                'year' => $year,
+                'kw' => $kw,
+                'raw' => mb_substr($rawJson, 0, 2000),
+            ]);
+
+            return [
+                'type' => 'error',
+                'answer' => "OpenAI hat kein gültiges JSON geliefert. Bitte dev.log prüfen.\n"
+                    . ($this->isDev ? ("\nRAW:\n" . mb_substr($rawJson, 0, 1500)) : ''),
+            ];
+        }
+
+        // ✅ Symptoms: Headlines + Drive-Link Bullet (Format wie gewünscht)
+        $symptomsBullets = $this->normalizeSymptomsBullets($ai['symptoms'] ?? []);
+        $driveBullet = sprintf('* [%s](%s)', $this->makeDriveLinkLabel($year, $kw, $originalName), $driveUrl);
+
+        // Du willst Links in symptoms im Format "* [Text](url)" -> genau so
+        $symptoms = trim(implode("\n", array_values(array_filter($symptomsBullets))));
+        $symptoms = $symptoms !== '' ? ($symptoms . "\n" . $driveBullet) : $driveBullet;
+
+        // ✅ context_notes als nummerierte Zusammenfassung (String)
+        $contextNotes = trim((string)($ai['context_notes'] ?? ''));
+        if ($contextNotes === '') {
+            // fallback: wenigstens nachvollziehbar
+            $contextNotes = "Quelle: {$originalName}\nNewsletter KW {$kw}/{$year}\n(Automatisch extrahiert, bitte prüfen)";
+        }
+
+        // ✅ Keywords (keine Filialkürzel wie COSU/LPSU etc.)
+        $keywords = $this->normalizeKeywordsNoBranchCodes($ai['keywords'] ?? []);
+
+        // ✅ Draft vorbereiten (mit AI-Feldern)
+        $draftId = bin2hex(random_bytes(16));
+
+        $draft = [
+            'type' => 'FORM',
+            'title' => "Newsletter KW {$kw}/{$year}",
+            'symptoms' => $symptoms,
+            'context_notes' => $contextNotes,
+            'media_type' => 'external',
+            'external_media_provider' => 'google_drive',
+            'external_media_url' => $driveUrl,
+            'external_media_id' => $driveId,
+            'created_at' => $now,
+            'updated_at' => $now,
+            'published_at' => $publishedAt,
+            'newsletter_year' => $year,
+            'newsletter_kw' => $kw,
+            'newsletter_edition' => $ai['newsletter_edition'] ?? 'STANDARD',
+            'category' => 'NEWSLETTER',
+            'keywords' => $keywords,
+
+            // Optional: für Debug/Review im Cache (nicht in DB)
+            '_source_text' => $text,
+            '_source_filename' => $originalName,
+            '_ai_raw' => $ai,
+        ];
+
+        // ✅ Draft im Cache speichern (30 min)
+        $key = $this->newsletterDraftKey($draftId);
+        $this->cache->delete($key);
+        $this->cache->get($key, static function (ItemInterface $i) use ($draft) {
+            $i->expiresAfter(1800);
+            return $draft;
+        });
+
+        $this->supportSolutionLogger->info('newsletter_ai_ok', [
+            'sessionId' => $sessionId,
+            'file' => $originalName,
+            'year' => $year,
+            'kw' => $kw,
+            'symptoms_lines' => substr_count($draft['symptoms'], "\n") + 1,
+            'keywords_count' => is_array($draft['keywords']) ? count($draft['keywords']) : 0,
+        ]);
+
+        return [
+            'type' => 'needs_confirmation',
+            'answer' => $this->renderNewsletterConfirmText($draft),
+            'draftId' => $draftId,
+            'confirmCard' => [
+                'draftId' => $draftId,
+                'fields' => $draft,
+            ],
+        ];
+    }
+
+    /**
+     * Prompt klar und lesbar auslagern:
+     * - Symptoms: nur Headlines als Bullet-Liste mit "* "
+     * - context_notes: nummerierte Kurzbeschreibung (wie dein Beispiel)
+     * - keywords: ohne Filialkürzel (COSU etc.)
+     */
+    private function buildNewsletterPrompt(
+        string $pdfText,
+        string $originalFilename,
+        int $year,
+        int $kw,
+        string $driveUrl
+    ): string {
+        // Hinweis: du gibst dem Modell sehr klare Struktur + harte Output-Regeln
+        return
+            "Ich habe dir einen Newsletter als Text extrahiert (aus PDF) angehängt.\n"
+            . "Bitte analysiere den Inhalt und gib mir EIN JSON-Objekt zurück, das ich als DB-Draft nutzen kann.\n\n"
+
+            . "HARTE REGELN:\n"
+            . "1) Antworte NUR als JSON (kein Markdown, keine Erklärtexte).\n"
+            . "2) 'symptoms' MUSS eine Liste von Headlines sein (kurz, prägnant), jede Headline als eigener String.\n"
+            . "   - Im UI werden daraus Bulletpoints mit '* ' gebaut.\n"
+            . "   - KEINE Fließtexte in symptoms.\n"
+            . "3) 'context_notes' MUSS ein STRING sein mit nummerierten Absätzen (1) 2) 3) ...), beschreibend wie im Beispiel.\n"
+            . "4) 'keywords' MUSS eine Liste relevanter Keywords sein, OHNE Filialkürzel.\n"
+            . "   - Filialkürzel sind oft 4 Buchstaben groß (z.B. COSU, LPSU). Bitte solche Tokens NICHT ausgeben.\n"
+            . "5) Wenn etwas unklar ist, entscheide bestmöglich anhand des Textes.\n\n"
+
+            . "METADATEN:\n"
+            . "- Original-Dateiname: {$originalFilename}\n"
+            . "- Newsletter Jahr: {$year}\n"
+            . "- Newsletter KW: {$kw}\n"
+            . "- Drive-Link (nur als Kontext, NICHT in keywords): {$driveUrl}\n\n"
+
+            . "GEWÜNSCHTES JSON-SCHEMA:\n"
+            . "{\n"
+            . "  \"symptoms\": [\"...\", \"...\"],\n"
+            . "  \"context_notes\": \"1) ...\\n\\n2) ...\\n\\n3) ...\",\n"
+            . "  \"keywords\": [\"newsletter\", \"umsatz\", \"kundenkarte\", ...],\n"
+            . "  \"newsletter_edition\": \"STANDARD\" \n"
+            . "}\n\n"
+
+            . "NEWSLETTER-TEXT (AUS PDF EXTRAHIERT):\n"
+            . "-----\n"
+            . $this->truncateForAi($pdfText, 45000) . "\n"
+            . "-----\n";
+    }
+
+    /**
+     * JSON robust parsen (auch wenn OpenAI davor/danach Whitespace liefert)
+     */
+    private function decodeNewsletterAiJson(string $raw): ?array
+    {
+        $raw = trim($raw);
+
+        // best-effort: erstes {...} rausziehen
+        $first = strpos($raw, '{');
+        $last  = strrpos($raw, '}');
+        if ($first === false || $last === false || $last <= $first) {
+            return null;
+        }
+
+        $json = substr($raw, $first, $last - $first + 1);
+        $data = json_decode($json, true);
+
+        if (!is_array($data)) {
+            return null;
+        }
+
+        return $data;
+    }
+
+    /**
+     * Symptoms: wir erwarten array von Headlines (strings).
+     * Wir geben hier die Bullet-Strings zurück: "* Headline"
+     */
+    private function normalizeSymptomsBullets(mixed $symptoms): array
+    {
+        if (!is_array($symptoms)) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($symptoms as $h) {
+            $h = trim((string)$h);
+            if ($h === '') {
+                continue;
+            }
+            // falls Modell doch schon "* " liefert -> normalisieren
+            $h = ltrim($h);
+            $h = preg_replace('/^\*\s*/', '', $h) ?? $h;
+
+            $out[] = '* ' . $h;
+            if (count($out) >= 20) break; // Schutz
+        }
+
+        return $out;
+    }
+
+    /**
+     * Keywords: keine Filialkürzel (heuristisch: 4 Großbuchstaben, optional auch mit Zahlen)
+     */
+    private function normalizeKeywordsNoBranchCodes(mixed $keywords): array
+    {
+        if (!is_array($keywords)) {
+            $keywords = [];
+        }
+
+        $base = [
+            ['keyword' => 'newsletter', 'weight' => 10],
+        ];
+
+        $seen = ['newsletter' => true];
+
+        foreach ($keywords as $k) {
+            $k = trim(mb_strtolower((string)$k));
+            if ($k === '') continue;
+
+            // Heuristik Filialkürzel:
+            // - original könnte "COSU" sein, das wird in lower "cosu" -> checke zusätzlich Upper-Pattern auf input
+            // Wir prüfen: wenn Keyword 4 Zeichen und nur Buchstaben -> weg.
+            if (preg_match('/^[a-z]{4}$/', $k)) {
+                continue;
+            }
+
+            // keine ultra-kurzen tokens
+            if (mb_strlen($k) < 3) continue;
+
+            if (isset($seen[$k])) continue;
+            $seen[$k] = true;
+
+            $base[] = ['keyword' => $k, 'weight' => 6];
+            if (count($base) >= 12) break;
+        }
+
+        return $base;
+    }
+
+    private function makeDriveLinkLabel(int $year, int $kw, string $filename): string
+    {
+        // Beispiel aus deinem Wunsch: "Newsletter KW52 – Teil 2 (Drive-Ordner)"
+        $label = "Newsletter KW{$kw} – Drive-Ordner";
+        $lower = mb_strtolower($filename);
+
+        if (str_contains($lower, 'teil2') || str_contains($lower, 'teil_2') || str_contains($lower, 'teil 2')) {
+            $label = "Newsletter KW{$kw} – Teil 2 (Drive-Ordner)";
+        } elseif (str_contains($lower, 'sondernewsletter')) {
+            $label = "Newsletter KW{$kw} – Sondernewsletter (Drive-Ordner)";
+        }
+
+        return $label;
+    }
+
+    /**
+     * damit du nicht aus Versehen riesige PDFs an das Modell schickst
+     */
+    private function truncateForAi(string $text, int $maxChars): string
+    {
+        $text = trim($text);
+        if (mb_strlen($text) <= $maxChars) {
+            return $text;
+        }
+        return mb_substr($text, 0, $maxChars) . "\n\n[...TRUNCATED...]";
+    }
+
+
+
+
+    /**
+     * POST /api/chat/newsletter/patch
+     */
+    public function newsletterPatch(
+        string $sessionId,
+        string $draftId,
+        string $message,
+        string $provider,
+        ?string $model,
+        ?Trace $trace = null
+    ): array {
+        $key = $this->newsletterDraftKey($draftId);
+        $draft = $this->cache->get($key, static fn(ItemInterface $i) => null);
+
+        if (!is_array($draft)) {
+            return ['type' => 'error', 'answer' => 'Draft nicht gefunden/abgelaufen. Bitte Newsletter erneut analysieren.'];
+        }
+
+        $msg = trim($message);
+
+        if (preg_match('/published_at\s*(=|auf)\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/i', $msg, $m)) {
+            $draft['published_at'] = $m[2] . ' 00:00:00';
+        }
+
+        if (preg_match('/created_at\s*(=|auf)\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/i', $msg, $m)) {
+            $draft['created_at'] = $m[2] . ' 00:00:00';
+            $draft['updated_at'] = $m[2] . ' 00:00:00';
+        }
+
+        if (preg_match('~drive[- ]link\s*(=|ist)?\s*(https?://\S+)~i', $msg, $m)) {
+            $draft['external_media_url'] = $m[2];
+            $draft['external_media_id']  = $this->extractDriveId($m[2]);
+        }
+
+        $this->cache->delete($key);
+        $this->cache->get($key, static function (ItemInterface $i) use ($draft) {
+            $i->expiresAfter(1800);
+            return $draft;
+        });
+
+        return [
+            'type' => 'needs_confirmation',
+            'answer' => $this->renderNewsletterConfirmText($draft),
+            'draftId' => $draftId,
+            'confirmCard' => [
+                'draftId' => $draftId,
+                'fields' => $draft,
+            ],
+        ];
+    }
+
+    /**
+     * POST /api/chat/newsletter/confirm
+     */
+    public function newsletterConfirm(
+        string $sessionId,
+        string $draftId,
+        ?Trace $trace = null
+    ): array {
+        $key = $this->newsletterDraftKey($draftId);
+        $draft = $this->cache->get($key, static fn(ItemInterface $i) => null);
+
+        if (!is_array($draft)) {
+            return ['type' => 'error', 'answer' => 'Draft nicht gefunden/abgelaufen. Bitte Newsletter erneut analysieren.'];
+        }
+
+        $this->db->beginTransaction();
+
+        try {
+            $this->db->insert('support_solution', [
+                'type' => $draft['type'],
+                'title' => $draft['title'],
+                'symptoms' => $draft['symptoms'],
+                'context_notes' => $draft['context_notes'],
+                'media_type' => $draft['media_type'],
+                'external_media_provider' => $draft['external_media_provider'],
+                'external_media_url' => $draft['external_media_url'],
+                'external_media_id' => $draft['external_media_id'],
+                'created_at' => $draft['created_at'],
+                'updated_at' => $draft['updated_at'],
+                'published_at' => $draft['published_at'],
+                'newsletter_year' => (int) $draft['newsletter_year'],
+                'newsletter_kw' => (int) $draft['newsletter_kw'],
+                'newsletter_edition' => $draft['newsletter_edition'],
+                'category' => $draft['category'],
+            ]);
+
+            $solutionId = (int) $this->db->lastInsertId();
+
+            $keywords = is_array($draft['keywords'] ?? null) ? $draft['keywords'] : [];
+            foreach ($keywords as $kw) {
+                if (!is_array($kw)) continue;
+                $keyword = trim((string)($kw['keyword'] ?? ''));
+                if ($keyword === '') continue;
+
+                $this->db->insert('support_solution_keyword', [
+                    'solution_id' => $solutionId,
+                    'keyword' => $keyword,
+                    'weight' => (int)($kw['weight'] ?? 5),
+                ]);
+            }
+
+            $this->db->commit();
+            $this->cache->delete($key);
+
+            return [
+                'type' => 'ok',
+                'answer' => "✅ Newsletter wurde eingefügt. ID: {$solutionId}",
+            ];
+        } catch (\Throwable $e) {
+            $this->db->rollBack();
+            throw $e;
+        }
+    }
+
+    private function renderNewsletterConfirmText(array $draft): string
+    {
+        return "Bitte prüfe vor dem Einfügen:\n\n"
+            . "- created_at: **{$draft['created_at']}**\n"
+            . "- updated_at: **{$draft['updated_at']}**\n"
+            . "- published_at: **{$draft['published_at']}**\n"
+            . "- Drive-Link: **{$draft['external_media_url']}**\n"
+            . "- Drive-ID: **{$draft['external_media_id']}**\n\n"
+            . "Wenn ok, klicke **Einfügen**. Oder schreibe z.B. „published_at auf 2025-12-29“.";
+    }
+
+    // ✅ NEU: Helper muss in dieselbe Klasse (SupportChatService)
+    private function extractPdfTextWithPdftotext(string $pdfPath): string
+    {
+        $cmd = sprintf('pdftotext -layout %s -', escapeshellarg($pdfPath));
+        $out = shell_exec($cmd);
+        return is_string($out) ? trim($out) : '';
+    }
+
+    private function parseYearKwFromFilename(string $filename): array
+    {
+        $raw = (string) $filename;
+
+        // Windows fakepath / Pfade vom Browser wegkürzen
+        $name = basename(str_replace('\\', '/', $raw));
+
+        // Whitespaces normalisieren
+        $name = preg_replace('/\s+/u', ' ', $name) ?? $name;
+        $name = trim($name);
+
+        $year = null;
+        $kw = null;
+
+        // ✅ kein \b ! (wegen _)
+        if (preg_match('/(20\d{2})/u', $name, $m)) {
+            $year = (int) $m[1];
+        }
+
+        // ✅ KW + 1-2 Ziffern, erlaubt KW03, KW3, KW53
+        if (preg_match('/KW\s*0*([0-9]{1,2})/ui', $name, $m)) {
+            $kw = (int) $m[1];
+        }
+
+        return [
+            'year' => $year,
+            'kw'   => $kw,
+            'raw'  => $name,
+        ];
+    }
+
+
+    private function nowMidnight(): string
+    {
+        return (new \DateTimeImmutable('now'))->format('Y-m-d 00:00:00');
     }
 
 }
