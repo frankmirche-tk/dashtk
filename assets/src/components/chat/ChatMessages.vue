@@ -6,13 +6,20 @@
             <div class="role">{{ roleLabel(m.role) }}:</div>
 
             <div class="content">
+                <!-- Normaler Chat-Text (nur wenn keine Karten aktiv sind) -->
                 <div v-if="!m.contactCard && !m.formCard" class="pre">
                     <template v-for="(p, pi) in linkifyParts(m.content)" :key="pi">
                         <span v-if="p.type === 'text'">{{ p.value }}</span>
-                        <a v-else :href="p.value" target="_blank" rel="noreferrer">{{ p.value }}</a>
+                        <a
+                            v-else-if="p.type === 'link'"
+                            :href="p.value"
+                            target="_blank"
+                            rel="noreferrer"
+                        >
+                            {{ p.label || p.value }}
+                        </a>
                     </template>
                 </div>
-
 
                 <!-- Kontaktkarte -->
                 <div v-if="m.contactCard" class="contactCard">
@@ -43,7 +50,7 @@
                         <div class="row" v-if="m.contactCard.data.telefon">
                             <div class="k">☎️ Telefon</div>
                             <div class="v">
-                                <a :href="`tel:${String(m.contactCard.data.telefon).replace(/\\s+/g,'')}`">{{ m.contactCard.data.telefon }}</a>
+                                <a :href="`tel:${String(m.contactCard.data.telefon).replace(/\s+/g,'')}`">{{ m.contactCard.data.telefon }}</a>
                             </div>
                         </div>
 
@@ -99,21 +106,21 @@
                         <div class="row" v-if="m.contactCard.data.phone_mobile">
                             <div class="k">📱 Mobil</div>
                             <div class="v">
-                                <a :href="`tel:${String(m.contactCard.data.phone_mobile).replace(/\\s+/g,'')}`">{{ m.contactCard.data.phone_mobile }}</a>
+                                <a :href="`tel:${String(m.contactCard.data.phone_mobile).replace(/\s+/g,'')}`">{{ m.contactCard.data.phone_mobile }}</a>
                             </div>
                         </div>
 
                         <div class="row" v-if="m.contactCard.data.phone_landline">
                             <div class="k">☎️ Festnetz</div>
                             <div class="v">
-                                <a :href="`tel:${String(m.contactCard.data.phone_landline).replace(/\\s+/g,'')}`">{{ m.contactCard.data.phone_landline }}</a>
+                                <a :href="`tel:${String(m.contactCard.data.phone_landline).replace(/\s+/g,'')}`">{{ m.contactCard.data.phone_landline }}</a>
                             </div>
                         </div>
 
                         <div class="row" v-if="!m.contactCard.data.phone_mobile && !m.contactCard.data.phone_landline && m.contactCard.data.phone">
                             <div class="k">☎️ Telefon</div>
                             <div class="v">
-                                <a :href="`tel:${String(m.contactCard.data.phone).replace(/\\s+/g,'')}`">{{ m.contactCard.data.phone }}</a>
+                                <a :href="`tel:${String(m.contactCard.data.phone).replace(/\s+/g,'')}`">{{ m.contactCard.data.phone }}</a>
                             </div>
                         </div>
 
@@ -148,7 +155,14 @@
                             <div class="v">
                                 <template v-for="(p, pi) in linkifyParts(m.formCard.symptoms)" :key="pi">
                                     <span v-if="p.type === 'text'">{{ p.value }}</span>
-                                    <a v-else :href="p.value" target="_blank" rel="noreferrer">{{ p.value }}</a>
+                                    <a
+                                        v-else-if="p.type === 'link'"
+                                        :href="p.value"
+                                        target="_blank"
+                                        rel="noreferrer"
+                                    >
+                                        {{ p.label || p.value }}
+                                    </a>
                                 </template>
                             </div>
                         </div>
@@ -183,11 +197,7 @@
                                     {{ i+1 }}) {{ c.label }}
                                 </div>
 
-                                <!-- ✅ Symptoms/ Kurzbeschreibung für Formulare -->
-                                <div
-                                    v-if="c.kind === 'form' && c.payload?.symptoms"
-                                    class="kb-item-sub"
-                                >
+                                <div v-if="c.kind === 'form' && c.payload?.symptoms" class="kb-item-sub">
                                     ↳ {{ c.payload.symptoms }}
                                 </div>
                             </div>
@@ -231,11 +241,11 @@
                         <li v-for="s in m.steps" :key="s.id || s.no">
                             <span class="stepText">{{ s.text }}</span>
                             <span v-if="s.mediaUrl" class="stepMedia">
-                                —
-                                <a :href="s.mediaUrl" target="_blank" rel="noreferrer">
-                                    {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
-                                </a>
-                            </span>
+                —
+                <a :href="s.mediaUrl" target="_blank" rel="noreferrer">
+                  {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
+                </a>
+              </span>
                         </li>
                     </ol>
                 </div>
@@ -259,33 +269,48 @@ const props = defineProps({
     },
 })
 
-const emit = defineEmits([
-    'db-only',
-    'contact-selected',
-    'choose',
-])
+defineEmits(['db-only', 'contact-selected', 'choose'])
 
-//Helferfunktion Links rendern
+// Helferfunktion Links rendern: unterstützt [Label](URL) + normale URLs
 function linkifyParts(text) {
-    const s = String(text ?? '');
-    const re = /(https?:\/\/[^\s<]+[^\s<\.,;:!?)\]])/g;
-    const parts = [];
-    let last = 0;
-    let m;
+    const s = String(text ?? '')
+    const parts = []
 
-    while ((m = re.exec(s)) !== null) {
-        const url = m[0];
-        const idx = m.index;
+    // 1) [Label](URL)
+    const md = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
+    let last = 0
+    let m
 
-        if (idx > last) parts.push({ type: 'text', value: s.slice(last, idx) });
-        parts.push({ type: 'link', value: url });
-        last = idx + url.length;
+    while ((m = md.exec(s)) !== null) {
+        const label = m[1]
+        const url = m[2]
+        const idx = m.index
+
+        if (idx > last) parts.push({ type: 'text', value: s.slice(last, idx) })
+        parts.push({ type: 'link', value: url, label })
+        last = idx + m[0].length
     }
-    if (last < s.length) parts.push({ type: 'text', value: s.slice(last) });
-    return parts;
+
+    const tail = s.slice(last)
+
+    // 2) normale URLs im Rest (Satzzeichen am Ende abschneiden)
+    const reUrl = /(https?:\/\/[^\s<]+[^\s<\.,;:!?"')\]])/g
+    let last2 = 0
+    let u
+
+    while ((u = reUrl.exec(tail)) !== null) {
+        const url = u[0]
+        const idx = u.index
+
+        if (idx > last2) parts.push({ type: 'text', value: tail.slice(last2, idx) })
+        parts.push({ type: 'link', value: url, label: url })
+        last2 = idx + url.length
+    }
+
+    if (last2 < tail.length) parts.push({ type: 'text', value: tail.slice(last2) })
+
+    return parts
 }
-
-
 </script>
 
 <style scoped>
@@ -359,5 +384,4 @@ a.btn{ display: inline-flex; align-items: center; justify-content: center; text-
 .contactGrid .k{ font-weight: 700; color: #111; }
 .contactGrid .v{ color: #222; }
 .contactGrid a{ color: #0f172a; text-decoration: underline; text-underline-offset: 3px; }
-
 </style>
