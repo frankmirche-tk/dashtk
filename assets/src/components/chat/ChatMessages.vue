@@ -6,7 +6,13 @@
             <div class="role">{{ roleLabel(m.role) }}:</div>
 
             <div class="content">
-                <pre v-if="!m.contactCard" class="pre">{{ m.content }}</pre>
+                <div v-if="!m.contactCard && !m.formCard" class="pre">
+                    <template v-for="(p, pi) in linkifyParts(m.content)" :key="pi">
+                        <span v-if="p.type === 'text'">{{ p.value }}</span>
+                        <a v-else :href="p.value" target="_blank" rel="noreferrer">{{ p.value }}</a>
+                    </template>
+                </div>
+
 
                 <!-- Kontaktkarte -->
                 <div v-if="m.contactCard" class="contactCard">
@@ -139,7 +145,12 @@
 
                         <div class="row" v-if="m.formCard.symptoms">
                             <div class="k">📝 Hinweis</div>
-                            <div class="v">{{ m.formCard.symptoms }}</div>
+                            <div class="v">
+                                <template v-for="(p, pi) in linkifyParts(m.formCard.symptoms)" :key="pi">
+                                    <span v-if="p.type === 'text'">{{ p.value }}</span>
+                                    <a v-else :href="p.value" target="_blank" rel="noreferrer">{{ p.value }}</a>
+                                </template>
+                            </div>
                         </div>
 
                         <div class="row" v-if="m.formCard.provider">
@@ -253,6 +264,28 @@ const emit = defineEmits([
     'contact-selected',
     'choose',
 ])
+
+//Helferfunktion Links rendern
+function linkifyParts(text) {
+    const s = String(text ?? '');
+    const re = /(https?:\/\/[^\s<]+[^\s<\.,;:!?)\]])/g;
+    const parts = [];
+    let last = 0;
+    let m;
+
+    while ((m = re.exec(s)) !== null) {
+        const url = m[0];
+        const idx = m.index;
+
+        if (idx > last) parts.push({ type: 'text', value: s.slice(last, idx) });
+        parts.push({ type: 'link', value: url });
+        last = idx + url.length;
+    }
+    if (last < s.length) parts.push({ type: 'text', value: s.slice(last) });
+    return parts;
+}
+
+
 </script>
 
 <style scoped>
@@ -326,4 +359,5 @@ a.btn{ display: inline-flex; align-items: center; justify-content: center; text-
 .contactGrid .k{ font-weight: 700; color: #111; }
 .contactGrid .v{ color: #222; }
 .contactGrid a{ color: #0f172a; text-decoration: underline; text-underline-offset: 3px; }
+
 </style>
