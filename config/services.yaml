@@ -100,8 +100,10 @@ services:
             $rootFolderId: '%env(string:GOOGLE_DRIVE_FOLDER_ID)%'
 
     App\Service\FormResolver: ~
-
+    App\Service\DocumentCreateResolver: ~
     App\Service\NewsletterResolver: ~
+    App\Service\NewsletterCreateResolver: ~
+
 
 
 

@@ -310,4 +310,178 @@ final class ChatController extends AbstractController
             $trace->finish();
         }
     }
+
+    #[Route('/api/chat/form/analyze', name: 'app_chat_document_analyze', methods: ['POST'])]
+    public function documentAnalyze(Request $request): JsonResponse
+    {
+        $trace = $this->traceManager->start('http.api.chat.document.analyze');
+        TraceContext::set($trace);
+
+        $uiReqId = (string) $request->headers->get('X-UI-Req-Id', '');
+
+        try {
+            $sessionId = (string) $request->request->get('sessionId', '');
+            $message   = (string) $request->request->get('message', '');
+            $model     = $request->request->get('model');
+            $driveUrl  = (string) $request->request->get('drive_url', '');
+            $file      = $request->files->get('file'); // UploadedFile|null
+
+            // 🔒 Dokumente auch immer OpenAI (wie Newsletter)
+            $provider = 'openai';
+
+            $this->logger->info('document.analyze.request', [
+                'trace_id' => $trace->getTraceId(),
+                'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
+                'sessionId' => $sessionId,
+                'provider' => $provider,
+                'model' => is_string($model) ? $model : null,
+                'drive_url_present' => $driveUrl !== '',
+                'file_present' => $file !== null,
+                'file_name' => $file?->getClientOriginalName(),
+                'file_size' => $file?->getSize(),
+            ]);
+
+            $result = $this->chatService->documentAnalyze(
+                sessionId: $sessionId,
+                message: $message,
+                driveUrl: $driveUrl,
+                file: $file,
+                provider: $provider,
+                model: is_string($model) ? $model : null,
+                trace: $trace,
+            );
+
+            $result['trace_id'] = $trace->getTraceId();
+            $result['provider'] = $provider;
+            if (is_string($model)) {
+                $result['model'] = $model;
+            }
+
+            $this->logger->info('document.analyze.response', [
+                'trace_id' => $trace->getTraceId(),
+                'sessionId' => $sessionId,
+                'type' => $result['type'] ?? null,
+                'draftId' => $result['draftId'] ?? null,
+                'answer_len' => mb_strlen((string)($result['answer'] ?? '')),
+            ]);
+
+            return new JsonResponse($result);
+        } catch (\Throwable $e) {
+            $this->logger->error('document.analyze.error', [
+                'trace_id' => $trace->getTraceId(),
+                'error' => $e->getMessage(),
+                'class' => $e::class,
+            ]);
+            throw $e;
+        } finally {
+            TraceContext::set(null);
+            $trace->finish();
+        }
+    }
+
+    #[Route('/api/chat/form/patch', name: 'app_chat_document_patch', methods: ['POST'])]
+    public function documentPatch(Request $request): JsonResponse
+    {
+        $trace = $this->traceManager->start('http.api.chat.document.patch');
+        TraceContext::set($trace);
+
+        try {
+            $payload = json_decode((string) $request->getContent(), true) ?: [];
+
+            $sessionId = (string)($payload['sessionId'] ?? '');
+            $draftId   = (string)($payload['draftId'] ?? '');
+            $message   = (string)($payload['message'] ?? '');
+            $provider  = (string)($payload['provider'] ?? 'openai');
+            $model     = isset($payload['model']) && is_string($payload['model']) ? $payload['model'] : null;
+
+            $this->logger->info('document.patch.request', [
+                'trace_id' => $trace->getTraceId(),
+                'sessionId' => $sessionId,
+                'draftId' => $draftId,
+                'provider' => $provider,
+                'model' => $model,
+                'message_len' => mb_strlen($message),
+            ]);
+
+            $result = $this->chatService->documentPatch(
+                sessionId: $sessionId,
+                draftId: $draftId,
+                message: $message,
+                provider: $provider,
+                model: $model,
+                trace: $trace,
+            );
+
+            $result['trace_id'] = $trace->getTraceId();
+
+            $this->logger->info('document.patch.response', [
+                'trace_id' => $trace->getTraceId(),
+                'sessionId' => $sessionId,
+                'draftId' => $result['draftId'] ?? $draftId,
+                'type' => $result['type'] ?? null,
+                'answer_len' => mb_strlen((string)($result['answer'] ?? '')),
+            ]);
+
+            return new JsonResponse($result);
+        } catch (\Throwable $e) {
+            $this->logger->error('document.patch.error', [
+                'trace_id' => $trace->getTraceId(),
+                'error' => $e->getMessage(),
+                'class' => $e::class,
+            ]);
+            throw $e;
+        } finally {
+            TraceContext::set(null);
+            $trace->finish();
+        }
+    }
+
+    #[Route('/api/chat/form/confirm', name: 'app_chat_document_confirm', methods: ['POST'])]
+    public function documentConfirm(Request $request): JsonResponse
+    {
+        $trace = $this->traceManager->start('http.api.chat.document.confirm');
+        TraceContext::set($trace);
+
+        try {
+            $payload = json_decode((string) $request->getContent(), true) ?: [];
+            $sessionId = (string)($payload['sessionId'] ?? '');
+            $draftId   = (string)($payload['draftId'] ?? '');
+
+            $this->logger->info('document.confirm.request', [
+                'trace_id' => $trace->getTraceId(),
+                'sessionId' => $sessionId,
+                'draftId' => $draftId,
+            ]);
+
+            $result = $this->chatService->documentConfirm(
+                sessionId: $sessionId,
+                draftId: $draftId,
+                trace: $trace,
+            );
+
+            $result['trace_id'] = $trace->getTraceId();
+
+            $this->logger->info('document.confirm.response', [
+                'trace_id' => $trace->getTraceId(),
+                'sessionId' => $sessionId,
+                'draftId' => $draftId,
+                'type' => $result['type'] ?? null,
+                'answer_len' => mb_strlen((string)($result['answer'] ?? '')),
+            ]);
+
+            return new JsonResponse($result);
+        } catch (\Throwable $e) {
+            $this->logger->error('document.confirm.error', [
+                'trace_id' => $trace->getTraceId(),
+                'error' => $e->getMessage(),
+                'class' => $e::class,
+            ]);
+            throw $e;
+        } finally {
+            TraceContext::set(null);
+            $trace->finish();
+        }
+    }
+
+
 }

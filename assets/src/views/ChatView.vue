@@ -63,6 +63,7 @@
         <ChatComposer
             v-model="input"
             v-model:driveUrl="driveUrl"
+            v-model:category="importCategory"
             :fileName="newsletterFileName"
             :disabled="sending"
             :show-attention="inputAttentionEnabled"
@@ -183,9 +184,16 @@ sessionStorage.setItem('sessionId', sessionId.value)
 const newsletterFile = ref(null)
 const newsletterFileName = ref('')
 const driveUrl = ref('')
+const importCategory = ref('GENERAL') // GENERAL | NEWSLETTER
 
 const pendingNewsletterDraftId = ref(null)
 const waitingForNewsletterPatch = ref(false)
+
+function createBaseUrl() {
+    return importCategory.value === 'NEWSLETTER'
+        ? '/api/chat/newsletter'
+        : '/api/chat/form'
+}
 
 function onNewsletterFile(f) {
     newsletterFile.value = f
@@ -297,7 +305,7 @@ function pushContactCardMessage(type, match) {
 async function patchNewsletterDraft(text) {
     dlog('newsletter patch ->', { draftId: pendingNewsletterDraftId.value, text })
 
-    const { data } = await axios.post('/api/chat/newsletter/patch', {
+    const { data } = await axios.post(`${createBaseUrl()}/patch`, {
         sessionId: sessionId.value,
         draftId: pendingNewsletterDraftId.value,
         message: text,
@@ -335,7 +343,7 @@ async function analyzeNewsletter(text) {
     if (driveUrl.value) form.append('drive_url', driveUrl.value)
     if (newsletterFile.value) form.append('file', newsletterFile.value)
 
-    const { data } = await axios.post('/api/chat/newsletter/analyze', form, {
+    const { data } = await axios.post(`${createBaseUrl()}/analyze`, form, {
         headers: { 'Content-Type': 'multipart/form-data' },
     })
 
@@ -367,7 +375,7 @@ async function confirmNewsletterInsert(draftId) {
 
     sending.value = true
     try {
-        const { data } = await axios.post('/api/chat/newsletter/confirm', {
+        const { data } = await axios.post(`${createBaseUrl()}/confirm`, {
             sessionId: sessionId.value,
             draftId,
             provider: provider.value,
@@ -424,12 +432,9 @@ async function send(textFromComposer) {
             return
         }
 
-        // 2) Newsletter Analyze (Keyword oder File)
-        const looksLikeNewsletter = /newsletter\s+einarbeiten/i.test(text)
-
-        // ✅ Nur dann analyze, wenn wirklich Newsletter-Intent ODER noch kein Draft existiert
-        // Wenn Draft existiert und User etwas schreibt, soll er eher patchen oder bestätigen – nicht neu analysieren.
-        if ((looksLikeNewsletter || newsletterFile.value) && !pendingNewsletterDraftId.value) {
+        // 2) Form/Newsletter Analyze (Keyword oder File)
+        // ✅ Import Analyze: wenn Datei vorhanden und noch kein Draft existiert
+        if (newsletterFile.value && !pendingNewsletterDraftId.value) {
             await analyzeNewsletter(text)
             return
         }

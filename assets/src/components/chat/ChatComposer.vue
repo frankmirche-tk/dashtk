@@ -22,6 +22,18 @@
                     @update:driveUrl="(v) => emit('update:driveUrl', v)"
                 />
 
+            <div style="display:flex; gap:10px; align-items:center; margin: 0 0 10px;">
+                   <label style="font-weight:700; font-size:14px;">Kategorie</label>
+                   <select
+                       class="select"
+                       :value="category"
+                       @change="emit('update:category', $event.target.value)"
+                   >
+                       <option value="GENERAL">GENERAL (Dokument)</option>
+                       <option value="NEWSLETTER">NEWSLETTER</option>
+                   </select>
+            </div>
+
                 <button type="button" class="btn ghost" @click="lockNewsletterTools">
                     Schließen
                 </button>
@@ -101,6 +113,7 @@ const props = defineProps({
     // Newsletter Tools (vom Parent)
     driveUrl: { type: String, default: '' },
     fileName: { type: String, default: '' },
+    category: { type: String, default: 'GENERAL' },
 })
 
 const emit = defineEmits([
@@ -112,6 +125,7 @@ const emit = defineEmits([
     'update:driveUrl',
     'file-selected',
     'file-cleared',
+    'update:category',
 ])
 
 const ignoreNextFocus = ref(false)
@@ -325,4 +339,12 @@ function lockNewsletterTools() {
 }
 .pin-error{ color:#b00020; margin-top:8px; }
 .pin-actions{ display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+
+.select{
+    border: 1px solid #bbb;
+    border-radius: 999px;
+    padding: 10px 12px;
+    background: #fff;
+}
+
 </style>

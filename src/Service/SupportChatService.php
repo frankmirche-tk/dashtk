@@ -45,16 +45,19 @@ final class SupportChatService
         private readonly CacheInterface $cache,
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly UsageTracker $usageTracker,
-        private readonly ContactResolver $contactResolver,
-        private readonly FormResolver $formResolver,
+        private readonly ContactResolver          $contactResolver,
+        private readonly FormResolver             $formResolver,
 
         // Newsletter: Suche/Query (bestehender Resolver)
-        private readonly NewsletterResolver $newsletterResolver,
+        private readonly NewsletterResolver       $newsletterResolver,
 
         // Newsletter: Create-Flow (NEU ausgelagert)
         private readonly NewsletterCreateResolver $newsletterCreateResolver,
 
-        KernelInterface $kernel,
+        // Document: Create-Flow (NEU ausgelagert)
+        private readonly FormCreateResolver       $documentCreateResolver,
+
+        KernelInterface                           $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
     }
@@ -1055,4 +1058,64 @@ final class SupportChatService
             ];
         }
     }
+
+    // ---------------------------------------------------------------------
+// Document Create (delegiert)
+// ---------------------------------------------------------------------
+
+    /**
+     * POST /api/chat/document/analyze
+     * => kompletter Create-Flow ist im FormCreateResolver.
+     */
+    public function documentAnalyze(
+        string $sessionId,
+        string $message,
+        string $driveUrl,
+        ?UploadedFile $file,
+        string $provider,
+        ?string $model,
+        ?Trace $trace = null
+    ): array {
+        return $this->documentCreateResolver->analyze(
+            sessionId: $sessionId,
+            message: $message,
+            driveUrl: $driveUrl,
+            file: $file,
+            model: $model,
+            trace: $trace
+        );
+    }
+
+    /**
+     * POST /api/chat/document/patch
+     */
+    public function documentPatch(
+        string $sessionId,
+        string $draftId,
+        string $message,
+        string $provider,
+        ?string $model,
+        ?Trace $trace = null
+    ): array {
+        return $this->documentCreateResolver->patch(
+            sessionId: $sessionId,
+            draftId: $draftId,
+            message: $message
+        );
+    }
+
+    /**
+     * POST /api/chat/document/confirm
+     */
+    public function documentConfirm(
+        string $sessionId,
+        string $draftId,
+        ?Trace $trace = null
+    ): array {
+        return $this->documentCreateResolver->confirm(
+            sessionId: $sessionId,
+            draftId: $draftId
+        );
+    }
+
 }
