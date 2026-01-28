@@ -625,6 +625,43 @@ function startNewsletterPatch(draftId) {
             'Alles klar – sende mir deine Änderungen als Text (z.B. „published_at auf 2024-12-30“ oder „Drive-Link ist …“). Danach zeige ich dir die Werte erneut zur Bestätigung.',
     })
 }
+
+/**
+ * Newsletter Erstellung: Sicherheitspin für
+ */
+const newsletterToolsUnlocked = ref(false)
+const showPinPrompt = ref(false)
+const pinInput = ref('')
+const pinError = ref('')
+
+function openNewsletterTools() {
+    showPinPrompt.value = true
+    pinInput.value = ''
+    pinError.value = ''
+}
+
+function cancelPin() {
+    showPinPrompt.value = false
+    pinInput.value = ''
+    pinError.value = ''
+}
+
+function confirmPin() {
+    // UI-only (keine echte Security)
+    const EXPECTED = '2014'
+    if (pinInput.value.trim() === EXPECTED) {
+        newsletterToolsUnlocked.value = true
+        showPinPrompt.value = false
+    } else {
+        pinError.value = 'PIN ist falsch.'
+    }
+}
+
+function lockNewsletterTools() {
+    newsletterToolsUnlocked.value = false
+}
+
+
 </script>
 
 
