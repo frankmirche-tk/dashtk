@@ -7,7 +7,7 @@
 
             <div class="content">
                 <!-- Normaler Chat-Text (nur wenn keine Karten aktiv sind) -->
-                <div v-if="!m.contactCard && !m.formCard" class="pre">
+                <div v-if="!m.contactCard && !m.formCard && !m.newsletterConfirmCard" class="pre">
                     <template v-for="(p, pi) in linkifyParts(m.content)" :key="pi">
                         <span v-if="p.type === 'text'">{{ p.value }}</span>
                         <a
@@ -138,74 +138,73 @@
                     </div>
                 </div>
 
+                <!-- ✅ Newsletter Confirm Card (eigener Block, NICHT in formCard verschachtelt) -->
+                <div v-if="m.newsletterConfirmCard" class="contactCard">
+                    <div class="contactTitle">
+                        ✅ <strong>Newsletter-Insert – Bitte bestätigen</strong>
+                    </div>
+
+                    <div class="contactGrid">
+                        <div class="row">
+                            <div class="k">📌 Title</div>
+                            <div class="v">{{ m.newsletterConfirmCard.preview.title }}</div>
+                        </div>
+
+                        <div class="row">
+                            <div class="k">🗓️ Jahr / KW</div>
+                            <div class="v">
+                                {{ m.newsletterConfirmCard.preview.newsletter_year }} / {{ m.newsletterConfirmCard.preview.newsletter_kw }}
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="k">🕒 created_at</div>
+                            <div class="v">{{ m.newsletterConfirmCard.preview.created_at }}</div>
+                        </div>
+
+                        <div class="row">
+                            <div class="k">🕒 updated_at</div>
+                            <div class="v">{{ m.newsletterConfirmCard.preview.updated_at }}</div>
+                        </div>
+
+                        <div class="row">
+                            <div class="k">📅 published_at</div>
+                            <div class="v">{{ m.newsletterConfirmCard.preview.published_at }}</div>
+                        </div>
+
+                        <div class="row">
+                            <div class="k">🔗 Drive</div>
+                            <div class="v">
+                                <a :href="m.newsletterConfirmCard.preview.drive_url" target="_blank" rel="noreferrer">
+                                    {{ m.newsletterConfirmCard.preview.drive_url }}
+                                </a>
+                                <div style="opacity:.8;font-size:13px;margin-top:4px;">
+                                    ID: {{ m.newsletterConfirmCard.preview.drive_id }}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="kb-actions" style="margin-top:10px;">
+                        <button class="btn small" @click="$emit('newsletter-confirm', m.newsletterConfirmCard.draft_id)">
+                            OK einfügen
+                        </button>
+                        <button class="btn small ghost" @click="$emit('newsletter-edit', m.newsletterConfirmCard.draft_id)">
+                            Änderungen senden (per Chat)
+                        </button>
+                    </div>
+
+                    <div v-if="m.newsletterConfirmCard.sqlPreview" class="stepsBox" style="margin-top:12px;">
+                        <div class="stepsTitle">SQL Vorschau:</div>
+                        <div class="pre">{{ m.newsletterConfirmCard.sqlPreview }}</div>
+                    </div>
+                </div>
+
                 <!-- ✅ formCard -->
                 <div v-if="m.formCard" class="contactCard">
                     <div class="contactTitle">
                         📄 <strong>{{ m.formCard.title }}</strong>
                     </div>
-
-                    <!-- ✅ Newsletter Confirm Card -->
-                    <div v-if="m.newsletterConfirmCard" class="contactCard">
-                        <div class="contactTitle">
-                            ✅ <strong>Newsletter-Insert – Bitte bestätigen</strong>
-                        </div>
-
-                        <div class="contactGrid">
-                            <div class="row">
-                                <div class="k">📌 Title</div>
-                                <div class="v">{{ m.newsletterConfirmCard.preview.title }}</div>
-                            </div>
-
-                            <div class="row">
-                                <div class="k">🗓️ Jahr / KW</div>
-                                <div class="v">
-                                    {{ m.newsletterConfirmCard.preview.newsletter_year }} / {{ m.newsletterConfirmCard.preview.newsletter_kw }}
-                                </div>
-                            </div>
-
-                            <div class="row">
-                                <div class="k">🕒 created_at</div>
-                                <div class="v">{{ m.newsletterConfirmCard.preview.created_at }}</div>
-                            </div>
-
-                            <div class="row">
-                                <div class="k">🕒 updated_at</div>
-                                <div class="v">{{ m.newsletterConfirmCard.preview.updated_at }}</div>
-                            </div>
-
-                            <div class="row">
-                                <div class="k">📅 published_at</div>
-                                <div class="v">{{ m.newsletterConfirmCard.preview.published_at }}</div>
-                            </div>
-
-                            <div class="row">
-                                <div class="k">🔗 Drive</div>
-                                <div class="v">
-                                    <a :href="m.newsletterConfirmCard.preview.drive_url" target="_blank" rel="noreferrer">
-                                        {{ m.newsletterConfirmCard.preview.drive_url }}
-                                    </a>
-                                    <div style="opacity:.8;font-size:13px;margin-top:4px;">
-                                        ID: {{ m.newsletterConfirmCard.preview.drive_id }}
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="kb-actions" style="margin-top:10px;">
-                            <button class="btn small" @click="$emit('newsletter-confirm', m.newsletterConfirmCard.draft_id)">
-                                OK einfügen
-                            </button>
-                            <button class="btn small ghost" @click="$emit('newsletter-edit', m.newsletterConfirmCard.draft_id)">
-                                Änderungen senden (per Chat)
-                            </button>
-                        </div>
-
-                        <div v-if="m.newsletterConfirmCard.sqlPreview" class="stepsBox" style="margin-top:12px;">
-                            <div class="stepsTitle">SQL Vorschau:</div>
-                            <div class="pre">{{ m.newsletterConfirmCard.sqlPreview }}</div>
-                        </div>
-                    </div>
-
 
                     <div class="contactGrid">
                         <div class="row" v-if="m.formCard.updatedAt">
@@ -244,46 +243,85 @@
                     </div>
                 </div>
 
-                <!-- ✅ Choices klickbar (Formularliste; sonst generische Auswahl) -->
-                <div v-if="m.role === 'assistant' && m.choices?.length" class="kb">
-                    <div class="kb-title" v-if="m.choices.some(c => c.kind === 'form')">Passende Formulare:</div>
-                    <div class="kb-title" v-else>Auswahl:</div>
+                <!-- ✅ Choices klickbar (Newsletter / Formulare getrennt) -->
+                <div v-if="m.role === 'assistant' && m.choices?.length">
+                    <!-- Newsletter -->
+                    <div v-if="groupedChoices(m).newsletters.length" class="kb">
+                        <div class="kb-title">Newsletter:</div>
+                        <ul class="kb-list">
+                            <li v-for="x in groupedChoices(m).newsletters" :key="x.idx" class="kb-item">
+                                <div class="kb-item-main">
+                                    <div class="kb-item-title">
+                                        {{ x.idx + 1 }}) {{ x.choice.label }}
+                                    </div>
 
-                    <ul class="kb-list">
-                        <li
-                            v-for="(c, i) in (m.choices.some(x => x.kind === 'form') ? m.choices.filter(x => x.kind === 'form') : m.choices)"
-                            :key="i"
-                            class="kb-item"
-                        >
-                            <div class="kb-item-main">
-                                <div class="kb-item-title">
-                                    {{ i+1 }}) {{ c.label }}
+                                    <div v-if="x.choice.payload?.symptoms" class="kb-item-sub">
+                                        ↳
+                                        <template v-for="(p, pi) in linkifyParts(x.choice.payload.symptoms)" :key="pi">
+                                            <span v-if="p.type === 'text'">{{ p.value }}</span>
+                                            <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
+                                                {{ p.label || p.value }}
+                                            </a>
+                                        </template>
+                                    </div>
                                 </div>
 
-                                <div v-if="c.kind === 'form' && c.payload?.symptoms" class="kb-item-sub">
-                                    ↳
-                                    <template v-for="(p, pi) in linkifyParts(c.payload.symptoms)" :key="pi">
-                                        <span v-if="p.type === 'text'">{{ p.value }}</span>
-                                        <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
-                                            {{ p.label || p.value }}
-                                        </a>
-                                    </template>
+                                <div class="kb-actions">
+                                    <button class="btn small" @click="$emit('choose', x.idx + 1)">Öffnen</button>
+                                </div>
+                            </li>
+                        </ul>
+                    </div>
+
+                    <!-- Formulare -->
+                    <div v-if="groupedChoices(m).forms.length" class="kb">
+                        <div class="kb-title">Formulare:</div>
+                        <ul class="kb-list">
+                            <li v-for="x in groupedChoices(m).forms" :key="x.idx" class="kb-item">
+                                <div class="kb-item-main">
+                                    <div class="kb-item-title">
+                                        {{ x.idx + 1 }}) {{ x.choice.label }}
+                                    </div>
+
+                                    <div v-if="x.choice.payload?.symptoms" class="kb-item-sub">
+                                        ↳
+                                        <template v-for="(p, pi) in linkifyParts(x.choice.payload.symptoms)" :key="pi">
+                                            <span v-if="p.type === 'text'">{{ p.value }}</span>
+                                            <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
+                                                {{ p.label || p.value }}
+                                            </a>
+                                        </template>
+                                    </div>
                                 </div>
 
-                            </div>
+                                <div class="kb-actions">
+                                    <button class="btn small" @click="$emit('choose', x.idx + 1)">Öffnen</button>
+                                </div>
+                            </li>
+                        </ul>
+                    </div>
 
-                            <div class="kb-actions">
-                                <button class="btn small" @click="$emit('choose', i+1)">
-                                    Öffnen
-                                </button>
-                            </div>
-                        </li>
-                    </ul>
+                    <!-- Optional: sonstige Auswahl (falls später neue kinds kommen) -->
+                    <div v-if="groupedChoices(m).other.length" class="kb">
+                        <div class="kb-title">Weitere Treffer:</div>
+                        <ul class="kb-list">
+                            <li v-for="x in groupedChoices(m).other" :key="x.idx" class="kb-item">
+                                <div class="kb-item-main">
+                                    <div class="kb-item-title">
+                                        {{ x.idx + 1 }}) {{ x.choice.label }}
+                                    </div>
+                                </div>
+                                <div class="kb-actions">
+                                    <button class="btn small" @click="$emit('choose', x.idx + 1)">Öffnen</button>
+                                </div>
+                            </li>
+                        </ul>
+                    </div>
                 </div>
 
                 <!-- SOP Treffer -->
                 <div v-if="m.role === 'assistant' && m.matches?.length" class="kb">
-                    <div class="kb-title">Passende SOPs aus der Datenbank:</div>
+                    <div class="kb-title">Passende Schritt für Schritt Anleitungen:</div>
                     <ul class="kb-list">
                         <li v-for="hit in m.matches" :key="hit.id" class="kb-item">
                             <div class="kb-item-main">
@@ -293,12 +331,8 @@
                             </div>
 
                             <div class="kb-actions">
-                                <button class="btn small" @click="$emit('db-only', hit.id)">
-                                    Nur Steps
-                                </button>
-                                <a class="btn small ghost" :href="hit.stepsUrl" target="_blank" rel="noreferrer">
-                                    Steps API
-                                </a>
+                                <button class="btn small" @click="$emit('db-only', hit.id)">Nur Steps</button>
+                                <a class="btn small ghost" :href="hit.stepsUrl" target="_blank" rel="noreferrer">Steps API</a>
                             </div>
                         </li>
                     </ul>
@@ -311,11 +345,11 @@
                         <li v-for="s in m.steps" :key="s.id || s.no">
                             <span class="stepText">{{ s.text }}</span>
                             <span v-if="s.mediaUrl" class="stepMedia">
-                —
-                <a :href="s.mediaUrl" target="_blank" rel="noreferrer">
-                  {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
-                </a>
-              </span>
+                                —
+                                <a :href="s.mediaUrl" target="_blank" rel="noreferrer">
+                                    {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
+                                </a>
+                            </span>
                         </li>
                     </ol>
                 </div>
@@ -324,6 +358,7 @@
         </div>
     </div>
 </template>
+
 
 <script setup>
 const props = defineProps({
@@ -394,6 +429,28 @@ function linkifyParts(text) {
 
     return parts
 }
+
+function groupedChoices(m) {
+    const list = Array.isArray(m?.choices) ? m.choices : []
+    const indexed = list.map((choice, idx) => ({ idx, choice }))
+
+    const newsletters = indexed.filter(x =>
+        x.choice?.kind === 'form' &&
+        String(x.choice?.payload?.category || '').toUpperCase() === 'NEWSLETTER'
+    )
+
+    const forms = indexed.filter(x =>
+        x.choice?.kind === 'form' &&
+        String(x.choice?.payload?.category || '').toUpperCase() !== 'NEWSLETTER'
+    )
+
+    const other = indexed.filter(x =>
+        x.choice?.kind !== 'form'
+    )
+
+    return { newsletters, forms, other }
+}
+
 </script>
 
 <style scoped>

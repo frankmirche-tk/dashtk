@@ -22,6 +22,7 @@ final class NewsletterCreateResolver
         private readonly CacheInterface $cache,
         private readonly Connection $db,
         private readonly LoggerInterface $supportSolutionLogger,
+        private readonly PromptTemplateLoader $promptLoader,
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
@@ -118,16 +119,11 @@ final class NewsletterCreateResolver
             'temperature' => 0.2,
         ];
 
-        $history = [
-            [
-                'role' => 'system',
-                'content' => 'Du bist ein präziser Assistent für Newsletter-Importe in eine Support-Wissensdatenbank. Antworte ausschließlich im gewünschten JSON-Format.',
-            ],
-            [
-                'role' => 'user',
-                'content' => $prompt,
-            ],
-        ];
+        $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
+                $history = [
+                        ['role' => 'system', 'content' => $tpl['system']],
+                        ['role' => 'user', 'content' => $prompt],
+                    ];
 
         $this->supportSolutionLogger->info('newsletter_create.ai.request', [
             'sessionId' => $sessionId,
@@ -355,28 +351,14 @@ final class NewsletterCreateResolver
     {
         $pdfText = $this->truncateForPrompt($pdfText, 18000);
 
-        return
-            "Ich habe dir einen Newsletter angehängt.\n"
-            . "Bitte analysiere ihn und erstelle mir einen JSON-Draft für einen DB-Insert.\n\n"
-            . "WICHTIG:\n"
-            . "- In `symptoms` bitte NUR pregnante Headlines, JEDE Zeile beginnt mit `* `.\n"
-            . "- In `symptoms` muss am Ende zusätzlich ein Link im Format stehen:\n"
-            . "  * [Newsletter KW{$kw} ({$year}) (Drive-Ordner)]({$driveUrl})\n"
-            . "- In `context_notes` bitte beschreibend, nummeriert (1) (2) (3)... wie in meinem Beispiel.\n"
-            . "- Keine Filialkürzel als Keywords (z.B. COSU, LPSU) und generell keine 4-5 Buchstaben-Codes/Abkürzungen als Keyword.\n"
-            . "- Keywords: sinnvoll, deutsch, klein geschrieben, max 20 Stück.\n\n"
-            . "Metadaten:\n"
-            . "- Dateiname: {$filename}\n"
-            . "- Jahr: {$year}\n"
-            . "- KW: {$kw}\n\n"
-            . "Gib ausschließlich JSON zurück mit diesen Feldern:\n"
-            . "{\n"
-            . "  \"symptoms\": \"* ...\\n* ...\",\n"
-            . "  \"context_notes\": \"1) ...\\n\\n2) ...\",\n"
-            . "  \"keywords\": [{\"keyword\":\"...\",\"weight\":10}, ...]\n"
-            . "}\n\n"
-            . "NEWSLETTER TEXT:\n"
-            . $pdfText;
+        $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
+                return $this->promptLoader->render($tpl['user'], [
+                    'filename' => $filename,
+                    'year' => $year,
+                    'kw' => $kw,
+                    'driveUrl' => $driveUrl,
+                    'pdfText' => $pdfText,
+                ]);
     }
 
     private function normalizeSymptoms(string $symptoms, string $driveUrl): string

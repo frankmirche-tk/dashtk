@@ -104,6 +104,14 @@ services:
     App\Service\NewsletterResolver: ~
     App\Service\NewsletterCreateResolver: ~
 
+    App\Command\PromptsValidateCommand:
+        arguments:
+            $projectDir: '%kernel.project_dir%'
+
+    App\Command\:
+        resource: '../src/Command/'
+        tags: [ 'console.command' ]
+
 
 
 

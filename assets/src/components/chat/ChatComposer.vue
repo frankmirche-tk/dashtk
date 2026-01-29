@@ -68,7 +68,7 @@
         <!-- Hint (grüner Pfeil + Text) -->
         <div v-if="showHint" class="composer-hint">
             <span class="arrow">➜</span>
-            <span class="hint-text">Hier starten, wobei können wir dir helfen?</span>
+            <span class="hint-text">Hier starten, wobei können wir dir helfen? Du kannst auch enfach "Tipps" eingeben für Anwendungsbeispele</span>
         </div>
 
         <!-- Eingabe + Senden -->
@@ -138,10 +138,11 @@ const showHint = ref(false)
 const pulse = ref(false)
 
 const placeholderText = computed(() => {
-    return props.placeholder || 'Beschreibe hier dein Problem (z. B. „Drucker druckt nicht“)'
+    return props.placeholder || 'Beschreibe hier dein Problem (z. B. „Drucker druckt nicht“) Oder gebe "Tipps" ein für Nutzerhinweise'
 })
 
 function triggerAttention() {
+    console.log('triggerAttention', { showAttention: props.showAttention, attentionKey: props.attentionKey })
     if (!props.showAttention) return
     showHint.value = true
     pulse.value = true
@@ -180,6 +181,9 @@ watch(
     async () => {
         await nextTick()
         triggerAttention()
+
+        // 👇 wichtig: Programmatic focus beim "New Chat" nicht als User-Aktion werten
+        ignoreNextFocus.value = true
         inputEl.value?.focus?.()
     }
 )

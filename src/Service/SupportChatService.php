@@ -45,8 +45,9 @@ final class SupportChatService
         private readonly CacheInterface $cache,
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly UsageTracker $usageTracker,
-        private readonly ContactResolver          $contactResolver,
-        private readonly FormResolver             $formResolver,
+        private readonly ContactResolver $contactResolver,
+        private readonly FormResolver $formResolver,
+        private readonly PromptTemplateLoader $promptLoader,
 
         // Newsletter: Suche/Query (bestehender Resolver)
         private readonly NewsletterResolver       $newsletterResolver,
@@ -429,13 +430,10 @@ final class SupportChatService
 
         $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
             if ($history === []) {
+                $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
                 $history[] = [
                     'role' => 'system',
-                    'content' =>
-                        'Du bist der IT-Support-Assistent für DashTK. ' .
-                        'Führe eine echte Problemdiagnose durch. Stelle gezielte Rückfragen. ' .
-                        'Wenn du passende SOPs aus der Wissensdatenbank bekommst, nutze diese vorrangig. ' .
-                        'Arbeite Schritt-für-Schritt und frage nach dem Ergebnis nach jedem Schritt.',
+                    'content' => $tpl['system'],
                 ];
             }
             return $history;
@@ -722,6 +720,7 @@ final class SupportChatService
             'type' => $type,
             'updatedAt' => $updatedAt,
             'symptoms' => (string)($solution->getSymptoms() ?? ''),
+            'category' => (string)($solution->getCategory() ?? ''), // ✅ NEU
         ];
 
         if ($type === 'FORM') {
@@ -738,6 +737,7 @@ final class SupportChatService
                 'stepsUrl' => $stepsUrl,
             ];
     }
+
 
     private function buildKbContext(array $matches): string
     {
