@@ -138,8 +138,8 @@
                     </div>
                 </div>
 
-                <!-- ✅ Newsletter Confirm Card (eigener Block, NICHT in formCard verschachtelt) -->
-                <div v-if="m.newsletterConfirmCard" class="contactCard">
+                <!-- ✅ Newsletter Confirm Card (preview ODER fields) -->
+                <div v-if="newsletterPreview(m)" class="contactCard">
                     <div class="contactTitle">
                         ✅ <strong>Newsletter-Insert – Bitte bestätigen</strong>
                     </div>
@@ -147,49 +147,59 @@
                     <div class="contactGrid">
                         <div class="row">
                             <div class="k">📌 Title</div>
-                            <div class="v">{{ m.newsletterConfirmCard.preview.title }}</div>
+                            <div class="v">{{ newsletterPreview(m).title }}</div>
                         </div>
 
                         <div class="row">
                             <div class="k">🗓️ Jahr / KW</div>
                             <div class="v">
-                                {{ m.newsletterConfirmCard.preview.newsletter_year }} / {{ m.newsletterConfirmCard.preview.newsletter_kw }}
+                                {{ newsletterPreview(m).newsletter_year }} / {{ newsletterPreview(m).newsletter_kw }}
                             </div>
                         </div>
 
                         <div class="row">
                             <div class="k">🕒 created_at</div>
-                            <div class="v">{{ m.newsletterConfirmCard.preview.created_at }}</div>
+                            <div class="v">{{ newsletterPreview(m).created_at }}</div>
                         </div>
 
                         <div class="row">
                             <div class="k">🕒 updated_at</div>
-                            <div class="v">{{ m.newsletterConfirmCard.preview.updated_at }}</div>
+                            <div class="v">{{ newsletterPreview(m).updated_at }}</div>
                         </div>
 
                         <div class="row">
                             <div class="k">📅 published_at</div>
-                            <div class="v">{{ m.newsletterConfirmCard.preview.published_at }}</div>
+                            <div class="v">{{ newsletterPreview(m).published_at }}</div>
                         </div>
 
                         <div class="row">
                             <div class="k">🔗 Drive</div>
                             <div class="v">
-                                <a :href="m.newsletterConfirmCard.preview.drive_url" target="_blank" rel="noreferrer">
-                                    {{ m.newsletterConfirmCard.preview.drive_url }}
+                                <a
+                                    :href="newsletterPreview(m).drive_url || newsletterPreview(m).external_media_url"
+                                    target="_blank"
+                                    rel="noreferrer"
+                                >
+                                    {{ newsletterPreview(m).drive_url || newsletterPreview(m).external_media_url }}
                                 </a>
                                 <div style="opacity:.8;font-size:13px;margin-top:4px;">
-                                    ID: {{ m.newsletterConfirmCard.preview.drive_id }}
+                                    ID: {{ newsletterPreview(m).drive_id || newsletterPreview(m).external_media_id }}
                                 </div>
                             </div>
                         </div>
                     </div>
 
                     <div class="kb-actions" style="margin-top:10px;">
-                        <button class="btn small" @click="$emit('newsletter-confirm', m.newsletterConfirmCard.draft_id)">
+                        <button
+                            class="btn small"
+                            @click="$emit('newsletter-confirm', m.newsletterConfirmCard.draft_id || m.newsletterConfirmCard.draftId)"
+                        >
                             OK einfügen
                         </button>
-                        <button class="btn small ghost" @click="$emit('newsletter-edit', m.newsletterConfirmCard.draft_id)">
+                        <button
+                            class="btn small ghost"
+                            @click="$emit('newsletter-edit', m.newsletterConfirmCard.draft_id || m.newsletterConfirmCard.draftId)"
+                        >
                             Änderungen senden (per Chat)
                         </button>
                     </div>
@@ -200,6 +210,24 @@
                     </div>
                 </div>
 
+                <!-- ✅ Fallback: Card existiert, aber preview/fields fehlen -->
+                <div v-else-if="m.newsletterConfirmCard" class="contactCard">
+                    <div class="contactTitle">
+                        ⏳ <strong>Newsletter-Insert – Daten werden geladen…</strong>
+                    </div>
+                    <div class="pre" style="opacity:.8">
+                        Draft-ID: {{ m.newsletterConfirmCard.draftId || m.newsletterConfirmCard.draft_id }}
+                    </div>
+                </div>
+                <!-- ✅ Fallback: Card existiert, aber Preview ist noch nicht da -->
+                <div v-else-if="m.newsletterConfirmCard" class="contactCard">
+                    <div class="contactTitle">
+                        ⏳ <strong>Newsletter-Insert – Daten werden geladen…</strong>
+                    </div>
+                    <div class="pre" style="opacity:.8">
+                        Draft-ID: {{ m.newsletterConfirmCard.draftId || m.newsletterConfirmCard.draft_id }}
+                    </div>
+                </div>
                 <!-- ✅ formCard -->
                 <div v-if="m.formCard" class="contactCard">
                     <div class="contactTitle">
@@ -380,13 +408,18 @@ defineEmits(['db-only', 'contact-selected', 'choose', 'newsletter-confirm', 'new
 function normalizeStarList(text) {
     const s = String(text ?? '')
 
-    // Wenn Sternchen in einer Zeile kommen: " * " -> "\n* "
-    // Zusätzlich: auch "* " am Anfang sauber lassen
     return s
         .replace(/\r\n/g, '\n')
+
+        // ✅ Markdown-Link über Zeilen zusammenziehen
+        // [Text]\n(URL) -> [Text](URL)
+        .replace(/\]\s*\n\s*\(/g, '](')
+
+        // Sterne normalisieren
         .replace(/\s\*\s/g, '\n* ')
         .replace(/^\s*\*\s*/, '* ')
 }
+
 
 
 // Helferfunktion Links rendern: unterstützt [Label](URL) + normale URLs
@@ -428,6 +461,12 @@ function linkifyParts(text) {
     if (last2 < tail.length) parts.push({ type: 'text', value: tail.slice(last2) })
 
     return parts
+}
+
+function newsletterPreview(m) {
+    const nc = m?.newsletterConfirmCard
+    if (!nc) return null
+    return nc.preview || nc.fields || null
 }
 
 function groupedChoices(m) {
