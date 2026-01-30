@@ -204,7 +204,7 @@
                         </button>
                     </div>
 
-                    <div v-if="m.newsletterConfirmCard.sqlPreview" class="stepsBox" style="margin-top:12px;">
+                    <div v-if="m.newsletterConfirmCard?.sqlPreview" class="stepsBox" style="margin-top:12px;">
                         <div class="stepsTitle">SQL Vorschau:</div>
                         <div class="pre">{{ m.newsletterConfirmCard.sqlPreview }}</div>
                     </div>
@@ -219,15 +219,7 @@
                         Draft-ID: {{ m.newsletterConfirmCard.draftId || m.newsletterConfirmCard.draft_id }}
                     </div>
                 </div>
-                <!-- ✅ Fallback: Card existiert, aber Preview ist noch nicht da -->
-                <div v-else-if="m.newsletterConfirmCard" class="contactCard">
-                    <div class="contactTitle">
-                        ⏳ <strong>Newsletter-Insert – Daten werden geladen…</strong>
-                    </div>
-                    <div class="pre" style="opacity:.8">
-                        Draft-ID: {{ m.newsletterConfirmCard.draftId || m.newsletterConfirmCard.draft_id }}
-                    </div>
-                </div>
+
                 <!-- ✅ formCard -->
                 <div v-if="m.formCard" class="contactCard">
                     <div class="contactTitle">
@@ -271,21 +263,22 @@
                     </div>
                 </div>
 
-                <!-- ✅ Choices klickbar (Newsletter / Formulare getrennt) -->
-                <div v-if="m.role === 'assistant' && m.choices?.length">
-                    <!-- Newsletter -->
-                    <div v-if="groupedChoices(m).newsletters.length" class="kb">
-                        <div class="kb-title">Newsletter:</div>
-                        <ul class="kb-list">
-                            <li v-for="x in groupedChoices(m).newsletters" :key="x.idx" class="kb-item">
-                                <div class="kb-item-main">
-                                    <div class="kb-item-title">
-                                        {{ x.idx + 1 }}) {{ x.choice.label }}
-                                    </div>
+                <!-- ✅ Treffer-Gruppen: SOP -> Formulare -> Newsletter -->
+                <div v-if="m.role === 'assistant' && hasAnyHits(m)" class="kbGroup">
 
-                                    <div v-if="x.choice.payload?.symptoms" class="kb-item-sub">
+                    <!-- 1) SOPs -->
+                    <div v-if="sortedSops(m).length" class="kb">
+                        <div class="kb-title">SOPs:</div>
+                        <ul class="kb-list">
+                            <li v-for="hit in sortedSops(m)" :key="hit._key" class="kb-item">
+                                <div class="kb-item-main">
+                                    <a :href="hit.url" target="_blank" rel="noreferrer">
+                                        {{ hit.title }}
+                                        <span v-if="hit.score !== null && hit.score !== undefined"> (Score {{ hit.score }})</span>
+                                    </a>
+                                    <div v-if="hit.symptoms" class="kb-item-sub">
                                         ↳
-                                        <template v-for="(p, pi) in linkifyParts(x.choice.payload.symptoms)" :key="pi">
+                                        <template v-for="(p, pi) in linkifyParts(hit.symptoms)" :key="pi">
                                             <span v-if="p.type === 'text'">{{ p.value }}</span>
                                             <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
                                                 {{ p.label || p.value }}
@@ -295,22 +288,21 @@
                                 </div>
 
                                 <div class="kb-actions">
-                                    <button class="btn small" @click="$emit('choose', x.idx + 1)">Öffnen</button>
+                                    <button v-if="hit.id" class="btn small" @click="$emit('db-only', hit.id)">Nur Steps</button>
+                                    <a v-if="hit.stepsUrl" class="btn small ghost" :href="hit.stepsUrl" target="_blank" rel="noreferrer">Steps API</a>
+                                    <button v-if="hit._choiceIndex !== null" class="btn small" @click="$emit('choose', hit._choiceIndex + 1)">Öffnen</button>
                                 </div>
                             </li>
                         </ul>
                     </div>
 
-                    <!-- Formulare -->
-                    <div v-if="groupedChoices(m).forms.length" class="kb">
+                    <!-- 2) Formulare -->
+                    <div v-if="sortedForms(m).length" class="kb">
                         <div class="kb-title">Formulare:</div>
                         <ul class="kb-list">
-                            <li v-for="x in groupedChoices(m).forms" :key="x.idx" class="kb-item">
+                            <li v-for="x in sortedForms(m)" :key="x.idx" class="kb-item">
                                 <div class="kb-item-main">
-                                    <div class="kb-item-title">
-                                        {{ x.idx + 1 }}) {{ x.choice.label }}
-                                    </div>
-
+                                    <div class="kb-item-title">{{ x.idx + 1 }}) {{ x.choice.label }}</div>
                                     <div v-if="x.choice.payload?.symptoms" class="kb-item-sub">
                                         ↳
                                         <template v-for="(p, pi) in linkifyParts(x.choice.payload.symptoms)" :key="pi">
@@ -321,7 +313,6 @@
                                         </template>
                                     </div>
                                 </div>
-
                                 <div class="kb-actions">
                                     <button class="btn small" @click="$emit('choose', x.idx + 1)">Öffnen</button>
                                 </div>
@@ -329,14 +320,21 @@
                         </ul>
                     </div>
 
-                    <!-- Optional: sonstige Auswahl (falls später neue kinds kommen) -->
-                    <div v-if="groupedChoices(m).other.length" class="kb">
-                        <div class="kb-title">Weitere Treffer:</div>
+                    <!-- 3) Newsletter -->
+                    <div v-if="sortedNewsletters(m).length" class="kb">
+                        <div class="kb-title">Newsletter:</div>
                         <ul class="kb-list">
-                            <li v-for="x in groupedChoices(m).other" :key="x.idx" class="kb-item">
+                            <li v-for="x in sortedNewsletters(m)" :key="x.idx" class="kb-item">
                                 <div class="kb-item-main">
-                                    <div class="kb-item-title">
-                                        {{ x.idx + 1 }}) {{ x.choice.label }}
+                                    <div class="kb-item-title">{{ x.idx + 1 }}) {{ x.choice.label }}</div>
+                                    <div v-if="x.choice.payload?.symptoms" class="kb-item-sub">
+                                        ↳
+                                        <template v-for="(p, pi) in linkifyParts(x.choice.payload.symptoms)" :key="pi">
+                                            <span v-if="p.type === 'text'">{{ p.value }}</span>
+                                            <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
+                                                {{ p.label || p.value }}
+                                            </a>
+                                        </template>
                                     </div>
                                 </div>
                                 <div class="kb-actions">
@@ -345,48 +343,14 @@
                             </li>
                         </ul>
                     </div>
+
                 </div>
 
-                <!-- SOP Treffer -->
-                <div v-if="m.role === 'assistant' && m.matches?.length" class="kb">
-                    <div class="kb-title">Passende Schritt für Schritt Anleitungen:</div>
-                    <ul class="kb-list">
-                        <li v-for="hit in m.matches" :key="hit.id" class="kb-item">
-                            <div class="kb-item-main">
-                                <a :href="hit.url" target="_blank" rel="noreferrer">
-                                    {{ hit.title }} (Score {{ hit.score }})
-                                </a>
-                            </div>
-
-                            <div class="kb-actions">
-                                <button class="btn small" @click="$emit('db-only', hit.id)">Nur Steps</button>
-                                <a class="btn small ghost" :href="hit.stepsUrl" target="_blank" rel="noreferrer">Steps API</a>
-                            </div>
-                        </li>
-                    </ul>
-                </div>
-
-                <!-- Steps -->
-                <div v-if="m.steps?.length" class="stepsBox">
-                    <div class="stepsTitle">Schritte:</div>
-                    <ol class="stepsList">
-                        <li v-for="s in m.steps" :key="s.id || s.no">
-                            <span class="stepText">{{ s.text }}</span>
-                            <span v-if="s.mediaUrl" class="stepMedia">
-                                —
-                                <a :href="s.mediaUrl" target="_blank" rel="noreferrer">
-                                    {{ s.mediaMimeType === 'application/pdf' ? 'PDF Hilfe' : 'Bildhilfe' }}
-                                </a>
-                            </span>
-                        </li>
-                    </ol>
-                </div>
 
             </div>
         </div>
     </div>
 </template>
-
 
 <script setup>
 const props = defineProps({
@@ -404,23 +368,16 @@ const props = defineProps({
 
 defineEmits(['db-only', 'contact-selected', 'choose', 'newsletter-confirm', 'newsletter-edit'])
 
-
 function normalizeStarList(text) {
     const s = String(text ?? '')
-
     return s
         .replace(/\r\n/g, '\n')
-
-        // ✅ Markdown-Link über Zeilen zusammenziehen
-        // [Text]\n(URL) -> [Text](URL)
+        // ✅ Markdown-Link über Zeilen zusammenziehen: [Text]\n(URL) -> [Text](URL)
         .replace(/\]\s*\n\s*\(/g, '](')
-
         // Sterne normalisieren
         .replace(/\s\*\s/g, '\n* ')
         .replace(/^\s*\*\s*/, '* ')
 }
-
-
 
 // Helferfunktion Links rendern: unterstützt [Label](URL) + normale URLs
 function linkifyParts(text) {
@@ -469,25 +426,180 @@ function newsletterPreview(m) {
     return nc.preview || nc.fields || null
 }
 
+/**
+ * ✅ Robust: erkennt Newsletter auch ohne category (nur label/titel),
+ * trennt Formulare strikt davon, und liefert SOP-Links separat.
+ */
 function groupedChoices(m) {
     const list = Array.isArray(m?.choices) ? m.choices : []
     const indexed = list.map((choice, idx) => ({ idx, choice }))
 
-    const newsletters = indexed.filter(x =>
-        x.choice?.kind === 'form' &&
-        String(x.choice?.payload?.category || '').toUpperCase() === 'NEWSLETTER'
-    )
+    const getText = (x) => String(
+        x?.choice?.label ??
+        x?.choice?.title ??
+        x?.choice?.payload?.title ??
+        ''
+    ).toLowerCase()
 
-    const forms = indexed.filter(x =>
-        x.choice?.kind === 'form' &&
-        String(x.choice?.payload?.category || '').toUpperCase() !== 'NEWSLETTER'
-    )
+    const getCategory = (x) => String(
+        x?.choice?.payload?.category ??
+        x?.choice?.category ??
+        x?.choice?.payload?.type ??
+        ''
+    ).toUpperCase()
 
-    const other = indexed.filter(x =>
-        x.choice?.kind !== 'form'
-    )
+    const getKind = (x) => String(
+        x?.choice?.kind ??
+        x?.choice?.type ??
+        ''
+    ).toLowerCase()
 
-    return { newsletters, forms, other }
+    // Heuristik: "newsletter" oder "kw 5/2026" etc.
+    const looksLikeNewsletter = (x) => {
+        const t = getText(x)
+        const cat = getCategory(x)
+        const kind = getKind(x)
+        return (
+            cat === 'NEWSLETTER' ||
+            kind === 'newsletter' ||
+            t.includes('newsletter') ||
+            /kw\s*\d{1,2}\s*\/\s*\d{4}/i.test(t) ||
+            /kw\s*\d{1,2}\s*-\s*\d{4}/i.test(t)
+        )
+    }
+
+    const newsletters = indexed.filter(looksLikeNewsletter)
+
+    // Formulare: alles was "form" ist, aber NICHT newsletter
+    const forms = indexed.filter(x => {
+        if (newsletters.some(n => n.idx === x.idx)) return false
+        const cat = getCategory(x)
+        const kind = getKind(x)
+        // Kategorie vorhanden und nicht Newsletter oder Kind form
+        return (cat !== '' && cat !== 'NEWSLETTER') || kind === 'form'
+    })
+
+    // SOP: alles übrige mit URL
+    const sops = indexed
+        .filter(x => !newsletters.some(n => n.idx === x.idx) && !forms.some(f => f.idx === x.idx))
+        .map(x => {
+            const url = x?.choice?.payload?.url || x?.choice?.url || ''
+            const label = x?.choice?.label || x?.choice?.title || 'SOP'
+            return { idx: x.idx, choice: x.choice, url, label }
+        })
+        .filter(x => String(x.url || '').startsWith('http'))
+
+    return { newsletters, forms, sops }
+}
+function hasAnyHits(m) {
+    return (Array.isArray(m?.matches) && m.matches.length) ||
+        (Array.isArray(m?.choices) && m.choices.length)
+}
+
+function parseDateTs(v) {
+    if (!v) return 0
+    const s = String(v).trim()
+    // akzeptiert "YYYY-MM-DD" und "YYYY-MM-DD HH:mm:ss"
+    const iso = s.includes('T') ? s : s.replace(' ', 'T')
+    const t = Date.parse(iso)
+    return Number.isFinite(t) ? t : 0
+}
+
+function choiceTs(choice) {
+    const p = choice?.payload || {}
+    return Math.max(
+        parseDateTs(p.updated_at),
+        parseDateTs(p.published_at),
+        parseDateTs(p.created_at),
+        parseDateTs(choice?.updated_at),
+        parseDateTs(choice?.published_at),
+        parseDateTs(choice?.created_at),
+    )
+}
+
+function newsletterRank(choice) {
+    // Fallback falls keine Dates: Jahr/KW => sortierbar
+    const p = choice?.payload || {}
+    const y = Number(p.newsletter_year || p.year || 0)
+    const kw = Number(p.newsletter_kw || p.kw || 0)
+    if (y > 0 && kw > 0) return y * 100 + kw
+    return 0
+}
+
+/**
+ * SOPs: bevorzugt echte DB matches.
+ * Falls SOPs als choices kommen: "other" mit url => SOP.
+ */
+function sortedSops(m) {
+    const out = []
+
+    // 1) matches (DB)
+    const matches = Array.isArray(m?.matches) ? m.matches : []
+    for (const hit of matches) {
+        out.push({
+            _key: 'm-' + String(hit.id ?? hit.url ?? Math.random()),
+            id: hit.id ?? null,
+            title: hit.title ?? 'SOP',
+            url: hit.url ?? hit.stepsUrl ?? '#',
+            stepsUrl: hit.stepsUrl ?? null,
+            score: hit.score ?? null,
+            symptoms: hit.symptoms ?? hit.snippet ?? null,
+            _ts: Math.max(parseDateTs(hit.updated_at), parseDateTs(hit.published_at), parseDateTs(hit.created_at)),
+            _choiceIndex: null,
+        })
+    }
+
+    // 2) fallback: choices-other als SOP (wenn URL vorhanden)
+    const gc = groupedChoices(m)
+    const other = Array.isArray(gc?.other) ? gc.other : []
+    for (const x of other) {
+        const url = x?.choice?.payload?.url || x?.choice?.url
+        if (!url) continue
+
+        // Heuristik: wenn category/kind eindeutig newsletter/form ist, NICHT als SOP nehmen
+        const cat = String(x?.choice?.payload?.category || x?.choice?.category || '').toUpperCase()
+        const kind = String(x?.choice?.kind || x?.choice?.type || '').toLowerCase()
+        if (cat === 'NEWSLETTER' || kind === 'newsletter' || kind === 'form') continue
+
+        out.push({
+            _key: 'c-' + x.idx,
+            id: null,
+            title: x?.choice?.label || x?.choice?.title || 'SOP',
+            url,
+            stepsUrl: x?.choice?.payload?.stepsUrl || null,
+            score: x?.choice?.payload?.score ?? null,
+            symptoms: x?.choice?.payload?.symptoms ?? null,
+            _ts: choiceTs(x.choice),
+            _choiceIndex: x.idx,
+        })
+    }
+
+    // Sort: neueste zuerst, fallback score (höher zuerst)
+    out.sort((a, b) => {
+        const dt = (b._ts || 0) - (a._ts || 0)
+        if (dt !== 0) return dt
+        return (b.score || 0) - (a.score || 0)
+    })
+
+    return out
+}
+
+function sortedForms(m) {
+    const gc = groupedChoices(m)
+    const arr = Array.isArray(gc?.forms) ? gc.forms.slice() : []
+    arr.sort((a, b) => (choiceTs(b.choice) - choiceTs(a.choice)))
+    return arr
+}
+
+function sortedNewsletters(m) {
+    const gc = groupedChoices(m)
+    const arr = Array.isArray(gc?.newsletters) ? gc.newsletters.slice() : []
+    arr.sort((a, b) => {
+        const dt = choiceTs(b.choice) - choiceTs(a.choice)
+        if (dt !== 0) return dt
+        return newsletterRank(b.choice) - newsletterRank(a.choice)
+    })
+    return arr
 }
 
 </script>
@@ -511,6 +623,7 @@ function groupedChoices(m) {
 .kb-item-sub { margin-top: 6px; opacity: 0.8; font-size: 0.95em; line-height: 1.35; white-space: pre-wrap; }
 
 .kb-actions{ display:flex; gap:10px; margin-top:8px; }
+.kbGroup {margin-top: 10px;}
 
 .btn{
     appearance: none;
