@@ -51,7 +51,21 @@ final class NewsletterResolver
 
         // 1) Kandidaten über bestehendes Matching holen (Keywords/Title/ContextNotes)
         // Tipp an Redaktion: pro Newsletter Keywords wie "newsletter", "kw 5", "sale", "rabatt", "kampagne" pflegen
-        $raw = $this->solutions->findBestMatches($message . ' newsletter', 80);
+
+
+        // "newsletter" ist ein Command, kein Keyword-Token (==> Sonderbehandlung)
+        $tokens = $this->tokenize($message);
+        $tokens = array_values(array_filter($tokens, fn($t) => $t !== 'newsletter'));
+
+        // Case A: nur Newsletter-Listing im Zeitraum
+        if (count($tokens) === 0) {
+            $raw = $this->solutions->findNewslettersInRange($from, $to); // neue Repo-Methode (siehe unten)
+        } else {
+            // Case B: z.B. "reduzierungen newsletter seit ..."
+            // strikt nur category=NEWSLETTER
+            $raw = $this->solutions->findNewsletterMatches($from, $to, $tokens);
+        }
+
 
         $mapped = [];
         foreach ($raw as $m) {
@@ -263,4 +277,32 @@ final class NewsletterResolver
             default => null,
         };
     }
+
+    /**
+     * @return string[] lowercase tokens
+     */
+    private function tokenize(string $message): array
+    {
+        $m = mb_strtolower($message);
+
+        // Datumsteile & Trennzeichen raus, Wörter behalten
+        $m = preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $m) ?? $m;
+
+        $parts = preg_split('/\s+/u', trim($m)) ?: [];
+
+        // stopwords (optional, klein anfangen)
+        $stop = ['seit','ab','von','bis','und','oder','die','der','das','im','in','am','zum','zur','für','mit'];
+
+        $out = [];
+        foreach ($parts as $p) {
+            if ($p === '') continue;
+            if (in_array($p, $stop, true)) continue;
+            // Datum-Token wie 01 01 2025 nicht als Suchwort nutzen
+            if (preg_match('/^\d{1,4}$/', $p)) continue;
+            $out[] = $p;
+        }
+        return array_values(array_unique($out));
+    }
+
+
 }

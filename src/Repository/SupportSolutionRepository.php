@@ -348,5 +348,35 @@ final class SupportSolutionRepository extends ServiceEntityRepository
         return $qb->getQuery()->getResult();
     }
 
+    /**
+     * Case A: "Newsletter seit ...": alle Newsletter im Zeitraum (ohne Keyword-Matching)
+     * Return-Format muss zu deinem Mapper passen: ['solution' => SupportSolution, 'score' => int]
+     *
+     * @return array<int,array{solution:SupportSolution,score:int}>
+     */
+    public function findNewslettersInRange(\DateTimeImmutable $from, \DateTimeImmutable $to): array
+    {
+        $qb = $this->createQueryBuilder('s')
+            ->andWhere('s.type = :type')
+            ->andWhere('(s.publishedAt BETWEEN :from AND :to OR (s.publishedAt IS NULL AND s.createdAt BETWEEN :from AND :to))')
+            ->andWhere('LOWER(s.title) LIKE :needle')
+            ->setParameter('type', 'FORM')
+            ->setParameter('from', $from)
+            ->setParameter('to', $to)
+            ->setParameter('needle', '%newsletter%')
+            ->orderBy('s.publishedAt', 'DESC')
+            ->addOrderBy('s.createdAt', 'DESC');
+
+
+        $solutions = $qb->getQuery()->getResult();
+
+        // Resolver erwartet $m['solution'] + score
+        return array_map(static fn(SupportSolution $s) => [
+            'solution' => $s,
+            'score' => 0,
+        ], $solutions);
+    }
+
+
 
 }

@@ -20,7 +20,13 @@
                         </a>
                     </template>
                 </div>
-
+                <!-- ✅ Edit-Link nach Insert (IMMER anzeigen wenn ID im content) -->
+                <div v-if="insertedId(m)" class="kb-item-sub" style="margin-top:6px;">
+                    ↳
+                    <a :href="`/kb/edit/${insertedId(m)}`" target="_blank" rel="noreferrer">
+                        Datensatz bearbeiten (ID {{ insertedId(m) }})
+                    </a>
+                </div>
                 <!-- Kontaktkarte -->
                 <div v-if="m.contactCard" class="contactCard">
                     <div class="contactTitle">
@@ -424,7 +430,9 @@ function linkifyParts(text) {
     const tail = s.slice(last)
 
     // 2) normale URLs im Rest (Satzzeichen am Ende abschneiden)
-    const reUrl = /(https?:\/\/[^\s<]+[^\s<\.,;:!?"')\]])/g
+    // ALT: const reUrl = /(https?:\/\/[^\s<]+[^\s<\.,;:!?"')\]])/g
+    const reUrl = /((?:https?:\/\/|\/)[^\s<]+[^\s<\.,;:!?"')\]])/g
+
     let last2 = 0
     let u
 
@@ -701,6 +709,13 @@ function pickExternalUrl(...candidates) {
 function symptomsHasDrive(symptoms) {
     const s = String(symptoms ?? '').toLowerCase()
     return s.includes('drive') || s.includes('dokument (drive)') || s.includes('document (drive)')
+}
+
+function insertedId(m) {
+    const s = String(m?.content ?? '')
+    // passt z.B. auf: "Dokument wurde eingefügt. ID: 31"
+    const mm = s.match(/\bID:\s*(\d+)\b/i)
+    return mm ? Number(mm[1]) : null
 }
 
 

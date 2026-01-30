@@ -40,26 +40,27 @@ final class SupportChatService
     private readonly bool $isDev;
 
     public function __construct(
-        private readonly AiChatGateway $aiChat,
+        private readonly AiChatGateway             $aiChat,
         private readonly SupportSolutionRepository $solutions,
-        private readonly CacheInterface $cache,
-        private readonly LoggerInterface $supportSolutionLogger,
-        private readonly UsageTracker $usageTracker,
-        private readonly ContactResolver $contactResolver,
-        private readonly FormResolver $formResolver,
-        private readonly PromptTemplateLoader $promptLoader,
+        private readonly CacheInterface            $cache,
+        private readonly LoggerInterface           $supportSolutionLogger,
+        private readonly UsageTracker              $usageTracker,
+        private readonly ContactResolver           $contactResolver,
+        private readonly FormResolver              $formResolver,
+        private readonly PromptTemplateLoader      $promptLoader,
 
         // Newsletter: Suche/Query (bestehender Resolver)
-        private readonly NewsletterResolver       $newsletterResolver,
+        private readonly NewsletterResolver        $newsletterResolver,
 
         // Newsletter: Create-Flow (NEU ausgelagert)
-        private readonly NewsletterCreateResolver $newsletterCreateResolver,
+        private readonly NewsletterCreateResolver  $newsletterCreateResolver,
 
         // Document: Create-Flow (NEU ausgelagert)
-        private readonly FormCreateResolver       $documentCreateResolver,
+        private readonly FormCreateResolver        $documentCreateResolver,
 
-        KernelInterface                           $kernel,
-    ) {
+        KernelInterface                            $kernel,
+    )
+    {
         $this->isDev = $kernel->getEnvironment() === 'dev';
     }
 
@@ -81,17 +82,18 @@ final class SupportChatService
 
     #[TrackUsage(self::USAGE_KEY_ASK, weight: 5)]
     public function ask(
-        string $sessionId,
-        string $message,
-        ?int $dbOnlySolutionId = null,
-        string $provider = 'gemini',
+        string  $sessionId,
+        string  $message,
+        ?int    $dbOnlySolutionId = null,
+        string  $provider = 'gemini',
         ?string $model = null,
-        array $context = [],
-        ?Trace $trace = null
-    ): array {
+        array   $context = [],
+        ?Trace  $trace = null
+    ): array
+    {
         $sessionId = trim($sessionId);
-        $message   = trim($message);
-        $provider  = strtolower(trim($provider));
+        $message = trim($message);
+        $provider = strtolower(trim($provider));
 
         // "mehr" -> Newsletter paging (nur vorbereitet, kein offset/limit implementiert)
         if (mb_strtolower($message) === 'mehr') {
@@ -131,7 +133,7 @@ final class SupportChatService
             ]);
 
             $this->supportSolutionLogger->info('db_only_response', [
-                'sessionId'  => $sessionId,
+                'sessionId' => $sessionId,
                 'solutionId' => $dbOnlySolutionId,
                 'stepsCount' => isset($result['steps']) && is_array($result['steps']) ? count($result['steps']) : 0,
             ]);
@@ -248,7 +250,7 @@ final class SupportChatService
          * NewsletterResolver (Suche/Query) mit Pending-State (Zeitraum First-Class)
          */
         $pendingKey = 'support_chat.newsletter_pending.' . sha1($sessionId);
-        $pagingKey  = 'support_chat.newsletter_paging.' . sha1($sessionId);
+        $pagingKey = 'support_chat.newsletter_paging.' . sha1($sessionId);
 
         // 1) Pending? (wir warten nur noch auf Zeitraum)
         $pending = $this->cache->get($pendingKey, static fn(ItemInterface $item) => null);
@@ -342,7 +344,7 @@ final class SupportChatService
         $matches = $this->dedupeMatchesById($matches);
 
         $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
-        $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+        $sops = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
 
         $sops = $this->filterSopsDuplicatingFormTitles($sops, $forms);
 
@@ -470,14 +472,14 @@ final class SupportChatService
         ]);
 
         $this->supportSolutionLogger->info('chat_request', [
-            'sessionId'      => $sessionId,
-            'message'        => $message,
-            'matchCount'     => count($matches),
-            'matchIds'       => array_map(static fn($m) => $m['id'] ?? null, $matches),
+            'sessionId' => $sessionId,
+            'message' => $message,
+            'matchCount' => count($matches),
+            'matchIds' => array_map(static fn($m) => $m['id'] ?? null, $matches),
             'kbContextChars' => strlen($kbContext),
-            'provider'       => $provider,
-            'model'          => $model,
-            'usageKey'       => $context['usage_key'] ?? self::USAGE_KEY_ASK,
+            'provider' => $provider,
+            'model' => $model,
+            'usageKey' => $context['usage_key'] ?? self::USAGE_KEY_ASK,
         ]);
 
         try {
@@ -525,10 +527,10 @@ final class SupportChatService
         });
 
         $this->supportSolutionLogger->info('chat_response', [
-            'sessionId'   => $sessionId,
+            'sessionId' => $sessionId,
             'answerChars' => strlen($answer),
-            'provider'    => $provider,
-            'model'       => $model,
+            'provider' => $provider,
+            'model' => $model,
         ]);
 
         // store numeric-selection choices: forms + sops
@@ -562,14 +564,15 @@ final class SupportChatService
      * => kompletter Create-Flow ist im NewsletterCreateResolver.
      */
     public function newsletterAnalyze(
-        string $sessionId,
-        string $message,
-        string $driveUrl,
+        string        $sessionId,
+        string        $message,
+        string        $driveUrl,
         ?UploadedFile $file,
-        string $provider,
-        ?string $model,
-        ?Trace $trace = null
-    ): array {
+        string        $provider,
+        ?string       $model,
+        ?Trace        $trace = null
+    ): array
+    {
         return $this->newsletterCreateResolver->analyze(
             sessionId: $sessionId,
             message: $message,
@@ -584,13 +587,14 @@ final class SupportChatService
      * POST /api/chat/newsletter/patch
      */
     public function newsletterPatch(
-        string $sessionId,
-        string $draftId,
-        string $message,
-        string $provider,
+        string  $sessionId,
+        string  $draftId,
+        string  $message,
+        string  $provider,
         ?string $model,
-        ?Trace $trace = null
-    ): array {
+        ?Trace  $trace = null
+    ): array
+    {
         return $this->newsletterCreateResolver->patch(
             sessionId: $sessionId,
             draftId: $draftId,
@@ -605,7 +609,8 @@ final class SupportChatService
         string $sessionId,
         string $draftId,
         ?Trace $trace = null
-    ): array {
+    ): array
+    {
         return $this->newsletterCreateResolver->confirm(
             sessionId: $sessionId,
             draftId: $draftId
@@ -1068,14 +1073,15 @@ final class SupportChatService
      * => kompletter Create-Flow ist im FormCreateResolver.
      */
     public function documentAnalyze(
-        string $sessionId,
-        string $message,
-        string $driveUrl,
+        string        $sessionId,
+        string        $message,
+        string        $driveUrl,
         ?UploadedFile $file,
-        string $provider,
-        ?string $model,
-        ?Trace $trace = null
-    ): array {
+        string        $provider,
+        ?string       $model,
+        ?Trace        $trace = null
+    ): array
+    {
         return $this->documentCreateResolver->analyze(
             sessionId: $sessionId,
             message: $message,
@@ -1090,13 +1096,14 @@ final class SupportChatService
      * POST /api/chat/document/patch
      */
     public function documentPatch(
-        string $sessionId,
-        string $draftId,
-        string $message,
-        string $provider,
+        string  $sessionId,
+        string  $draftId,
+        string  $message,
+        string  $provider,
         ?string $model,
-        ?Trace $trace = null
-    ): array {
+        ?Trace  $trace = null
+    ): array
+    {
         return $this->documentCreateResolver->patch(
             sessionId: $sessionId,
             draftId: $draftId,
@@ -1111,7 +1118,8 @@ final class SupportChatService
         string $sessionId,
         string $draftId,
         ?Trace $trace = null
-    ): array {
+    ): array
+    {
         return $this->documentCreateResolver->confirm(
             sessionId: $sessionId,
             draftId: $draftId
