@@ -12,6 +12,7 @@ use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
+use App\Validator\TKFashionPolicyKeywords;
 
 final class FormCreateResolver
 {
@@ -23,6 +24,7 @@ final class FormCreateResolver
         private readonly Connection $db,
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly PromptTemplateLoader $promptLoader,
+        private readonly TKFashionPolicyKeywords $keywordPolicy,
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
@@ -379,40 +381,14 @@ final class FormCreateResolver
      */
     private function normalizeKeywords(mixed $keywords): array
     {
-        $base = [
-            ['keyword' => 'dokument', 'weight' => 10],
-        ];
-
-        $out = [];
-        foreach ($base as $k) {
-            $kwd = trim(mb_strtolower((string)$k['keyword']));
-            if ($kwd !== '') {
-                $out[$kwd] = ['keyword' => $kwd, 'weight' => (int)$k['weight']];
-            }
+        if (!is_array($keywords)) {
+            return [];
         }
 
-        if (is_array($keywords)) {
-            foreach ($keywords as $k) {
-                if (!is_array($k)) continue;
-                $kwd = trim(mb_strtolower((string)($k['keyword'] ?? '')));
-                if ($kwd === '') continue;
-
-                // ❌ keine Filialkürzel / Codes
-                // (sehr pragmatisch: 4-5 Zeichen, nur A-Z0-9 → raus)
-                $isCode = (bool) preg_match('/^[a-z0-9]{4,5}$/i', $kwd);
-                if ($isCode) continue;
-
-                $weight = (int)($k['weight'] ?? 6);
-                if ($weight < 1) $weight = 1;
-                if ($weight > 10) $weight = 10;
-
-                $out[$kwd] = ['keyword' => $kwd, 'weight' => $weight];
-                if (count($out) >= 20) break;
-            }
-        }
-
-        return array_values($out);
+        // Delegiere Normalisierung + Filterung komplett an die Policy
+        return $this->keywordPolicy->filterKeywordObjects($keywords, 20);
     }
+
 
     private function fallbackTitleFromFilename(string $filename): string
     {

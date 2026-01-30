@@ -112,6 +112,10 @@ services:
         resource: '../src/Command/'
         tags: [ 'console.command' ]
 
+    App\Validator\TKFashionPolicyKeywords:
+        arguments:
+            $configPath: '%kernel.project_dir%/Service/Prompts/TKFashionPolicyKeywords.config'
+
 
 
 

@@ -276,6 +276,7 @@
                                         {{ hit.title }}
                                         <span v-if="hit.score !== null && hit.score !== undefined"> (Score {{ hit.score }})</span>
                                     </a>
+
                                     <div v-if="hit.symptoms" class="kb-item-sub">
                                         ↳
                                         <template v-for="(p, pi) in linkifyParts(hit.symptoms)" :key="pi">
@@ -303,16 +304,26 @@
                             <li v-for="x in sortedForms(m)" :key="x.idx" class="kb-item">
                                 <div class="kb-item-main">
                                     <div class="kb-item-title">{{ x.idx + 1 }}) {{ x.choice.label }}</div>
+
                                     <div v-if="x.choice.payload?.symptoms" class="kb-item-sub">
                                         ↳
-                                        <template v-for="(p, pi) in linkifyParts(x.choice.payload.symptoms)" :key="pi">
+                                        <template v-for="(p, pi) in linkifyParts(stripDriveBullets(x.choice.payload.symptoms))" :key="pi">
                                             <span v-if="p.type === 'text'">{{ p.value }}</span>
                                             <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
                                                 {{ p.label || p.value }}
                                             </a>
                                         </template>
                                     </div>
+
+                                    <!-- optional: externer Link (Drive) falls vorhanden -->
+                                    <div v-if="choiceDriveUrl(x)" class="kb-item-sub">
+                                        ↳
+                                        <a :href="choiceDriveUrl(x)" target="_blank" rel="noreferrer">
+                                            {{ choiceDriveLabel(x) }}
+                                        </a>
+                                    </div>
                                 </div>
+
                                 <div class="kb-actions">
                                     <button class="btn small" @click="$emit('choose', x.idx + 1)">Öffnen</button>
                                 </div>
@@ -327,16 +338,26 @@
                             <li v-for="x in sortedNewsletters(m)" :key="x.idx" class="kb-item">
                                 <div class="kb-item-main">
                                     <div class="kb-item-title">{{ x.idx + 1 }}) {{ x.choice.label }}</div>
+
                                     <div v-if="x.choice.payload?.symptoms" class="kb-item-sub">
                                         ↳
-                                        <template v-for="(p, pi) in linkifyParts(x.choice.payload.symptoms)" :key="pi">
+                                        <template v-for="(p, pi) in linkifyParts(stripDriveBullets(x.choice.payload.symptoms))" :key="pi">
                                             <span v-if="p.type === 'text'">{{ p.value }}</span>
                                             <a v-else-if="p.type === 'link'" :href="p.value" target="_blank" rel="noreferrer">
                                                 {{ p.label || p.value }}
                                             </a>
                                         </template>
                                     </div>
+
+                                    <!-- optional: externer Link (Drive) falls vorhanden -->
+                                    <div v-if="choiceDriveUrl(x)" class="kb-item-sub">
+                                        ↳
+                                        <a :href="choiceDriveUrl(x)" target="_blank" rel="noreferrer">
+                                            {{ choiceDriveLabel(x) }}
+                                        </a>
+                                    </div>
                                 </div>
+
                                 <div class="kb-actions">
                                     <button class="btn small" @click="$emit('choose', x.idx + 1)">Öffnen</button>
                                 </div>
@@ -345,6 +366,7 @@
                     </div>
 
                 </div>
+
 
 
             </div>
@@ -544,16 +566,17 @@ function sortedSops(m) {
             stepsUrl: hit.stepsUrl ?? null,
             score: hit.score ?? null,
             symptoms: hit.symptoms ?? hit.snippet ?? null,
+            external_media_url: hit.external_media_url ?? null,
             _ts: Math.max(parseDateTs(hit.updated_at), parseDateTs(hit.published_at), parseDateTs(hit.created_at)),
             _choiceIndex: null,
         })
     }
 
-    // 2) fallback: choices-other als SOP (wenn URL vorhanden)
+    // 2) fallback: choices-SOPs als SOP (wenn URL vorhanden)
     const gc = groupedChoices(m)
-    const other = Array.isArray(gc?.other) ? gc.other : []
+    const other = Array.isArray(gc?.sops) ? gc.sops : []
     for (const x of other) {
-        const url = x?.choice?.payload?.url || x?.choice?.url
+        const url = x?.url || x?.choice?.payload?.url || x?.choice?.url
         if (!url) continue
 
         // Heuristik: wenn category/kind eindeutig newsletter/form ist, NICHT als SOP nehmen
@@ -601,6 +624,85 @@ function sortedNewsletters(m) {
     })
     return arr
 }
+
+function isInternalApiUrl(u) {
+    const s = String(u ?? '').trim()
+    return (
+        s.startsWith('/api/') ||
+        s.includes('://127.0.0.1') ||
+        s.includes('://localhost') ||
+        s.includes('/api/support_solutions')
+    )
+}
+function choiceDriveUrl(x) {
+    const p = x?.choice?.payload || {}
+    return (
+        // ✅ camelCase aus deinem /api/chat Response
+        p.externalMediaUrl ||
+        p.driveUrl ||
+
+        // ✅ snake_case (falls es an anderer Stelle so kommt)
+        p.external_media_url ||
+        p.drive_url ||
+
+        // optional: wenn du als letzten Fallback überhaupt irgendwas willst
+        // (ich würde API-URLs eher NICHT als "Dokument" anzeigen)
+        ''
+    )
+}
+
+
+
+function choiceDriveLabel(x) {
+    const p = x?.choice?.payload || {}
+    const cat = String(p.category || x?.choice?.category || '').toUpperCase()
+    const kind = String(x?.choice?.kind || '').toLowerCase()
+
+    // Du lieferst category aktuell "GENERAL" obwohl es ein Newsletter ist.
+    // Daher: Heuristik über Titel/Label.
+    const t = String(p.title || x?.choice?.label || '').toLowerCase()
+    const isNewsletter = cat === 'NEWSLETTER' || kind === 'newsletter' || t.includes('newsletter')
+
+    return isNewsletter ? 'Newsletter (Drive)' : 'Dokument (Drive)'
+}
+
+function stripDriveBullets(text) {
+    const s = String(text ?? '')
+
+    // Entfernt Bullet-Zeilen, die einen Drive-Link enthalten (Markdown)
+    // z.B. "* [Dokument (Drive)](https://drive.google.com/....)"
+    return s
+        .split('\n')
+        .filter(line => {
+            const l = line.trim()
+            // bullet + markdown link + drive
+            const isDriveMd = /^\*\s*\[[^\]]+\]\((https?:\/\/[^)]+)\)\s*$/.test(l) && /drive\.google\.com/i.test(l)
+            // optional auch "↳ Dokument (Drive)" Varianten
+            const isDrivePlain = /Dokument\s*\(Drive\)/i.test(l) && /drive\.google\.com/i.test(l)
+            return !(isDriveMd || isDrivePlain)
+        })
+        .join('\n')
+}
+
+
+function pickExternalUrl(...candidates) {
+    for (const c of candidates) {
+        const u = String(c ?? '').trim()
+        if (!u) continue
+        if (isInternalApiUrl(u)) continue
+        // optional: nur http(s) zulassen
+        if (!u.startsWith('http')) continue
+        return u
+    }
+    return ''
+}
+
+
+function symptomsHasDrive(symptoms) {
+    const s = String(symptoms ?? '').toLowerCase()
+    return s.includes('drive') || s.includes('dokument (drive)') || s.includes('document (drive)')
+}
+
 
 </script>
 

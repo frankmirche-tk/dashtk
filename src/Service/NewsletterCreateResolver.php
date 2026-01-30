@@ -12,6 +12,7 @@ use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
 use Doctrine\DBAL\Connection;
+use App\Validator\TKFashionPolicyKeywords;
 
 final class NewsletterCreateResolver
 {
@@ -23,6 +24,7 @@ final class NewsletterCreateResolver
         private readonly Connection $db,
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly PromptTemplateLoader $promptLoader,
+        private readonly TKFashionPolicyKeywords $keywordPolicy,
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
@@ -399,42 +401,14 @@ final class NewsletterCreateResolver
      * @param mixed $keywords
      * @return array<int, array{keyword:string, weight:int}>
      */
-    private function normalizeKeywords(mixed $keywords, int $kw, int $year): array
+    private function normalizeKeywords(mixed $keywords): array
     {
-        $base = [
-            ['keyword' => 'newsletter', 'weight' => 10],
-            ['keyword' => "newsletter kw {$kw}", 'weight' => 9],
-            ['keyword' => "kw {$kw}", 'weight' => 8],
-            ['keyword' => "kw{$kw}", 'weight' => 7],
-            ['keyword' => (string)$year, 'weight' => 4],
-        ];
-
-        $out = [];
-        foreach ($base as $k) {
-            $out[$k['keyword']] = $k;
+        if (!is_array($keywords)) {
+            return [];
         }
 
-        if (is_array($keywords)) {
-            foreach ($keywords as $k) {
-                if (!is_array($k)) continue;
-                $kwd = trim(mb_strtolower((string)($k['keyword'] ?? '')));
-                if ($kwd === '') continue;
-
-                // ❌ keine Filialkürzel / Codes
-                // (sehr pragmatisch: 4-5 Zeichen, nur A-Z0-9 → raus)
-                $isCode = (bool) preg_match('/^[a-z0-9]{4,5}$/i', $kwd);
-                if ($isCode) continue;
-
-                $weight = (int)($k['weight'] ?? 6);
-                if ($weight < 1) $weight = 1;
-                if ($weight > 10) $weight = 10;
-
-                $out[$kwd] = ['keyword' => $kwd, 'weight' => $weight];
-                if (count($out) >= 20) break;
-            }
-        }
-
-        return array_values($out);
+        // Delegiere Normalisierung + Filterung komplett an die Policy
+        return $this->keywordPolicy->filterKeywordObjects($keywords, 20);
     }
 
     // ----------------------------
