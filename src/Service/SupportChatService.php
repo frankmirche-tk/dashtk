@@ -426,6 +426,10 @@ final class SupportChatService
         /**
          * C) AI + DB (SOP guidance)
          */
+        $history = $this->span($trace, 'cache.history_load', fn() => $this->loadHistory($sessionId), [
+            'session_hash' => sha1($sessionId),
+        ]);
+
         $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
             $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
 
@@ -474,6 +478,18 @@ final class SupportChatService
         $kbContext = $this->span($trace, 'kb.build_context', fn() => $this->buildKbContext($matches), [
             'match_count' => count($matches),
         ]);
+
+        // Wenn Form-Choices aus UI vorhanden sind, dem Modell explizit mitgeben
+        if ($formChoices !== []) {
+            $kbContext .= "\nFORM_CHOICES_UI:\n";
+            foreach ($formChoices as $c) {
+                $label = (string)($c['label'] ?? '');
+                $symptoms = trim((string)($c['payload']['symptoms'] ?? ''));
+                $kbContext .= "- {$label}" . ($symptoms !== '' ? (" | " . $symptoms) : "") . "\n";
+            }
+            $kbContext .= "ANWEISUNG: Wenn FORM_CHOICES_UI nicht leer ist, behaupte niemals \"kein Zugriff\" und biete Auswahl per Nummer an.\n";
+        }
+
 
         $context = $this->span($trace, 'ai.context_defaults', function () use ($context) {
             $context['usage_key'] ??= self::USAGE_KEY_ASK;
@@ -773,6 +789,13 @@ final class SupportChatService
             'updatedAt' => $updatedAt,
             'symptoms' => (string)($solution->getSymptoms() ?? ''),
             'category' => (string)($solution->getCategory() ?? ''), // ✅ NEU
+            // Newsletter-Metadaten (für Trefferliste "seit Datum")
+            'newsletterYear' => method_exists($solution, 'getNewsletterYear') ? $solution->getNewsletterYear() : null,
+            'newsletterKw' => method_exists($solution, 'getNewsletterKw') ? $solution->getNewsletterKw() : null,
+            'newsletterEdition' => method_exists($solution, 'getNewsletterEdition') ? $solution->getNewsletterEdition() : null,
+            'publishedAt' => method_exists($solution, 'getPublishedAt') && $solution->getPublishedAt()
+                ? $solution->getPublishedAt()->format('Y-m-d')
+                : null,
         ];
 
         if ($type === 'FORM') {
@@ -791,32 +814,119 @@ final class SupportChatService
     }
 
 
+
     private function buildKbContext(array $matches): string
     {
+
         if ($matches === []) {
-            return '';
+            return "KB_CONTEXT: none\n";
         }
 
-        $sops = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
-        if ($sops === []) {
-            return '';
+        // Alles reinnehmen (SOP/Newsletter/Form), damit KI keine "kein Zugriff" Behauptungen macht
+        $items = array_values($matches);
+        if ($items === []) {
+            return "KB_CONTEXT: none\n";
+        }
+
+        // Newsletter erkennen: über newsletterYear/publishedAt oder Kategorie/Title
+        $newsletters = [];
+        $forms = [];
+        $others = [];
+        foreach ($items as $m) {
+            if (($m['type'] ?? null) === 'FORM') {
+                $forms[] = $m;
+                continue;
+            }
+            $cat = mb_strtolower((string)($m['category'] ?? ''));
+            $ttl = mb_strtolower((string)($m['title'] ?? ''));
+            $isNl = !empty($m['newsletterYear'])
+                || !empty($m['publishedAt'])
+                || str_contains($cat, 'newsletter')
+                || str_contains($ttl, 'newsletter');
+
+            if ($isNl) {
+                $newsletters[] = $m;
+            } else {
+                $others[] = $m;
+            }
         }
 
         $lines = [];
-        $lines[] = 'WISSENSDATENBANK (SOPs) – nutze diese vorrangig, wenn passend:';
-        foreach ($sops as $hit) {
-            $lines[] = sprintf(
-                '- SOP #%d: %s (Score %d) IRI: %s',
-                $hit['id'],
-                $hit['title'],
-                $hit['score'],
-                $hit['url']
-            );
-        }
-        $lines[] = 'REGEL: Wenn eine SOP passt, führe Schritt-für-Schritt und frage nach jedem Ergebnis.';
+        $lines[] = "KB_CONTEXT: present";
+        $lines[] = "WICHTIG: Nutze die folgenden Treffer als primäre Quelle. Behaupte NICHT, dass du keinen Zugriff/kein Archiv hast, wenn Treffer gelistet sind.";
+        $lines[] = "";
 
-        return implode("\n", $lines);
+        // 1) Newsletter-Block (genau das, was ihr wollt)
+        $lines[] = "NEWSLETTER_MATCHES:";
+        if ($newsletters === []) {
+            $lines[] = "- (none)";
+        } else {
+            foreach ($newsletters as $hit) {
+                $id = (int)($hit['id'] ?? 0);
+                $title = trim((string)($hit['title'] ?? ''));
+                $kw = (string)($hit['newsletterKw'] ?? '');
+                $year = (string)($hit['newsletterYear'] ?? '');
+                $edition = (string)($hit['newsletterEdition'] ?? '');
+                $published = (string)($hit['publishedAt'] ?? '');
+                $symptoms = trim((string)($hit['symptoms'] ?? ''));
+
+                $meta = [];
+                if ($published !== '') { $meta[] = "published_at={$published}"; }
+                if ($year !== '' || $kw !== '' || $edition !== '') {
+                    $meta[] = "newsletter={$year}-KW{$kw}" . ($edition !== '' ? "-{$edition}" : '');
+                }
+                $metaStr = $meta ? (" [" . implode(", ", $meta) . "]") : "";
+
+                $lines[] = "- (#{$id}) {$title}{$metaStr}";
+                if ($symptoms !== '') {
+                    $lines[] = "  excerpt: " . $symptoms;
+                }
+            }
+        }
+
+        $lines[] = "";
+        $lines[] = "FORM_MATCHES:";
+        if ($forms === []) {
+            $lines[] = "- (none)";
+        } else {
+            foreach ($forms as $hit) {
+                $id = (int)($hit['id'] ?? 0);
+                $title = trim((string)($hit['title'] ?? ''));
+                $symptoms = trim((string)($hit['symptoms'] ?? ''));
+                $lines[] = "- (#{$id}) {$title}";
+                if ($symptoms !== '') {
+                    $lines[] = "  excerpt: " . $symptoms;
+                }
+            }
+        }
+
+        $lines[] = "";
+        $lines[] = "OTHER_KB_MATCHES:";
+        if ($others === []) {
+            $lines[] = "- (none)";
+        } else {
+            foreach ($others as $hit) {
+                $lines[] = sprintf(
+                    '- (#%d) %s (Score %d) IRI: %s',
+                    (int)($hit['id'] ?? 0),
+                    (string)($hit['title'] ?? ''),
+                    (int)($hit['score'] ?? 0),
+                    (string)($hit['url'] ?? '')
+                );
+            }
+        }
+
+        $lines[] = "";
+        $lines[] = "ANWEISUNG:";
+        $lines[] = "- Wenn der Nutzer nach Newsletter 'seit DD.MM.YYYY' fragt: liste NEWSLETTER_MATCHES.";
+        $lines[] = "- Wenn NEWSLETTER_MATCHES = (none): antworte exakt: \"Keine passenden Newsletter gefunden.\"";
+        $lines[] = "- Wenn der Nutzer nach Formularen fragt: liste FORM_MATCHES oder biete Auswahl/Nummern an, falls vorhanden.";
+        $lines[] = "- Behaupte niemals \"kein Zugriff\" wenn irgendeine *_MATCHES Liste nicht leer ist.";
+
+        return implode("\n", $lines) . "\n";
     }
+
+
 
     // ---------------------------------------------------------------------
     // History / choices cache

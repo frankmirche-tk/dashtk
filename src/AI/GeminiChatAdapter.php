@@ -27,7 +27,16 @@ final readonly class GeminiChatAdapter implements AIChatAdapterInterface
         $trace = TraceContext::get();
 
         if (!$trace) {
-            return $this->inner->handleRequest($request);
+            // Wichtig: wir fangen hier auch den "single-Part" Fehler ab,
+            // damit er nicht bis in den SupportChatService hoch knallt.
+            try {
+                return $this->inner->handleRequest($request);
+            } catch (\RuntimeException $e) {
+                if ($this->isGeminiNonSimpleTextError($e)) {
+                    return $this->makeNonSimpleTextFallbackResponse();
+                }
+                throw $e;
+            }
         }
 
         return $trace->span('adapter.gemini.handleRequest', function () use ($trace, $request) {
@@ -42,11 +51,65 @@ final readonly class GeminiChatAdapter implements AIChatAdapterInterface
             }
 
             return $trace->span('adapter.gemini.vendor_call', function () use ($request) {
-                return $this->inner->handleRequest($request);
+                try {
+                    return $this->inner->handleRequest($request);
+                } catch (\RuntimeException $e) {
+                    // Ziel in Schritt 1: diesen konkreten "single-Part" Fehler abfangen,
+                    // damit es keinen Hard-Fail gibt.
+                    if ($this->isGeminiNonSimpleTextError($e)) {
+                        return $this->makeNonSimpleTextFallbackResponse();
+                    }
+
+                    throw $e;
+                }
             }, $meta);
 
         }, [
             'inner_class' => $this->inner::class,
         ]);
+    }
+
+    private function isGeminiNonSimpleTextError(\RuntimeException $e): bool
+    {
+        $m = $e->getMessage();
+
+        // exakt der Fehler aus deinem Log:
+        // "GenerateContentResponse::text() quick accessor only works for simple (single-Part) text responses..."
+        return str_contains($m, 'GenerateContentResponse::text()')
+            && str_contains($m, 'only works for simple (single-')
+            && str_contains($m, 'parts');
+    }
+
+    /**
+     * Fallback nur für Schritt 1 (single-Part Problem):
+     * Wir liefern eine saubere, kurze Antwort zurück, statt Exception.
+     *
+     * Hinweis: Wir bauen hier absichtlich KEIN parts()-Parsing ein,
+     * weil das sauber im eigentlichen Response-Extractor / Inner-Adapter passieren sollte.
+     */
+    private function makeNonSimpleTextFallbackResponse(): AIChatResponse
+    {
+        $msg = 'Fehler beim Erzeugen der Antwort (Gemini): Die Antwort kam als Multi-Part zurück und konnte nicht als einfacher Text gelesen werden.';
+
+        // Versuche, eine AIChatResponse sauber zu erzeugen – abhängig davon,
+        // welche Factory/Signatur eure ModelflowAi-Version anbietet.
+        if (method_exists(AIChatResponse::class, 'fromText')) {
+            /** @phpstan-ignore-next-line */
+            return AIChatResponse::fromText($msg);
+        }
+        if (method_exists(AIChatResponse::class, 'fromString')) {
+            /** @phpstan-ignore-next-line */
+            return AIChatResponse::fromString($msg);
+        }
+
+        // Letzter Versuch: Constructor mit string (falls vorhanden).
+        try {
+            /** @phpstan-ignore-next-line */
+            return new AIChatResponse($msg);
+        } catch (\Throwable) {
+            // Wenn wir keine Response bauen können, lieber sauber RuntimeException werfen,
+            // damit es im DEV sichtbar bleibt (statt fatal/undefined behaviour).
+            throw new \RuntimeException($msg);
+        }
     }
 }
