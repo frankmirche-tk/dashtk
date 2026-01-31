@@ -305,20 +305,15 @@ final class SupportSolutionRepository extends ServiceEntityRepository
 
     // neuer Code
 
-    public function findNewsletterMatches(
-        array $tokens,
-        \DateTimeInterface $from,
-        \DateTimeInterface $to,
-        int $limit = 25,
-        int $offset = 0
-    ): array {
+    public function findNewsletterMatches(array $tokens, \DateTimeImmutable $from, \DateTimeImmutable $to, int $offset = 0, int $limit = 25): array
+    {
         $qb = $this->createQueryBuilder('s');
 
         $qb
             ->andWhere('s.active = true')
             ->andWhere('s.type = :type')
             ->andWhere('s.category = :category')
-            ->andWhere('s.publishedAt BETWEEN :from AND :to')
+            ->andWhere('(s.publishedAt BETWEEN :from AND :to OR (s.publishedAt IS NULL AND s.createdAt BETWEEN :from AND :to))')
             ->setParameter('type', 'FORM')
             ->setParameter('category', 'NEWSLETTER')
             ->setParameter('from', $from)
@@ -327,9 +322,10 @@ final class SupportSolutionRepository extends ServiceEntityRepository
         if (!empty($tokens)) {
             $qb
                 ->join('s.keywords', 'k')
-                ->andWhere('k.keyword IN (:tokens)')
-                ->setParameter('tokens', $tokens);
+                ->andWhere('LOWER(k.keyword) IN (:tokens)')
+                ->setParameter('tokens', array_map('mb_strtolower', $tokens));
         }
+
 
         $qb
             ->addSelect(
@@ -345,7 +341,12 @@ final class SupportSolutionRepository extends ServiceEntityRepository
             ->setFirstResult($offset)
             ->setMaxResults($limit);
 
-        return $qb->getQuery()->getResult();
+        $solutions = $qb->getQuery()->getResult();
+
+        return array_map(static fn(SupportSolution $s) => [
+            'solution' => $s,
+            'score' => 0,
+        ], $solutions);
     }
 
     /**

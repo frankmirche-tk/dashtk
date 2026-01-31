@@ -6,6 +6,8 @@ namespace App\Service;
 
 use App\Entity\SupportSolution;
 use App\Repository\SupportSolutionRepository;
+use Psr\Log\LoggerInterface;
+
 
 final class NewsletterResolver
 {
@@ -13,6 +15,7 @@ final class NewsletterResolver
 
     public function __construct(
         private readonly SupportSolutionRepository $solutions,
+        private readonly LoggerInterface $logger,
     ) {}
 
     /**
@@ -55,17 +58,26 @@ final class NewsletterResolver
 
         // "newsletter" ist ein Command, kein Keyword-Token (==> Sonderbehandlung)
         $tokens = $this->tokenize($message);
-        $tokens = array_values(array_filter($tokens, fn($t) => $t !== 'newsletter'));
 
-        // Case A: nur Newsletter-Listing im Zeitraum
+        // 1) newsletter als Command entfernen (vor Normalisierung + vor Query)
+        $tokens = array_values(array_filter($tokens, fn($t) => mb_strtolower((string)$t) !== 'newsletter'));
+
+        // 2) Normalisieren/expandieren (Singular/Plural etc.)
+        $tokens = $this->normalizeNewsletterTokens($tokens);
+
+        // Debug
+        $this->logger->info('newsletter.tokens', [
+            'tokens' => $tokens,
+            'from' => $from->format('Y-m-d'),
+            'to' => $to->format('Y-m-d'),
+        ]);
+
+        // 3) Case A / B
         if (count($tokens) === 0) {
-            $raw = $this->solutions->findNewslettersInRange($from, $to); // neue Repo-Methode (siehe unten)
+            $raw = $this->solutions->findNewslettersInRange($from, $to, 0, self::PAGE_SIZE);
         } else {
-            // Case B: z.B. "reduzierungen newsletter seit ..."
-            // strikt nur category=NEWSLETTER
-            $raw = $this->solutions->findNewsletterMatches($from, $to, $tokens);
+            $raw = $this->solutions->findNewsletterMatches($tokens, $from, $to, 0, self::PAGE_SIZE);
         }
-
 
         $mapped = [];
         foreach ($raw as $m) {
@@ -303,6 +315,38 @@ final class NewsletterResolver
         }
         return array_values(array_unique($out));
     }
+
+    private function normalizeNewsletterTokens(array $tokens): array
+    {
+        $out = [];
+
+        foreach ($tokens as $t) {
+            $t = mb_strtolower(trim((string)$t));
+            if ($t === '') continue;
+
+            // Stopwords raus (kannst du erweitern)
+            if (in_array($t, ['newsletter', 'seit', 'ab', 'in', 'im', 'der', 'die', 'das', 'und'], true)) {
+                continue;
+            }
+
+            $out[] = $t;
+
+            // ✅ Heuristik: -ung <-> -ungen (Reduzierung/Reduzierungen)
+            if (str_ends_with($t, 'ung')) {
+                $out[] = $t . 'en';          // reduzierungen
+            }
+            if (str_ends_with($t, 'ungen')) {
+                $out[] = mb_substr($t, 0, -2); // reduzierung  (ungen -> ung)
+            }
+
+            // Optional: Umlaut-Normalisierung (falls ihr gemischt speichert)
+            $out[] = str_replace(['ä','ö','ü','ß'], ['ae','oe','ue','ss'], $t);
+        }
+
+        $out = array_values(array_unique($out));
+        return $out;
+    }
+
 
 
 }
