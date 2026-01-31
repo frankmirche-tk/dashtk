@@ -471,6 +471,25 @@ final class SupportChatService
             'max' => self::MAX_HISTORY_MESSAGES,
         ]);
 
+
+        // DEV/Debug: prüfen, ob system prompt wirklich vorne steht (nur wenn isDev aktiv)
+        if ($this->isDev) {
+            $systemCount = 0;
+            $firstRole = $trimmedHistory[0]['role'] ?? null;
+            foreach ($trimmedHistory as $msg) {
+                if (($msg['role'] ?? null) === 'system') {
+                    $systemCount++;
+                }
+            }
+            $this->supportSolutionLogger->debug('prompt_debug', [
+                'firstRole' => $firstRole,
+                'systemCount' => $systemCount,
+                'firstSystemPreview' => ($firstRole === 'system')
+                    ? mb_substr((string)($trimmedHistory[0]['content'] ?? ''), 0, 180)
+                    : null,
+            ]);
+        }
+
         $this->supportSolutionLogger->info('chat_request', [
             'sessionId' => $sessionId,
             'message' => $message,
