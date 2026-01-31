@@ -426,20 +426,48 @@ final class SupportChatService
         /**
          * C) AI + DB (SOP guidance)
          */
-        $history = $this->span($trace, 'cache.history_load', fn() => $this->loadHistory($sessionId), [
-            'session_hash' => sha1($sessionId),
-        ]);
-
         $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
-            if ($history === []) {
-                $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
-                $history[] = [
-                    'role' => 'system',
-                    'content' => $tpl['system'],
-                ];
+            $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
+
+            // Optional: Datum rendern (damit Gemini Zeiträume korrekt interpretiert)
+            $today = (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d');
+            $expectedSystem = $this->promptLoader->render($tpl['system'], ['today' => $today]);
+
+            // Marker zur Prompt-Versionierung (in SYSTEM einfügen, z.B. in TKFashionPolicyPrompt.config)
+            $marker = 'PROMPT_ID: dashTk_assist_v2';
+
+            // 1) System-Message finden
+            $systemIndex = null;
+            foreach ($history as $i => $msg) {
+                if (($msg['role'] ?? null) === 'system') {
+                    $systemIndex = $i;
+                    break;
+                }
             }
+
+            // 2) Wenn keine System-Message existiert: vorne einfügen
+            if ($systemIndex === null) {
+                array_unshift($history, ['role' => 'system', 'content' => $expectedSystem]);
+                return $history;
+            }
+
+            // 3) Wenn alte/andere System-Message: ersetzen
+            $current = (string)($history[$systemIndex]['content'] ?? '');
+            if ($marker !== '' && stripos($current, $marker) === false) {
+                $history[$systemIndex]['content'] = $expectedSystem;
+            }
+
+            // 4) Sicherstellen: System steht ganz vorne
+            if ($systemIndex !== 0) {
+                $sys = $history[$systemIndex];
+                unset($history[$systemIndex]);
+                array_unshift($history, $sys);
+                $history = array_values($history);
+            }
+
             return $history;
         });
+
 
         $history[] = ['role' => 'user', 'content' => $message];
 
