@@ -48,6 +48,11 @@ services:
         arguments:
             $defaultModel: '%app.ai.gemini.default_model%'
         tags: [ 'app.ai_provider_factory' ]
+    App\AI\GeminiChatAdapter:
+        arguments:
+            $inner: '@App\AI\GeminiChatAdapterInner' # bei euch entsprechend
+            $logger: '@logger'
+            $includeVendorDetails: '%kernel.debug%'
 
     App\AI\OpenAiChatAdapterFactory:
         arguments:
@@ -57,10 +62,12 @@ services:
     App\AI\ChatAdapterRegistry:
         arguments:
             $factories: !tagged_iterator app.ai_provider_factory
+            $logger: '@monolog.logger.ai_chat'
 
     App\AI\AiChatGateway:
         arguments:
             $defaultProvider: '%app.ai.default_provider%'
+            $logger: '@monolog.logger.ai_chat'
 
     App\AI\Cost\AiCostCalculator:
         arguments:

@@ -10,6 +10,7 @@ use App\AI\Usage\AiUsageExtractor;
 use App\Tracing\TraceContext;
 use ModelflowAi\Chat\Request\AIChatMessageCollection;
 use ModelflowAi\Chat\Request\AIChatRequest;
+use Psr\Log\LoggerInterface;
 
 final readonly class AiChatGateway
 {
@@ -18,6 +19,19 @@ final readonly class AiChatGateway
         private string $defaultProvider,
         private AiCostTracker $aiCostTracker,
         private AiUsageExtractor $aiUsageExtractor,
+        private ?LoggerInterface $logger = null,
+
+        /**
+         * Schutz vor "History-Explosion".
+         * Empfehlung: 40–80 (je nach Systemprompt-Länge & Use-Case).
+         */
+        private int $maxMessages = 60,
+
+        /**
+         * Warnschwelle: ab welcher KB_CONTEXT Länge wir ein Warning loggen.
+         * (Nur Länge, kein Inhalt.)
+         */
+        private int $warnKbContextLen = 18_000,
     ) {}
 
     public function chat(
@@ -27,28 +41,63 @@ final readonly class AiChatGateway
         ?string $model = null,
         array $context = []
     ): string {
-        return TraceContext::span('gateway.ai_chat.chat', function () use ($history, $kbContext, $provider, $model, $context) {
+        $providerUsed = $this->normalizeProvider($provider ?: $this->defaultProvider);
+        $modelWanted  = $this->normalizeModel($model);
+        $usageKey     = $this->normalizeUsageKey((string) ($context['usage_key'] ?? 'unknown'));
 
-            $provider = $provider ? strtolower(trim($provider)) : $this->defaultProvider;
+        return TraceContext::span('gateway.ai_chat.chat', function () use ($history, $kbContext, $providerUsed, $modelWanted, $usageKey, $context) {
 
+            $kbContextLen = mb_strlen($kbContext);
             if ($kbContext !== '') {
                 $history[] = ['role' => 'system', 'content' => $kbContext];
             }
 
-            $adapter = TraceContext::span('registry.adapter.resolve', function () use ($provider, $model, $context) {
-                return $this->registry->create($provider, [
-                    'model' => $model,
+            // Normalize + limit
+            $history = $this->normalizeHistory($history);
+
+            $historyCountBeforeLimit = count($history);
+            if ($historyCountBeforeLimit > $this->maxMessages) {
+                $history = array_slice($history, -$this->maxMessages);
+            }
+
+            // Structured meta (ohne Inhalte)
+            $meta = [
+                'provider' => $providerUsed,
+                'model_wanted' => $modelWanted,
+                'usage_key' => $usageKey,
+                'history_count' => count($history),
+                'history_count_before_limit' => $historyCountBeforeLimit,
+                'max_messages' => $this->maxMessages,
+                'kb_context_len' => $kbContextLen,
+                'cache_hit' => (bool) ($context['cache_hit'] ?? false),
+                'roles' => $this->summarizeRoles($history),
+                'content_lens' => $this->summarizeContentLens($history),
+            ];
+
+            $this->logInfo('ai.gateway.request_built', $meta);
+
+            // Warnungen bei auffälligen Inputs (in PROD sichtbar, wenn Handler >= warning)
+            if ($historyCountBeforeLimit > $this->maxMessages) {
+                $this->logWarning('ai.gateway.history_truncated', $meta);
+            }
+            if ($kbContextLen >= $this->warnKbContextLen) {
+                $this->logWarning('ai.gateway.kb_context_very_large', $meta);
+            }
+
+            $adapter = TraceContext::span('registry.adapter.resolve', function () use ($providerUsed, $modelWanted, $context) {
+                return $this->registry->create($providerUsed, [
+                    'model' => $modelWanted !== 'unknown' ? $modelWanted : null,
                     'context' => $context,
                 ]);
             }, [
-                'provider' => $provider,
-                'model' => $model,
+                'provider' => $providerUsed,
+                'model' => $modelWanted !== 'unknown' ? $modelWanted : null,
             ]);
 
             $messages = TraceContext::span('gateway.messages.build_collection', function () use ($history) {
                 return $this->buildMessageCollection($history);
             }, [
-                'history_count' => is_array($history) ? count($history) : null,
+                'history_count' => count($history),
             ]);
 
             $request = TraceContext::span('gateway.request.make_ai_chat_request', function () use ($messages) {
@@ -66,17 +115,20 @@ final readonly class AiChatGateway
 
                 $latencyMs = (int) round((microtime(true) - $start) * 1000);
 
-                $usageKey = $this->normalizeUsageKey((string) ($context['usage_key'] ?? 'unknown'));
-                $modelUsed = $this->normalizeModel($model ?? (string) ($context['model_used'] ?? ''));
-
                 $usage = TraceContext::span('gateway.usage.extract', function () use ($response) {
                     return $this->aiUsageExtractor->extract($response);
                 });
 
-                TraceContext::span('gateway.cost.record_ok', function () use ($usageKey, $provider, $modelUsed, $usage, $latencyMs, $context) {
+                // model_used -> context > wanted > unknown
+                $modelUsed = $this->normalizeModel((string) ($context['model_used'] ?? ''));
+                if ($modelUsed === 'unknown' && $modelWanted !== 'unknown') {
+                    $modelUsed = $modelWanted;
+                }
+
+                TraceContext::span('gateway.cost.record_ok', function () use ($usageKey, $providerUsed, $modelUsed, $usage, $latencyMs, $context) {
                     $this->aiCostTracker->record(
                         usageKey: $usageKey,
-                        provider: $provider,
+                        provider: $providerUsed,
                         model: $modelUsed,
                         usage: $usage,
                         latencyMs: $latencyMs,
@@ -87,26 +139,48 @@ final readonly class AiChatGateway
                     return null;
                 }, [
                     'usage_key' => $usageKey,
-                    'provider' => $provider,
+                    'provider' => $providerUsed,
                     'model' => $modelUsed,
                     'latency_ms' => $latencyMs,
                     'cache_hit' => (bool) ($context['cache_hit'] ?? false),
                 ]);
 
-                return TraceContext::span('gateway.response.extract_text', function () use ($response) {
+                $text = TraceContext::span('gateway.response.extract_text', function () use ($response) {
                     return $this->extractResponseText($response->getMessage());
                 });
+
+                // Leere/Platzhalter-Antwort -> warning
+                if (trim($text) === '' || $text === '[leere Antwort]' || $text === '[unlesbare Antwort]') {
+                    $this->logWarning('ai.gateway.suspicious_empty_response', [
+                        'provider' => $providerUsed,
+                        'model' => $modelUsed,
+                        'usage_key' => $usageKey,
+                        'latency_ms' => $latencyMs,
+                    ]);
+                } else {
+                    $this->logInfo('ai.gateway.ok', [
+                        'provider' => $providerUsed,
+                        'model' => $modelUsed,
+                        'usage_key' => $usageKey,
+                        'latency_ms' => $latencyMs,
+                        'cache_hit' => (bool) ($context['cache_hit'] ?? false),
+                    ]);
+                }
+
+                return $text;
 
             } catch (\Throwable $e) {
                 $latencyMs = (int) round((microtime(true) - $start) * 1000);
 
-                $usageKey = $this->normalizeUsageKey((string) ($context['usage_key'] ?? 'unknown'));
-                $modelUsed = $this->normalizeModel($model ?? (string) ($context['model_used'] ?? ''));
+                $modelUsed = $this->normalizeModel((string) ($context['model_used'] ?? ''));
+                if ($modelUsed === 'unknown' && $modelWanted !== 'unknown') {
+                    $modelUsed = $modelWanted;
+                }
 
-                TraceContext::span('gateway.cost.record_error', function () use ($usageKey, $provider, $modelUsed, $latencyMs, $e, $context) {
+                TraceContext::span('gateway.cost.record_error', function () use ($usageKey, $providerUsed, $modelUsed, $latencyMs, $e, $context) {
                     $this->aiCostTracker->record(
                         usageKey: $usageKey,
-                        provider: $provider,
+                        provider: $providerUsed,
                         model: $modelUsed,
                         usage: new AiUsage(null, null, null),
                         latencyMs: $latencyMs,
@@ -117,19 +191,59 @@ final readonly class AiChatGateway
                     return null;
                 }, [
                     'usage_key' => $usageKey,
-                    'provider' => $provider,
+                    'provider' => $providerUsed,
                     'model' => $modelUsed,
                     'latency_ms' => $latencyMs,
                     'error' => $e::class,
+                ]);
+
+                $this->logError('ai.gateway.error', [
+                    'provider' => $providerUsed,
+                    'model' => $modelUsed,
+                    'usage_key' => $usageKey,
+                    'latency_ms' => $latencyMs,
+                    'cache_hit' => (bool) ($context['cache_hit'] ?? false),
+                    'error_class' => $e::class,
+                    'error_code' => $this->normalizeErrorCode($e),
+                    'error_snippet' => $this->makeSafeShortDetail($e->getMessage()),
+                    'history_count' => count($history),
+                    'kb_context_len' => $kbContextLen,
                 ]);
 
                 throw $e;
             }
 
         }, [
-            'provider' => $provider ? strtolower(trim($provider)) : $this->defaultProvider,
-            'model' => $model,
+            'provider' => $providerUsed,
+            'model' => $modelWanted !== 'unknown' ? $modelWanted : null,
         ]);
+    }
+
+    private function normalizeHistory(array $history): array
+    {
+        $out = [];
+
+        foreach ($history as $m) {
+            if (!is_array($m)) {
+                continue;
+            }
+
+            $role = strtolower(trim((string) ($m['role'] ?? 'user')));
+            $content = (string) ($m['content'] ?? '');
+
+            if (!in_array($role, ['system', 'user', 'assistant'], true)) {
+                $role = 'user';
+            }
+
+            $content = trim($content);
+            if ($content === '') {
+                continue;
+            }
+
+            $out[] = ['role' => $role, 'content' => $content];
+        }
+
+        return $out;
     }
 
     private function buildMessageCollection(array $history): AIChatMessageCollection
@@ -156,7 +270,7 @@ final readonly class AiChatGateway
         $roleEnumClass = 'ModelflowAi\\Chat\\Request\\Message\\AIChatMessageRoleEnum';
 
         if (!class_exists($msgClass) || !class_exists($roleEnumClass)) {
-            return [
+            return (object) [
                 'role' => $role,
                 'content' => $content,
             ];
@@ -254,6 +368,12 @@ final readonly class AiChatGateway
         return $model !== '' ? $model : 'unknown';
     }
 
+    private function normalizeProvider(string $provider): string
+    {
+        $p = strtolower(trim($provider));
+        return $p !== '' ? $p : 'unknown';
+    }
+
     private function normalizeErrorCode(\Throwable $e): string
     {
         $code = $e->getCode();
@@ -265,5 +385,61 @@ final readonly class AiChatGateway
         }
 
         return $e::class;
+    }
+
+    private function summarizeRoles(array $history): array
+    {
+        $roles = [];
+        foreach ($history as $m) {
+            $roles[] = (string) ($m['role'] ?? 'unknown');
+        }
+        return $roles;
+    }
+
+    private function summarizeContentLens(array $history): array
+    {
+        $lens = [];
+        foreach ($history as $m) {
+            $c = (string) ($m['content'] ?? '');
+            $lens[] = $c !== '' ? mb_strlen($c) : 0;
+        }
+        return $lens;
+    }
+
+    private function makeSafeShortDetail(string $raw): string
+    {
+        $detail = trim($raw);
+        if ($detail === '') {
+            return '';
+        }
+
+        $detail = preg_replace('/\s+/', ' ', $detail) ?? $detail;
+
+        if (mb_strlen($detail) > 260) {
+            $detail = mb_substr($detail, 0, 260) . '…';
+        }
+
+        return $detail;
+    }
+
+    private function logInfo(string $event, array $context): void
+    {
+        if ($this->logger) {
+            $this->logger->info($event, $context);
+        }
+    }
+
+    private function logWarning(string $event, array $context): void
+    {
+        if ($this->logger) {
+            $this->logger->warning($event, $context);
+        }
+    }
+
+    private function logError(string $event, array $context): void
+    {
+        if ($this->logger) {
+            $this->logger->error($event, $context);
+        }
     }
 }

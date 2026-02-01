@@ -6,6 +6,7 @@ namespace App\AI;
 
 use App\Tracing\TraceContext;
 use ModelflowAi\Chat\Adapter\AIChatAdapterInterface;
+use Psr\Log\LoggerInterface;
 
 final class ChatAdapterRegistry
 {
@@ -14,8 +15,10 @@ final class ChatAdapterRegistry
      */
     private array $factories;
 
-    public function __construct(iterable $factories)
-    {
+    public function __construct(
+        iterable $factories,
+        private ?LoggerInterface $logger = null,
+    ) {
         $this->factories = is_array($factories) ? $factories : iterator_to_array($factories);
     }
 
@@ -48,8 +51,30 @@ final class ChatAdapterRegistry
                         'adapter_class' => is_object($adapter) ? $adapter::class : gettype($adapter),
                     ]);
 
+                    if ($this->logger) {
+                        $this->logger->info('ai.registry.adapter_created', [
+                            'provider' => $provider,
+                            'model' => $model,
+                            'factory_class' => is_object($factory) ? $factory::class : gettype($factory),
+                            'adapter_class' => is_object($adapter) ? $adapter::class : gettype($adapter),
+                            'factories_total' => count($this->factories),
+                        ]);
+                    }
+
                     return $adapter;
                 }
+            }
+
+            if ($this->logger) {
+                $this->logger->error('ai.registry.unsupported_provider', [
+                    'provider' => $provider,
+                    'model' => $model,
+                    'factories_total' => count($this->factories),
+                    'factory_classes' => array_map(
+                        static fn ($f) => is_object($f) ? $f::class : gettype($f),
+                        $this->factories
+                    ),
+                ]);
             }
 
             throw new \InvalidArgumentException(sprintf('Unsupported AI provider "%s"', $provider));

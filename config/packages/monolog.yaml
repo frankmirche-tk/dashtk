@@ -3,6 +3,7 @@ monolog:
         - deprecation
         - support_solution
         - contact_lookup
+        - ai_chat
 
 when@dev:
     monolog:
@@ -29,6 +30,12 @@ when@dev:
                 path: "%kernel.logs_dir%/contact_lookup.%kernel.environment%.log"
                 level: debug
                 channels: [ "contact_lookup" ]
+
+            ai_chat:
+                type: stream
+                path: "%kernel.logs_dir%/ai_chat.%kernel.environment%.log"
+                level: debug
+                channels: [ "ai_chat" ]
 
 when@test:
     monolog:
@@ -84,3 +91,10 @@ when@prod:
                 path: "%kernel.logs_dir%/contact_lookup.%kernel.environment%.log"
                 level: info
                 channels: [ "contact_lookup" ]
+
+            ai_chat:
+                type: stream
+                path: php://stderr
+                level: warning
+                formatter: monolog.formatter.json
+                channels: [ "ai_chat" ]
