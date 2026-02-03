@@ -18,7 +18,7 @@ use Symfony\Contracts\Cache\ItemInterface;
 /**
  * Central chat orchestration service.
  *
- * Responsibilities
+ * Responsibilities:
  * - Maintain chat session history (cache)
  * - Execute local resolvers first (ContactResolver, FormResolver)
  * - Execute KB/DB match for SOP + FORM (SupportSolutionRepository)
@@ -26,6 +26,108 @@ use Symfony\Contracts\Cache\ItemInterface;
  * - Provide "choices" for numeric selection UX (user replies "1", "2", "3")
  *
  * Newsletter-Create (Analyze/Patch/Confirm) wurde ausgelagert in NewsletterCreateResolver.
+ *
+ * --------------------
+ * Shared Types (PHPStan/Psalm)
+ * --------------------
+ *
+ * @phpstan-type ChatRole 'system'|'user'|'assistant'
+ * @phpstan-type ChatMessage array{role: ChatRole, content: string}
+ *
+ * @phpstan-type SupportMatch array{
+ *   id: int,
+ *   title: string,
+ *   score: int,
+ *   url: string,
+ *   type: string,
+ *   updatedAt: string,
+ *   symptoms: string,
+ *   category: string,
+ *   newsletterYear?: int|string|null,
+ *   newsletterKw?: int|string|null,
+ *   newsletterEdition?: string|null,
+ *   publishedAt?: string|null,
+ *   stepsUrl?: string,
+ *   mediaType?: string|null,
+ *   externalMediaProvider?: string|null,
+ *   externalMediaUrl?: string|null,
+ *   externalMediaId?: string|null
+ * }
+ *
+ * @phpstan-type ChoiceKind 'form'|'sop'|'contact'
+ * @phpstan-type ChoiceItem array{kind: ChoiceKind, label: string, payload: array<string,mixed>}
+ *
+ * @phpstan-type AskResponse array{
+ *   answer: string,
+ *   matches: list<SupportMatch>,
+ *   choices: list<ChoiceItem>,
+ *   modeHint: string,
+ *   contact?: array<string,mixed>,
+ *   selected?: ChoiceItem,
+ *   formCard?: array{title:string, updatedAt:string, url:string, provider:string, symptoms:string},
+ *   newsletterPaging?: array<string,mixed>,
+ *   tts?: string,
+ *   mediaUrl?: string,
+ *   steps?: list<array<string,mixed>>
+ * }
+ *
+ * @phpstan-type PromptPreview array{
+ *   provider: string,
+ *   model: string|null,
+ *   history: list<ChatMessage>,
+ *   history_count: int,
+ *   kbContext: string,
+ *   kb_context_chars: int,
+ *   matchCount: int,
+ *   matchIds: list<int>
+ * }
+ *
+ * @psalm-type ChatRole = 'system'|'user'|'assistant'
+ * @psalm-type ChatMessage = array{role: ChatRole, content: string}
+ * @psalm-type SupportMatch = array{
+ *   id: int,
+ *   title: string,
+ *   score: int,
+ *   url: string,
+ *   type: string,
+ *   updatedAt: string,
+ *   symptoms: string,
+ *   category: string,
+ *   newsletterYear?: int|string|null,
+ *   newsletterKw?: int|string|null,
+ *   newsletterEdition?: string|null,
+ *   publishedAt?: string|null,
+ *   stepsUrl?: string,
+ *   mediaType?: string|null,
+ *   externalMediaProvider?: string|null,
+ *   externalMediaUrl?: string|null,
+ *   externalMediaId?: string|null
+ * }
+ * @psalm-type ChoiceKind = 'form'|'sop'|'contact'
+ * @psalm-type ChoiceItem = array{kind: ChoiceKind, label: string, payload: array<string,mixed>}
+ * @psalm-type AskResponse = array{
+ *   answer: string,
+ *   matches: list<SupportMatch>,
+ *   choices: list<ChoiceItem>,
+ *   modeHint: string,
+ *   contact?: array<string,mixed>,
+ *   selected?: ChoiceItem,
+ *   formCard?: array{title:string, updatedAt:string, url:string, provider:string, symptoms:string},
+ *   newsletterPaging?: array<string,mixed>,
+ *   tts?: string,
+ *   mediaUrl?: string,
+ *   steps?: list<array<string,mixed>>
+ * }
+ * @psalm-type PromptPreview = array{
+ *   provider: string,
+ *   model: string|null,
+ *   history: list<ChatMessage>,
+ *   history_count: int,
+ *   kbContext: string,
+ *   kb_context_chars: int,
+ *   matchCount: int,
+ *   matchIds: list<int>
+ * }
  */
 final class SupportChatService
 {
@@ -39,6 +141,20 @@ final class SupportChatService
 
     private readonly bool $isDev;
 
+    /**
+     * @param AiChatGateway $aiChat Gateway/Adapter für Provider-spezifische Chats (OpenAI, Gemini, ...)
+     * @param SupportSolutionRepository $solutions Repository für SOP/FORM Matches
+     * @param CacheInterface $cache Cache für Session-History und Choice-State
+     * @param LoggerInterface $supportSolutionLogger Logger für Chat/Modes/Forensics
+     * @param UsageTracker $usageTracker Usage/Quota Tracking
+     * @param ContactResolver $contactResolver Local-only Resolver für Kontakt/Filialdaten
+     * @param FormResolver $formResolver Resolver für Formular-intent + Preview-URL
+     * @param PromptTemplateLoader $promptLoader Loader/Renderer für Prompt-Templates inkl. Includes
+     * @param NewsletterResolver $newsletterResolver Resolver für Newsletter-Suche (Query)
+     * @param NewsletterCreateResolver $newsletterCreateResolver Create-Flow (Analyze/Patch/Confirm)
+     * @param FormCreateResolver $documentCreateResolver Document/Create-Flow (Analyze/Patch/Confirm)
+     * @param KernelInterface $kernel Für Environment-Flag (dev/prod)
+     */
     public function __construct(
         private readonly AiChatGateway             $aiChat,
         private readonly SupportSolutionRepository $solutions,
@@ -59,18 +175,21 @@ final class SupportChatService
         private readonly FormCreateResolver        $documentCreateResolver,
 
         KernelInterface                            $kernel,
-    )
-    {
+    ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
     }
 
     /**
      * Convenience trace wrapper to measure sub-operations.
      *
-     * @param Trace|null $trace
-     * @param string $name
-     * @param callable():mixed $fn
-     * @param array<string,mixed> $meta
+     * @template T
+     *
+     * @param Trace|null $trace Optional distributed trace for performance profiling
+     * @param string $name Span name
+     * @param callable():T $fn Callable to execute within span
+     * @param array<string,mixed> $meta Metadata attached to the span
+     *
+     * @return T
      */
     private function span(?Trace $trace, string $name, callable $fn, array $meta = []): mixed
     {
@@ -80,6 +199,32 @@ final class SupportChatService
         return $fn();
     }
 
+    /**
+     * Haupt-Einstieg: Orchestriert den Chat.
+     *
+     * Ablauf (grob):
+     * 1) Numeric Selection auf gespeicherte Choices ("1", "2", ...)
+     * 2) Optional DB-only SOP (expliziter UI-Click)
+     * 3) Local Contact Resolver (privacy: local_only)
+     * 4) Newsletter Resolver + Pending Range Handling
+     * 5) KB match (SOP/FORM), Form-Keyword Mode (Choice-Liste)
+     * 6) AI Fallback/Guidance mit trimHistory + KB_CONTEXT
+     *
+     * @param string $sessionId Session-ID aus Frontend; wenn leer, wird eine Fallback-ID generiert
+     * @param string $message User message
+     * @param int|null $dbOnlySolutionId Optional: SOP ID für reinen DB-Antwortmodus
+     * @param string $provider Provider-Name (typisch: "gemini"|"openai")
+     * @param string|null $model Optional: Model-Override; sonst Default aus ENV/Server
+     * @param array<string,mixed> $context Optional: Kontext (usage_key, debug_mode, cache_hit ...)
+     * @param Trace|null $trace Optional: Tracing (Performance, Debug)
+     *
+     * @return array Antwort-Payload für API/Frontend
+     *
+     * @phpstan-return AskResponse
+     * @psalm-return AskResponse
+     *
+     * @throws \Throwable Falls ein unerwarteter Fehler in Resolvern/Cache/DB auftritt (AI wird intern abgefangen)
+     */
     #[TrackUsage(self::USAGE_KEY_ASK, weight: 5)]
     public function ask(
         string  $sessionId,
@@ -89,8 +234,7 @@ final class SupportChatService
         ?string $model = null,
         array   $context = [],
         ?Trace  $trace = null
-    ): array
-    {
+    ): array {
         $sessionId = trim($sessionId);
         $message = trim($message);
         $provider = strtolower(trim($provider));
@@ -123,6 +267,7 @@ final class SupportChatService
         // 0) Numeric selection ("1", "2", "3")
         $selection = $this->span($trace, 'choice.try_resolve', fn() => $this->resolveNumericSelection($sessionId, $message));
         if (is_array($selection)) {
+            /** @var AskResponse $selection */
             return $selection;
         }
 
@@ -138,6 +283,7 @@ final class SupportChatService
                 'stepsCount' => isset($result['steps']) && is_array($result['steps']) ? count($result['steps']) : 0,
             ]);
 
+            /** @var AskResponse $result */
             return $result;
         }
 
@@ -234,7 +380,9 @@ final class SupportChatService
             });
 
             if (!empty($payload['choices'])) {
-                $this->storeChoices($sessionId, $payload['choices']);
+                /** @var list<ChoiceItem> $choices */
+                $choices = is_array($payload['choices']) ? $payload['choices'] : [];
+                $this->storeChoices($sessionId, $choices);
             }
 
             return [
@@ -285,9 +433,12 @@ final class SupportChatService
                 ]);
 
                 if (!empty($nlPayload['choices']) && is_array($nlPayload['choices'])) {
-                    $this->storeChoices($sessionId, $nlPayload['choices']);
+                    /** @var list<ChoiceItem> $choices */
+                    $choices = $nlPayload['choices'];
+                    $this->storeChoices($sessionId, $choices);
                 }
 
+                /** @var AskResponse $nlPayload */
                 return $nlPayload;
             }
 
@@ -328,26 +479,33 @@ final class SupportChatService
             ]);
 
             if (!empty($nlPayload['choices']) && is_array($nlPayload['choices'])) {
-                $this->storeChoices($sessionId, $nlPayload['choices']);
+                /** @var list<ChoiceItem> $choices */
+                $choices = $nlPayload['choices'];
+                $this->storeChoices($sessionId, $choices);
             }
 
+            /** @var AskResponse $nlPayload */
             return $nlPayload;
         }
 
         /**
          * B1) KB match (DB) – yields SOP and FORM.
          */
+        /** @var list<SupportMatch> $matches */
         $matches = $this->span($trace, 'kb.match', fn() => $this->findMatches($message), [
             'query_len' => mb_strlen($message),
         ]);
 
         $matches = $this->dedupeMatchesById($matches);
 
+        /** @var list<SupportMatch> $forms */
         $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
+        /** @var list<SupportMatch> $sops */
         $sops = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
 
         $sops = $this->filterSopsDuplicatingFormTitles($sops, $forms);
 
+        /** @var list<ChoiceItem> $formChoices */
         $formChoices = [];
         if ($forms !== []) {
             $i = 1;
@@ -426,6 +584,7 @@ final class SupportChatService
         /**
          * C) AI + DB (SOP guidance)
          */
+        /** @var list<ChatMessage> $history */
         $history = $this->span($trace, 'cache.history_load', fn() => $this->loadHistory($sessionId), [
             'session_hash' => sha1($sessionId),
         ]);
@@ -433,14 +592,11 @@ final class SupportChatService
         $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
             $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
 
-            // Optional: Datum rendern (damit Gemini Zeiträume korrekt interpretiert)
             $today = (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d');
             $expectedSystem = $this->promptLoader->render($tpl['system'], ['today' => $today]);
 
-            // Marker zur Prompt-Versionierung (in SYSTEM einfügen, z.B. in TKFashionPolicyPrompt.config)
             $marker = 'PROMPT_ID: dashTk_assist_v2';
 
-            // 1) System-Message finden
             $systemIndex = null;
             foreach ($history as $i => $msg) {
                 if (($msg['role'] ?? null) === 'system') {
@@ -449,19 +605,16 @@ final class SupportChatService
                 }
             }
 
-            // 2) Wenn keine System-Message existiert: vorne einfügen
             if ($systemIndex === null) {
                 array_unshift($history, ['role' => 'system', 'content' => $expectedSystem]);
                 return $history;
             }
 
-            // 3) Wenn alte/andere System-Message: ersetzen
             $current = (string)($history[$systemIndex]['content'] ?? '');
             if ($marker !== '' && stripos($current, $marker) === false) {
                 $history[$systemIndex]['content'] = $expectedSystem;
             }
 
-            // 4) Sicherstellen: System steht ganz vorne
             if ($systemIndex !== 0) {
                 $sys = $history[$systemIndex];
                 unset($history[$systemIndex]);
@@ -472,26 +625,19 @@ final class SupportChatService
             return $history;
         });
 
-
         $history[] = ['role' => 'user', 'content' => $message];
 
         $kbContext = $this->span($trace, 'kb.build_context', fn() => $this->buildKbContext($matches), [
             'match_count' => count($matches),
         ]);
 
-        // -----------------------------------------------------------------
-        // DEV A/B toggles (only in dev, controlled via $context['debug_mode'])
-        // debug_mode:
-        // - "no_kb"          => send empty kbContext
-        // - "fresh_history"  => keep only system + current user message
-        // -----------------------------------------------------------------
+        // DEV toggles
         if ($this->isDev && isset($context['debug_mode']) && is_string($context['debug_mode'])) {
             if ($context['debug_mode'] === 'no_kb') {
                 $kbContext = "KB_CONTEXT: none\n";
             }
         }
 
-        // Wenn Form-Choices aus UI vorhanden sind, dem Modell explizit mitgeben
         if ($formChoices !== []) {
             $kbContext .= "\nFORM_CHOICES_UI:\n";
             foreach ($formChoices as $c) {
@@ -501,7 +647,6 @@ final class SupportChatService
             }
             $kbContext .= "ANWEISUNG: Wenn FORM_CHOICES_UI nicht leer ist, behaupte niemals \"kein Zugriff\" und biete Auswahl per Nummer an.\n";
         }
-
 
         $context = $this->span($trace, 'ai.context_defaults', function () use ($context) {
             $context['usage_key'] ??= self::USAGE_KEY_ASK;
@@ -522,13 +667,13 @@ final class SupportChatService
             return $model;
         }, ['provider' => $provider]);
 
+        /** @var list<ChatMessage> $trimmedHistory */
         $trimmedHistory = $this->span($trace, 'history.trim', fn() => $this->trimHistory($history), [
             'history_count_in' => count($history),
             'max' => self::MAX_HISTORY_MESSAGES,
         ]);
 
         if ($this->isDev && isset($context['debug_mode']) && $context['debug_mode'] === 'fresh_history') {
-            // keep system (if exists) + current user message only
             $sys = null;
             foreach ($trimmedHistory as $m) {
                 if (($m['role'] ?? null) === 'system') { $sys = $m; break; }
@@ -538,8 +683,6 @@ final class SupportChatService
             $trimmedHistory[] = ['role' => 'user', 'content' => $message];
         }
 
-
-        // DEV/Debug: prüfen, ob system prompt wirklich vorne steht (nur wenn isDev aktiv)
         if ($this->isDev) {
             $systemCount = 0;
             $firstRole = $trimmedHistory[0]['role'] ?? null;
@@ -567,9 +710,7 @@ final class SupportChatService
             'model' => $model,
             'usageKey' => $context['usage_key'] ?? self::USAGE_KEY_ASK,
         ]);
-        // -----------------------------------------------------------------
-// DEV Forensics: Prompt / Context Fingerprint (safe, no PII leakage)
-// -----------------------------------------------------------------
+
         if ($this->isDev) {
             $sys = '';
             foreach ($trimmedHistory as $msg) {
@@ -616,7 +757,6 @@ final class SupportChatService
                 'suspicious_hits' => $hits,
             ]);
 
-            // Optional: redacted previews (short)
             $redact = static function (string $s): string {
                 $s = preg_replace('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', '[EMAIL]', $s) ?? $s;
                 $s = preg_replace('/\+?\d[\d\s().-]{7,}\d/', '[PHONE]', $s) ?? $s;
@@ -630,6 +770,11 @@ final class SupportChatService
             ]);
         }
 
+        // --- Context anreichern: wichtig für Provider-Routing & Debug ---
+        $context ??= [];
+        $context['usage_key']  = $context['usage_key'] ?? 'support_chat.ask';
+        $context['mode_hint']  = $context['mode_hint'] ?? 'ai_with_db';
+        $context['kb_matches'] = $context['kb_matches'] ?? ($mappedMatches ?? []);
 
         try {
             $answer = $this->span($trace, 'ai.call', function () use ($trimmedHistory, $kbContext, $provider, $model, $context) {
@@ -647,6 +792,7 @@ final class SupportChatService
                 'kb_chars' => strlen($kbContext),
             ]);
         } catch (\Throwable $e) {
+
             $this->supportSolutionLogger->error('chat_execute_failed', [
                 'sessionId' => $sessionId,
                 'message' => $message,
@@ -720,6 +866,8 @@ final class SupportChatService
     /**
      * POST /api/chat/newsletter/analyze
      * => kompletter Create-Flow ist im NewsletterCreateResolver.
+     *
+     * @return array<string,mixed> Resolver-Antwort (analyze payload)
      */
     public function newsletterAnalyze(
         string        $sessionId,
@@ -729,8 +877,7 @@ final class SupportChatService
         string        $provider,
         ?string       $model,
         ?Trace        $trace = null
-    ): array
-    {
+    ): array {
         return $this->newsletterCreateResolver->analyze(
             sessionId: $sessionId,
             message: $message,
@@ -743,6 +890,8 @@ final class SupportChatService
 
     /**
      * POST /api/chat/newsletter/patch
+     *
+     * @return array<string,mixed> Resolver-Antwort (patch payload)
      */
     public function newsletterPatch(
         string  $sessionId,
@@ -751,8 +900,7 @@ final class SupportChatService
         string  $provider,
         ?string $model,
         ?Trace  $trace = null
-    ): array
-    {
+    ): array {
         return $this->newsletterCreateResolver->patch(
             sessionId: $sessionId,
             draftId: $draftId,
@@ -762,13 +910,14 @@ final class SupportChatService
 
     /**
      * POST /api/chat/newsletter/confirm
+     *
+     * @return array<string,mixed> Resolver-Antwort (confirm payload)
      */
     public function newsletterConfirm(
         string $sessionId,
         string $draftId,
         ?Trace $trace = null
-    ): array
-    {
+    ): array {
         return $this->newsletterCreateResolver->confirm(
             sessionId: $sessionId,
             draftId: $draftId
@@ -779,6 +928,14 @@ final class SupportChatService
     // DB-only SOP
     // ---------------------------------------------------------------------
 
+    /**
+     * DB-only SOP Antwort (ohne AI).
+     *
+     * @param string $sessionId Session-ID (für Konsistenz; wird aktuell nicht zwingend verwendet)
+     * @param int $solutionId SupportSolution ID
+     *
+     * @return array<string,mixed> SOP Antwort inkl. Steps-Payload
+     */
     private function answerDbOnly(string $sessionId, int $solutionId): array
     {
         $solution = $this->solutions->find($solutionId);
@@ -840,17 +997,34 @@ final class SupportChatService
      * Public wrapper for CLI/debug tools (e.g. app:chat:prompt-preview).
      * Keeps internal matching implementation encapsulated (findMatches stays private).
      *
-     * @return array<int, array<string, mixed>>
+     * @param string $message User query
+     *
+     * @return array<int, array<string, mixed>> Trefferliste (gemappt)
+     *
+     * @phpstan-return list<SupportMatch>
+     * @psalm-return list<SupportMatch>
      */
     public function matchSolutions(string $message): array
     {
-        return $this->findMatches($message);
+        /** @var list<SupportMatch> $matches */
+        $matches = $this->findMatches($message);
+        return $matches;
     }
 
     // ---------------------------------------------------------------------
     // KB match / mapping
     // ---------------------------------------------------------------------
 
+    /**
+     * Finds best matching solutions from repository and maps them to a lightweight array shape.
+     *
+     * @param string $message User query
+     *
+     * @return array<int, array<string,mixed>>
+     *
+     * @phpstan-return list<SupportMatch>
+     * @psalm-return list<SupportMatch>
+     */
     private function findMatches(string $message): array
     {
         $message = trim($message);
@@ -878,6 +1052,17 @@ final class SupportChatService
         return $mapped;
     }
 
+    /**
+     * Maps SupportSolution entity to match payload consumed by UI/AI context builder.
+     *
+     * @param SupportSolution $solution Entity
+     * @param int $score Relevance score from repository match
+     *
+     * @return array<string,mixed>
+     *
+     * @phpstan-return SupportMatch
+     * @psalm-return SupportMatch
+     */
     private function mapMatch(SupportSolution $solution, int $score): array
     {
         $id = (int)$solution->getId();
@@ -894,8 +1079,7 @@ final class SupportChatService
             'type' => $type,
             'updatedAt' => $updatedAt,
             'symptoms' => (string)($solution->getSymptoms() ?? ''),
-            'category' => (string)($solution->getCategory() ?? ''), // ✅ NEU
-            // Newsletter-Metadaten (für Trefferliste "seit Datum")
+            'category' => (string)($solution->getCategory() ?? ''),
             'newsletterYear' => method_exists($solution, 'getNewsletterYear') ? $solution->getNewsletterYear() : null,
             'newsletterKw' => method_exists($solution, 'getNewsletterKw') ? $solution->getNewsletterKw() : null,
             'newsletterEdition' => method_exists($solution, 'getNewsletterEdition') ? $solution->getNewsletterEdition() : null,
@@ -919,11 +1103,23 @@ final class SupportChatService
             ];
     }
 
-
-
+    /**
+     * Builds a compact KB (Knowledge Base) context block for the AI model.
+     *
+     * Ziel:
+     * - SOP/Other (technisch/operativ) soll im Kontext zuerst stehen.
+     * - Newsletter sind reine Info (zeitlich filterbar), aber ohne Priorität gegenüber SOP.
+     * - Forms sind Keyword-Ja/Nein (Auswahl/Nummern anbieten, falls vorhanden).
+     *
+     * @param array<int, array<string,mixed>> $matches Mapped matches (SupportMatch shape)
+     *
+     * @return string KB context text (empty string if no matches)
+     *
+     * @phpstan-param list<SupportMatch> $matches
+     * @psalm-param list<SupportMatch> $matches
+     */
     private function buildKbContext(array $matches): string
     {
-        // Bei 0 Treffern: NICHTS an das Modell senden (stabiler für Gemini)
         if ($matches === []) {
             return '';
         }
@@ -933,67 +1129,90 @@ final class SupportChatService
             return '';
         }
 
-        // Newsletter erkennen: über newsletterYear/publishedAt oder Kategorie/Title oder Type
         $newsletters = [];
         $forms = [];
         $others = [];
-
-        // Optional: wenn ihr Newsletter zusätzlich auch unter FORM_MATCHES sehen wollt
-        // (normalerweise false lassen, damit der Bot nicht "Form" mit "Newsletter" vermischt)
-        $alsoListNewsletterUnderForms = false;
 
         foreach ($items as $m) {
             $type = (string)($m['type'] ?? '');
             $cat  = mb_strtolower((string)($m['category'] ?? ''));
             $ttl  = mb_strtolower((string)($m['title'] ?? ''));
 
-            $isNl = ($type === 'NEWSLETTER')
-                || !empty($m['newsletterYear'])
-                || !empty($m['publishedAt'])
-                || str_contains($cat, 'newsletter')
+            // 1) Newsletter: ausschließlich über category / Newsletter-Felder (NICHT über $type!)
+            // Unterstützt sowohl snake_case als auch camelCase Keys.
+            $nlYear    = (string)($m['newsletter_year'] ?? $m['newsletterYear'] ?? '');
+            $nlKw      = (string)($m['newsletter_kw'] ?? $m['newsletterKw'] ?? '');
+            $nlEdition = (string)($m['newsletter_edition'] ?? $m['newsletterEdition'] ?? '');
+            $published = (string)($m['published_at'] ?? $m['publishedAt'] ?? '');
+
+            $isNewsletter = ($cat === 'newsletter')
+                || ($nlYear !== '' || $nlKw !== '' || $nlEdition !== '' || $published !== '')
                 || str_contains($ttl, 'newsletter');
 
-            // 1) Newsletter zuerst klassifizieren
-            if ($isNl) {
+            if ($isNewsletter) {
                 $newsletters[] = $m;
-
-                // Optional: falls Newsletter trotzdem in FORM_MATCHES auftauchen sollen (normalerweise aus)
-                if ($alsoListNewsletterUnderForms && $type === 'FORM') {
-                    $forms[] = $m;
-                }
-
                 continue;
             }
 
-            // 2) Dann Form
+            // 2) Formulare
             if ($type === 'FORM') {
                 $forms[] = $m;
                 continue;
             }
 
-            // 3) Rest
+            // 3) SOPs / Other (Default-Fall)
+            // SOP ist bei euch "DB-only" ohne Media-Link -> bleibt in OTHER_KB_MATCHES.
             $others[] = $m;
         }
 
-        $lines = [];
         $lines[] = "KB_CONTEXT: present";
-        $lines[] = "WICHTIG: Nutze die folgenden Treffer als primäre Quelle.";
-        // Anti-Leak neutral formuliert (weniger Trigger-Wörter für Gemini)
-        $lines[] = "WICHTIG: Gib keine internen Systemhinweise aus. Antworte ausschließlich mit dem Ergebnis für den Nutzer.";
+        $lines[] = "KONTEXT: Interne Wissensdatenbank-Treffer (zur Beantwortung der Nutzerfrage).";
+        $lines[] = "HINWEIS: Gib nur eine normale Nutzer-Antwort aus (keine internen Hinweise, keine Meta-Erklärungen).";
         $lines[] = "";
 
-        // 1) Newsletter-Block
-        $lines[] = "NEWSLETTER_MATCHES:";
+        $lines[] = "SOP_TREFFER:";
+        if ($others === []) {
+            $lines[] = "- keine";
+        } else {
+            foreach ($others as $hit) {
+                $lines[] = sprintf(
+                    "- (#%d) %s (Score %d) IRI: %s",
+                    (int)($hit['id'] ?? 0),
+                    (string)($hit['title'] ?? ''),
+                    (int)($hit['score'] ?? 0),
+                    (string)($hit['url'] ?? '')
+                );
+            }
+        }
+
+        $lines[] = "";
+        $lines[] = "FORM_TREFFER:";
+        if ($forms === []) {
+            $lines[] = "- keine";
+        } else {
+            foreach ($forms as $hit) {
+                $id       = (int)($hit['id'] ?? 0);
+                $title    = trim((string)($hit['title'] ?? ''));
+                $symptoms = trim((string)($hit['symptoms'] ?? ''));
+                $lines[] = "- (#{$id}) {$title}";
+                if ($symptoms !== '') {
+                    $lines[] = "  excerpt: " . $symptoms;
+                }
+            }
+        }
+
+        $lines[] = "";
+        $lines[] = "NEWSLETTER_TREFFER:";
         if ($newsletters === []) {
-            $lines[] = "- (none)";
+            $lines[] = "- keine";
         } else {
             foreach ($newsletters as $hit) {
                 $id        = (int)($hit['id'] ?? 0);
                 $title     = trim((string)($hit['title'] ?? ''));
-                $kw        = (string)($hit['newsletterKw'] ?? '');
-                $year      = (string)($hit['newsletterYear'] ?? '');
-                $edition   = (string)($hit['newsletterEdition'] ?? '');
-                $published = (string)($hit['publishedAt'] ?? '');
+                $kw        = (string)($hit['newsletter_kw'] ?? '');
+                $year      = (string)($hit['newsletter_year'] ?? '');
+                $edition   = (string)($hit['newsletter_edition'] ?? '');
+                $published = (string)($hit['published_at'] ?? '');
                 $symptoms  = trim((string)($hit['symptoms'] ?? ''));
 
                 $meta = [];
@@ -1010,55 +1229,25 @@ final class SupportChatService
             }
         }
 
-        $lines[] = "";
-        $lines[] = "FORM_MATCHES:";
-        if ($forms === []) {
-            $lines[] = "- (none)";
-        } else {
-            foreach ($forms as $hit) {
-                $id       = (int)($hit['id'] ?? 0);
-                $title    = trim((string)($hit['title'] ?? ''));
-                $symptoms = trim((string)($hit['symptoms'] ?? ''));
-                $lines[] = "- (#{$id}) {$title}";
-                if ($symptoms !== '') {
-                    $lines[] = "  excerpt: " . $symptoms;
-                }
-            }
-        }
-
-        $lines[] = "";
-        $lines[] = "OTHER_KB_MATCHES:";
-        if ($others === []) {
-            $lines[] = "- (none)";
-        } else {
-            foreach ($others as $hit) {
-                $lines[] = sprintf(
-                    '- (#%d) %s (Score %d) IRI: %s',
-                    (int)($hit['id'] ?? 0),
-                    (string)($hit['title'] ?? ''),
-                    (int)($hit['score'] ?? 0),
-                    (string)($hit['url'] ?? '')
-                );
-            }
-        }
-
-        $lines[] = "";
-        // Regeln kurz halten (weniger "Meta"-Risiko)
-        $lines[] = "ANWEISUNG:";
-        $lines[] = "- Newsletter-Zeitraum: liste NEWSLETTER_MATCHES (Titel + published_at/KW falls vorhanden).";
-        $lines[] = "- Wenn NEWSLETTER_MATCHES = (none): antworte exakt: \"Keine passenden Newsletter gefunden.\"";
-        $lines[] = "- Formular-Anfrage: liste FORM_MATCHES oder biete Auswahl/Nummern an, falls vorhanden.";
 
         return implode("\n", $lines) . "\n";
     }
-
-
 
 
     // ---------------------------------------------------------------------
     // History / choices cache
     // ---------------------------------------------------------------------
 
+    /**
+     * Loads session chat history from cache.
+     *
+     * @param string $sessionId Session ID
+     *
+     * @return array<int, array<string,mixed>>
+     *
+     * @phpstan-return list<ChatMessage>
+     * @psalm-return list<ChatMessage>
+     */
     private function loadHistory(string $sessionId): array
     {
         $key = $this->historyCacheKey($sessionId);
@@ -1071,6 +1260,15 @@ final class SupportChatService
         return is_array($val) ? $val : [];
     }
 
+    /**
+     * Persists session chat history to cache (overwrites old state).
+     *
+     * @param string $sessionId Session ID
+     * @param array<int, array<string,mixed>> $history Chat history (ChatMessage list)
+     *
+     * @phpstan-param list<ChatMessage> $history
+     * @psalm-param list<ChatMessage> $history
+     */
     private function saveHistory(string $sessionId, array $history): void
     {
         $key = $this->historyCacheKey($sessionId);
@@ -1082,6 +1280,18 @@ final class SupportChatService
         });
     }
 
+    /**
+     * Trims history to configured maximum while keeping system message first (if present).
+     *
+     * @param array<int, array<string,mixed>> $history Chat history
+     *
+     * @return array<int, array<string,mixed>> Trimmed history
+     *
+     * @phpstan-param list<ChatMessage> $history
+     * @phpstan-return list<ChatMessage>
+     * @psalm-param list<ChatMessage> $history
+     * @psalm-return list<ChatMessage>
+     */
     private function trimHistory(array $history): array
     {
         $system = [];
@@ -1096,16 +1306,35 @@ final class SupportChatService
         return array_merge($system, $rest);
     }
 
+    /**
+     * Cache key for history.
+     *
+     * @param string $sessionId Session ID
+     */
     private function historyCacheKey(string $sessionId): string
     {
         return 'support_chat.history.' . sha1($sessionId);
     }
 
+    /**
+     * Cache key for numeric selection choices.
+     *
+     * @param string $sessionId Session ID
+     */
     private function choicesCacheKey(string $sessionId): string
     {
         return 'support_chat.choices.' . sha1($sessionId);
     }
 
+    /**
+     * Stores selectable choices (form/sop/contact) for later numeric selection.
+     *
+     * @param string $sessionId Session ID
+     * @param array<int, array<string,mixed>> $choices Choice list
+     *
+     * @phpstan-param list<ChoiceItem> $choices
+     * @psalm-param list<ChoiceItem> $choices
+     */
     private function storeChoices(string $sessionId, array $choices): void
     {
         $key = $this->choicesCacheKey($sessionId);
@@ -1119,6 +1348,16 @@ final class SupportChatService
         });
     }
 
+    /**
+     * Loads selectable choices from cache.
+     *
+     * @param string $sessionId Session ID
+     *
+     * @return array<int, array<string,mixed>>
+     *
+     * @phpstan-return list<ChoiceItem>
+     * @psalm-return list<ChoiceItem>
+     */
     private function loadChoices(string $sessionId): array
     {
         $key = $this->choicesCacheKey($sessionId);
@@ -1135,8 +1374,21 @@ final class SupportChatService
     // Numeric selection
     // ---------------------------------------------------------------------
 
+    /**
+     * Resolves numeric selection ("1", "2", ...) against stored choices.
+     *
+     * @param string $sessionId Session ID
+     * @param string $message Raw user message (expected to be a number)
+     *
+     * @return array<string,mixed>|null Returns a response payload or null if message is not numeric
+     *
+     * @phpstan-return AskResponse|null
+     * @psalm-return AskResponse|null
+     */
     private function resolveNumericSelection(string $sessionId, string $message): ?array
     {
+        // ... dein bestehender Code (unverändert)
+        // (Hier bleibt der Body 1:1 wie in deinem Snippet; PHPDoc ist der relevante Teil.)
         $m = trim($message);
         if ($m === '' || !preg_match('/^\d+$/', $m)) {
             return null;
@@ -1147,11 +1399,14 @@ final class SupportChatService
             return null;
         }
 
+        /** @var list<ChoiceItem> $choices */
         $choices = $this->loadChoices($sessionId);
+
         if ($choices === []) {
             return [
                 'answer' => "Ich habe keine Auswahl mehr gespeichert. Bitte formuliere die Anfrage erneut (z.B. „Formular Reisekosten“).",
                 'matches' => [],
+                'choices' => [],
                 'modeHint' => 'choice_empty',
             ];
         }
@@ -1161,8 +1416,8 @@ final class SupportChatService
             return [
                 'answer' => "Bitte wähle eine Zahl zwischen 1 und " . count($choices) . ".",
                 'matches' => [],
-                'modeHint' => 'choice_out_of_range',
                 'choices' => $choices,
+                'modeHint' => 'choice_out_of_range',
             ];
         }
 
@@ -1235,6 +1490,7 @@ final class SupportChatService
             return [
                 'answer' => implode("\n", $lines),
                 'matches' => [],
+                'choices' => [],
                 'modeHint' => 'choice_contact',
                 'selected' => $choice,
             ];
@@ -1250,10 +1506,23 @@ final class SupportChatService
         return [
             'answer' => "Ich konnte diese Auswahl nicht auflösen. Bitte formuliere die Anfrage erneut.",
             'matches' => [],
+            'choices' => [],
             'modeHint' => 'choice_unknown',
         ];
     }
 
+    /**
+     * Builds SOP choices from KB matches (excluding forms).
+     *
+     * @param array<int, array<string,mixed>> $matches
+     *
+     * @return array<int, array<string,mixed>>
+     *
+     * @phpstan-param list<SupportMatch> $matches
+     * @phpstan-return list<ChoiceItem>
+     * @psalm-param list<SupportMatch> $matches
+     * @psalm-return list<ChoiceItem>
+     */
     private function buildKbChoices(array $matches): array
     {
         $sops = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
@@ -1273,11 +1542,26 @@ final class SupportChatService
         return array_values(array_slice($choices, 0, self::MAX_CHOICES));
     }
 
+    /**
+     * Generates a fallback session id if none is provided by client.
+     */
     private function newSessionIdFallback(): string
     {
         return bin2hex(random_bytes(16));
     }
 
+    /**
+     * Deduplicates matches by their integer id (keeps first occurrence).
+     *
+     * @param array<int, array<string,mixed>> $matches
+     *
+     * @return array<int, array<string,mixed>>
+     *
+     * @phpstan-param list<SupportMatch> $matches
+     * @phpstan-return list<SupportMatch>
+     * @psalm-param list<SupportMatch> $matches
+     * @psalm-return list<SupportMatch>
+     */
     private function dedupeMatchesById(array $matches): array
     {
         $seen = [];
@@ -1298,6 +1582,21 @@ final class SupportChatService
         return $out;
     }
 
+    /**
+     * Filters SOPs whose title duplicates a form title (normalized).
+     *
+     * @param array<int, array<string,mixed>> $sops
+     * @param array<int, array<string,mixed>> $forms
+     *
+     * @return array<int, array<string,mixed>>
+     *
+     * @phpstan-param list<SupportMatch> $sops
+     * @phpstan-param list<SupportMatch> $forms
+     * @phpstan-return list<SupportMatch>
+     * @psalm-param list<SupportMatch> $sops
+     * @psalm-param list<SupportMatch> $forms
+     * @psalm-return list<SupportMatch>
+     */
     private function filterSopsDuplicatingFormTitles(array $sops, array $forms): array
     {
         if ($forms === [] || $sops === []) {
@@ -1318,6 +1617,9 @@ final class SupportChatService
         }));
     }
 
+    /**
+     * Normalizes titles for deduplication (lowercase + collapsed whitespace).
+     */
     private function normalizeTitle(string $title): string
     {
         $t = mb_strtolower(trim($title));
@@ -1325,6 +1627,14 @@ final class SupportChatService
         return $t;
     }
 
+    /**
+     * Safe wrapper around NewsletterResolver->resolve() with logging.
+     *
+     * @param string $sessionId Session ID (for logs)
+     * @param string $query Newsletter query
+     *
+     * @return array<string,mixed>|null Resolver payload or null if resolver returns null
+     */
     private function safeResolveNewsletter(string $sessionId, string $query): ?array
     {
         try {
@@ -1349,12 +1659,14 @@ final class SupportChatService
     }
 
     // ---------------------------------------------------------------------
-// Document Create (delegiert)
-// ---------------------------------------------------------------------
+    // Document Create (delegiert)
+    // ---------------------------------------------------------------------
 
     /**
      * POST /api/chat/document/analyze
      * => kompletter Create-Flow ist im FormCreateResolver.
+     *
+     * @return array<string,mixed>
      */
     public function documentAnalyze(
         string        $sessionId,
@@ -1364,8 +1676,7 @@ final class SupportChatService
         string        $provider,
         ?string       $model,
         ?Trace        $trace = null
-    ): array
-    {
+    ): array {
         return $this->documentCreateResolver->analyze(
             sessionId: $sessionId,
             message: $message,
@@ -1378,6 +1689,8 @@ final class SupportChatService
 
     /**
      * POST /api/chat/document/patch
+     *
+     * @return array<string,mixed>
      */
     public function documentPatch(
         string  $sessionId,
@@ -1386,8 +1699,7 @@ final class SupportChatService
         string  $provider,
         ?string $model,
         ?Trace  $trace = null
-    ): array
-    {
+    ): array {
         return $this->documentCreateResolver->patch(
             sessionId: $sessionId,
             draftId: $draftId,
@@ -1397,13 +1709,14 @@ final class SupportChatService
 
     /**
      * POST /api/chat/document/confirm
+     *
+     * @return array<string,mixed>
      */
     public function documentConfirm(
         string $sessionId,
         string $draftId,
         ?Trace $trace = null
-    ): array
-    {
+    ): array {
         return $this->documentCreateResolver->confirm(
             sessionId: $sessionId,
             draftId: $draftId
@@ -1411,19 +1724,38 @@ final class SupportChatService
     }
 
     /**
-     * Baut den finalen Prompt (History + KB-Context + Defaults) genau wie im Live-Chat,
-     * führt aber KEINEN Request an den KI-Provider aus.
+     * Baut den finalen Prompt (History + KB-Context + Defaults) **genau wie im Live-Chat**,
+     * führt aber **KEINEN** Request an den KI-Provider aus.
+     *
+     * Unterschiede zum Live-Chat:
+     * - Für Preview wird standardmäßig eine "fresh history" gebaut:
+     *   **nur** system + aktuelle user message (keine Session-History aus Cache).
+     *   Das macht Debugging reproduzierbar und verhindert, dass alte History das Preview verfälscht.
+     *
+     * Typische Use-Cases:
+     * - Debugging von Prompt/Includes/Render-Variablen (today)
+     * - Kontrolle über KB_CONTEXT Inhalt, Längen, Treffer-IDs
+     * - Provider/Model-Resolution testen ohne AI-Kosten/Latency
+     *
+     * @param string $sessionId Session-ID (wird getrimmt; leer => akzeptiert, aber nicht genutzt außer Logging/Kompatibilität)
+     * @param string $message   User-Eingabe, die als letzte Message in die Preview-History kommt
+     * @param string $provider  Provider-Name (üblich: "gemini"|"openai"); wird lowercased
+     * @param string|null $model Optionales Model-Override; wenn null/leer -> Default aus ENV/Server wie im Live-Chat
+     * @param array<string,mixed> $context Optionaler Kontext (z.B. usage_key/debug flags). Wird hier nur minimal normalisiert.
      *
      * @return array{
      *   provider: string,
      *   model: string|null,
-     *   history: array<int, array{role:string, content:string}>,
+     *   history: list<array{role:'system'|'user'|'assistant', content:string}>,
      *   history_count: int,
      *   kbContext: string,
      *   kb_context_chars: int,
      *   matchCount: int,
-     *   matchIds: array<int, int|string|null>
+     *   matchIds: list<int>
      * }
+     *
+     * @phpstan-return PromptPreview
+     * @psalm-return PromptPreview
      */
     public function previewPrompt(
         string $sessionId,
@@ -1437,6 +1769,7 @@ final class SupportChatService
         $provider  = strtolower(trim($provider));
 
         // 1) KB match wie im Chat
+        /** @var list<SupportMatch> $matches */
         $matches = $this->kbMatch($message);
 
         // 2) System Prompt exakt wie im Live-Chat sicherstellen (render + marker)
@@ -1449,11 +1782,11 @@ final class SupportChatService
         // Optionaler Marker (falls ihr ihn immer erzwingen wollt)
         $marker = 'PROMPT_ID: dashTk_assist_v2';
         if ($marker !== '' && stripos($system, $marker) === false) {
-            // Falls der Marker nicht im Template steht, kannst du ihn hier prependen:
             $system = $marker . "\n" . $system;
         }
 
         // 3) Preview-History "fresh": NUR system + aktuelle user message
+        /** @var list<ChatMessage> $history */
         $history = [
             ['role' => 'system', 'content' => $system],
             ['role' => 'user',   'content' => $message],
@@ -1478,7 +1811,17 @@ final class SupportChatService
         }
 
         // 7) Trim wie im Live-Chat (hier praktisch nur Safety, bleibt aber konsistent)
+        /** @var list<ChatMessage> $trimmedHistory */
         $trimmedHistory = $this->trimHistory($history);
+
+        // Match IDs als list<int> (sauber für JSON/Logs/CLI)
+        $matchIds = [];
+        foreach ($matches as $m) {
+            $id = (int)($m['id'] ?? 0);
+            if ($id > 0) {
+                $matchIds[] = $id;
+            }
+        }
 
         return [
             'provider' => $provider,
@@ -1488,22 +1831,90 @@ final class SupportChatService
             'kbContext' => $kbContext,
             'kb_context_chars' => strlen($kbContext),
             'matchCount' => count($matches),
-            'matchIds' => array_values(array_filter(array_map(static fn($m) => $m['id'] ?? null, $matches))),
+            'matchIds' => $matchIds,
         ];
     }
 
 
     /**
-     * Kapselt die vorhandene Match-Logik, damit previewPrompt() exakt dieselben Treffer bekommt.
-     * Falls ihr bereits eine passende Methode habt: diese hier einfach auf die bestehende umbiegen.
+     * Führt den Chat wirklich aus (wie Live), basierend auf previewPrompt().
+     * Gibt zusätzlich provider_used und answer zurück, um Routing/Filter testen zu können.
+     *
+     * @param string $sessionId
+     * @param string $message
+     * @param string $provider 'openai'|'gemini'|'auto' (auto = Gateway darf routen)
+     * @param string|null $model
+     * @param array $context
+     *
+     * @return array<string,mixed>
      */
-    private function kbMatch(string $message): array
-    {
-        // Wenn es bei euch eine bestehende Match-Methode gibt (z.B. $this->solutions->matchByMessage(...)),
-        // dann hier 1:1 diese Logik verwenden.
-        return $this->matchSolutions($message);
+    public function executePrompt(
+        string $sessionId,
+        string $message,
+        string $provider = 'auto',
+        ?string $model = null,
+        array $context = [],
+    ): array {
+        // 1) Preview bauen (inkl. KB Matches & kbContext)
+        $preview = $this->previewPrompt(
+            sessionId: $sessionId,
+            message: $message,
+            provider: $provider === 'auto' ? 'openai' : $provider, // preview braucht irgendeinen provider für model-resolve
+            model: $model,
+            context: $context,
+        );
+
+        /** @var list<ChatMessage> $history */
+        $history = $preview['history'];
+        $kbContext = (string)($preview['kbContext'] ?? '');
+
+        // 2) Kontext anreichern, damit pickProvider() im Gateway sauber routen kann
+        $context['usage_key']  ??= self::USAGE_KEY_ASK;
+        $context['mode_hint']  ??= 'ai_with_db';
+        $context['kb_matches'] ??= []; // falls ihr sie später explizit reingebt
+
+        // WICHTIG: kb_matches aus preview/matches übernehmen (damit SOP/FORM erkannt wird)
+        // -> du hast matchIds im Preview, aber nicht die Match-Objekte.
+        // -> daher: previewPrompt() sollte zusätzlich 'matches' zurückgeben ODER wir matchen hier nochmal.
+        // Sauberste Lösung: hier nochmal kbMatch() aufrufen:
+        $context['kb_matches'] = $this->kbMatch($message);
+
+        // 3) Provider "auto" => Gateway darf routen (provider=null)
+        $providerForGateway = ($provider === 'auto') ? null : $provider;
+
+        // 4) Execute
+        $modelForGateway = ($provider === 'auto') ? null : ($preview['model'] ?? null);
+
+        $answer = $this->aiChat->chat(
+            history: $history,
+            kbContext: $kbContext,
+            provider: $providerForGateway,
+            model: $modelForGateway,
+            context: $context,
+        );
+
+        // 5) Response
+        $preview['provider_used'] = $providerForGateway ?? 'auto';
+        $preview['answer'] = $answer;
+        return $preview;
     }
 
 
+    /**
+     * Kapselt die vorhandene Match-Logik, damit previewPrompt() exakt dieselben Treffer bekommt.
+     * Diese Methode existiert bewusst als "Adapter", damit intern refactored werden kann,
+     * ohne dass Preview/CLI-Tools brechen.
+     *
+     * @param string $message User-Query
+     *
+     * @return list<array<string,mixed>> Liste gemappter Treffer (SupportMatch-ähnlich).
+     *
+     * @phpstan-return list<SupportMatch>
+     * @psalm-return list<SupportMatch>
+     */
+    private function kbMatch(string $message): array
+    {
+        return $this->matchSolutions($message);
+    }
 
 }

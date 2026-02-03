@@ -41,11 +41,28 @@ final readonly class AiChatGateway
         ?string $model = null,
         array $context = []
     ): string {
+
+        // --- Provider-Routing (override) ---
+        // 1) letzte User-Message aus dem Verlauf ziehen
+        $userMessage = $this->extractLastUserMessage($history);
+
+        // 2) optionale Routing-Hints aus context (wenn du sie übergibst)
+        $modeHint   = (string)($context['mode_hint'] ?? '');
+        $kbMatches  = (array)($context['kb_matches'] ?? []);
+
+        // 3) Nur dann overriden, wenn der Caller NICHT explizit provider vorgibt
+        //    (wenn du IMMER erzwingen willst: diese if-Klammer entfernen)
+        $providerWasAuto = ($provider === null || $provider === '');
+        if ($providerWasAuto) {
+            $provider = $this->pickProvider($userMessage, $modeHint, $kbMatches, $kbContext);
+        }
+        // --- /Provider-Routing ---
+
         $providerUsed = $this->normalizeProvider($provider ?: $this->defaultProvider);
         $modelWanted  = $this->normalizeModel($model);
         $usageKey     = $this->normalizeUsageKey((string) ($context['usage_key'] ?? 'unknown'));
 
-        return TraceContext::span('gateway.ai_chat.chat', function () use ($history, $kbContext, $providerUsed, $modelWanted, $usageKey, $context) {
+        return TraceContext::span('gateway.ai_chat.chat', function () use ($history, $kbContext, $providerUsed, $modelWanted, $usageKey, $context, $providerWasAuto) {
 
             $kbContextLen = mb_strlen($kbContext);
             if ($kbContext !== '') {
@@ -149,6 +166,9 @@ final readonly class AiChatGateway
                     return $this->extractResponseText($response->getMessage());
                 });
 
+                // --- Meta-Leak-Filter (Gemini leakt sonst gerne "Denke Schritt für Schritt", Prompt/Policy etc.) ---
+                $text = $this->stripMetaLeaks($text);
+
                 // Leere/Platzhalter-Antwort -> warning
                 if (trim($text) === '' || $text === '[leere Antwort]' || $text === '[unlesbare Antwort]') {
                     $this->logWarning('ai.gateway.suspicious_empty_response', [
@@ -171,6 +191,55 @@ final readonly class AiChatGateway
 
             } catch (\Throwable $e) {
                 $latencyMs = (int) round((microtime(true) - $start) * 1000);
+
+                // --- GRÜN: Gemini -> Auto-Fallback auf OpenAI bei Safety ODER transienten Vendor/Netzwerkfehlern ---
+                // Wichtig: nur EINMAL fallbacken (sonst Endlosschleife)
+                $alreadyFallbacked = (bool)($context['gemini_fallback_done'] ?? false);
+                $isGeminiProvider  = ($providerUsed === 'gemini');
+                $msg = trim((string)$e->getMessage());
+
+                // 1) Safety block aus Adapter (dein GeminiChatAdapter wirft exakt diese Message)
+                $isGeminiSafety = ($e instanceof \RuntimeException) && ($msg === 'GEMINI_SAFETY_BLOCKED');
+
+                // 2) Transiente Transport-/HTTP-/Stream-Probleme (z.B. "Connection reset by peer")
+                //    -> bewusst "fuzzy" matchen, weil Vendor/HTTP-Stack variiert.
+                $isTransientGemini = (
+                        str_contains($msg, 'Unable to read stream contents')
+                        || str_contains($msg, 'Connection reset by peer')
+                        || str_contains($msg, 'cURL error')
+                        || str_contains($msg, 'Operation timed out')
+                        || str_contains($msg, 'timeout')
+                        || str_contains($msg, 'HTTP 429')
+                        || str_contains($msg, 'Too Many Requests')
+                        || str_contains($msg, '503')
+                        || str_contains($msg, 'Service Unavailable')
+                    );
+
+                // Fallback nur wenn:
+                // - wir gerade Gemini benutzen
+                // - noch nicht gefallbackt
+                // - und der Caller "auto" war (also provider nicht explizit auf gemini gesetzt)
+                if ($isGeminiProvider && !$alreadyFallbacked && ($isGeminiSafety || $isTransientGemini) && ($providerWasAuto ?? false)) {
+                    $context['gemini_fallback_done'] = true;
+
+                    $this->logWarning('ai.gateway.gemini_fallback_to_openai', [
+                        'provider' => $providerUsed,
+                        'usage_key' => $usageKey,
+                        'latency_ms' => $latencyMs,
+                        'kb_context_len' => $kbContextLen,
+                        'reason' => $isGeminiSafety ? 'gemini_safety' : 'gemini_transient',
+                        'error_snippet' => $this->makeSafeShortDetail($msg),
+                    ]);
+
+                    return $this->chat(
+                        history: $history,
+                        kbContext: '',
+                        provider: 'openai',
+                        model: null,
+                        context: $context
+                    );
+                }
+        // --- /GRÜN ---
 
                 $modelUsed = $this->normalizeModel((string) ($context['model_used'] ?? ''));
                 if ($modelUsed === 'unknown' && $modelWanted !== 'unknown') {
@@ -323,6 +392,32 @@ final readonly class AiChatGateway
         return '[unlesbare Antwort]';
     }
 
+    private function stripMetaLeaks(string $text): string
+    {
+        $patterns = [
+            // Klassiker: "Denke Schritt für Schritt:"
+            '~(?is)\bdenke\s+schritt\s+f[üu]r\s+schritt\s*:.*?(?=\n\s*\n|$)~u',
+
+            // Policy/Prompt leaks
+            '~(?is)\b(prompt_id|kb_context|anweisung|policy|system[- ]prompt|interne\s+regeln)\b\s*:.*?(?=\n\s*\n|$)~u',
+
+            // "Analyse der Nutzeranfrage:" etc.
+            '~(?is)\b(analyse\s+der\s+nutzeranfrage|pr[üu]fung\s+des\s+kb_context|formulierung\s+der\s+antwort)\b\s*:.*?(?=\n\s*\n|$)~u',
+        ];
+
+        $clean = preg_replace($patterns, '', $text);
+        $clean = trim((string)$clean);
+
+        // Falls alles weggeschnitten wurde: fallback
+        if ($clean === '') {
+            return "Ich habe dazu einen passenden SOP-Eintrag gefunden. Meinst du die Druckerwarteschlange (Windows) oder eine Warteschlange in Advarics/Advarics-Cash? Wenn du mir kurz sagst: welcher Drucker und welche Fehlermeldung, kann ich dir die richtigen Schritte geben.";
+        }
+
+        return $clean;
+    }
+
+
+
     private function makeAiChatRequest(AIChatMessageCollection $messages): AIChatRequest
     {
         $criteriaClass = 'ModelflowAi\\DecisionTree\\Criteria\\CriteriaCollection';
@@ -442,4 +537,50 @@ final readonly class AiChatGateway
             $this->logger->error($event, $context);
         }
     }
+
+    private function pickProvider(string $userMessage, string $modeHint, array $kbMatches, string $kbContext): string
+    {
+        // 1) Newsletter explizit? -> Gemini darf
+        $msg = mb_strtolower($userMessage);
+        $looksLikeNewsletter = str_contains($msg, 'newsletter')
+            || str_contains($msg, 'kw')
+            || preg_match('~seit\s+\d{1,2}\.\d{1,2}\.\d{4}~u', $msg);
+
+        // 2) SOP/Technik? -> OpenAI erzwingen (weil Gemini häufiger meta-leakt)
+        $hasSopHit = false;
+        foreach ($kbMatches as $m) {
+            $type = (string)($m['type'] ?? '');
+            if ($type === 'SOP') { $hasSopHit = true; break; }
+        }
+
+        $looksTechnical = preg_match('~\b(warteschlange|drucker|kasse|login|bondrucker|ec|teamviewer|wireguard|server)\b~u', $msg) === 1;
+
+        if ($hasSopHit || $looksTechnical) {
+            return 'openai';
+        }
+
+        if ($looksLikeNewsletter) {
+            return 'gemini';
+        }
+
+        // default
+        return 'openai';
+    }
+
+    private function extractLastUserMessage(array $history): string
+    {
+        for ($i = count($history) - 1; $i >= 0; $i--) {
+            $msg = $history[$i] ?? null;
+            if (!is_array($msg)) {
+                continue;
+            }
+            $role = (string)($msg['role'] ?? '');
+            if ($role === 'user') {
+                return (string)($msg['content'] ?? '');
+            }
+        }
+        return '';
+    }
+
+
 }

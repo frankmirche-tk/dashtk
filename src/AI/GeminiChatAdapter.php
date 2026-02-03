@@ -73,30 +73,26 @@ final readonly class GeminiChatAdapter implements AIChatAdapterInterface
         $start = microtime(true);
 
         try {
-            $resp = $this->inner->handleRequest($request);
-
-            // Optional: erfolgreiche Calls minimal loggen (nur wenn ihr das wollt)
-            // $this->logger->debug('gemini.ok', [
-            //     'provider' => 'gemini',
-            //     'inner' => $this->inner::class,
-            //     'latency_ms' => (int) round((microtime(true) - $start) * 1000),
-            // ]);
-
-            return $resp;
+            return $this->inner->handleRequest($request);
         } catch (\RuntimeException $e) {
             $latencyMs = (int) round((microtime(true) - $start) * 1000);
-
             $reason = $this->classifyNonSimpleTextReason($e->getMessage());
 
             // Nur bekannte Gemini-Sonderfälle abfangen.
             if ($this->isGeminiNonSimpleTextOrSafetyBlockedError($e)) {
                 $this->logVendorException($request, $e, $trace, $reason, $latencyMs);
 
-                if (!$this->enableFallback) {
-                    throw $e;
+                // --- ROT (alt): user-facing Policy-/Meta-Text zurückgeben ---
+                // if (!$this->enableFallback) { throw $e; }
+                // return $this->makeUserFriendlyFallbackResponse($e, $reason);
+
+                // --- GRÜN (neu): eindeutiges Signal nach oben (Gateway fallbackt auf OpenAI) ---
+                if ($this->enableFallback) {
+                    throw new \RuntimeException('GEMINI_SAFETY_BLOCKED');
                 }
 
-                return $this->makeUserFriendlyFallbackResponse($e, $reason);
+                // In DEV/TEST: Original weiterwerfen, damit man echte Vendor-Details sieht.
+                throw $e;
             }
 
             // Unbekannte RuntimeException: loggen und weiterwerfen (damit echte Bugs nicht verdeckt werden).
@@ -140,32 +136,9 @@ final readonly class GeminiChatAdapter implements AIChatAdapterInterface
     }
 
     /**
-     * Nutzerfreundlicher Fallback (für normale Mitarbeitende).
-     * Technische Details nur optional in DEV.
-     */
-    private function makeUserFriendlyFallbackResponse(\RuntimeException $e, string $reason): AIChatResponse
-    {
-        // Safety: nicht als "Fehler" formulieren, sondern als Einschränkung.
-        if ($reason === 'safety_blocked' || $reason === 'prompt_feedback') {
-            $msg = "Dabei kann ich dir leider nicht helfen. Bitte formuliere die Anfrage anders oder wende dich an die interne IT/Teamleitung, falls es dringend ist.";
-            return $this->makeTextResponse($msg);
-        }
-
-        // Multi-Part / Text-Accessor: meistens ein Vendor-Format-Thema.
-        $msg = "Ich konnte gerade keine saubere Text-Antwort erzeugen. Bitte schreib die Frage noch einmal etwas konkreter (z.B. Stichwort + Kontext) – oder probiere es in 10 Sekunden erneut.";
-
-        if ($this->includeVendorDetails) {
-            $detail = $this->makeSafeShortDetail($e->getMessage());
-            if ($detail !== '') {
-                $msg .= ' (DEV-Details: ' . $detail . ')';
-            }
-        }
-
-        return $this->makeTextResponse($msg);
-    }
-
-    /**
      * Kompatibel halten mit mehreren ModelflowAi Versionen.
+     * (Wird aktuell nicht mehr für den Vendor-Fallback genutzt, aber bleibt drin,
+     *  falls ihr später wieder einen "harmlosen" Text-Fallback wollt.)
      */
     private function makeTextResponse(string $msg): AIChatResponse
     {

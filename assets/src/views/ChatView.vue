@@ -5,8 +5,8 @@
 
             <div class="actions">
                 <select v-model="provider" class="select" @change="onProviderChange">
-                    <option value="gemini">Gemini (Standard)</option>
-                    <option value="openai">OpenAI</option>
+                    <option value="openai">OpenAI(Standard)</option>
+                    <option value="gemini">Gemini </option>
                 </select>
 
                 <router-link class="btn" to="/kb/new">Neues Thema</router-link>
@@ -172,7 +172,7 @@ if (debugEnabled && !axios.__chatViewInterceptorInstalled) {
  */
 const input = ref('')
 const sending = ref(false)
-const provider = ref('gemini')
+const provider = ref('openai')
 const model = ref(null)
 
 const sessionId = ref(sessionStorage.getItem('sessionId') || uuid())
