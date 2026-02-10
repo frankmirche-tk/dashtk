@@ -49,7 +49,7 @@ final class NewsletterCreateResolver
         ]);
 
         // 1) Drive-Link Pflicht
-        if ($driveId === '') {
+        if ($driveId === '' && !$file instanceof UploadedFile) {
             return [
                 'type' => 'need_drive',
                 'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
@@ -213,14 +213,18 @@ final class NewsletterCreateResolver
         ]);
 
         return [
-            'type' => 'needs_confirmation',
+            'type' => ResponseCode::NEEDS_CONFIRMATION,
             'answer' => $this->renderConfirmText($draft),
             'draftId' => $draftId,
             'confirmCard' => [
                 'draftId' => $draftId,
                 'fields' => $draft,
             ],
+            '_meta' => [
+                'ai_used' => true,
+            ],
         ];
+
     }
 
     public function patch(

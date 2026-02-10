@@ -6,13 +6,14 @@ namespace App\Service;
 
 use App\AI\AiChatGateway;
 use App\Tracing\Trace;
+use App\Validator\TKFashionPolicyKeywords;
 use Doctrine\DBAL\Connection;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
-use App\Validator\TKFashionPolicyKeywords;
+
 
 final class FormCreateResolver
 {
@@ -25,6 +26,7 @@ final class FormCreateResolver
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly PromptTemplateLoader $promptLoader,
         private readonly TKFashionPolicyKeywords $keywordPolicy,
+        private readonly UploadedFileClassifier $fileClassifier,   // <—
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
@@ -41,46 +43,105 @@ final class FormCreateResolver
         $driveUrl = trim($driveUrl);
         $driveId  = $this->extractDriveId($driveUrl);
 
+        $hasFile  = $file instanceof UploadedFile;
+        $hasDrive = ($driveId !== '') || ($driveUrl !== '');
+
         $this->supportSolutionLogger->info('form_create.analyze.start', [
             'sessionId' => $sessionId,
-            'hasFile' => $file instanceof UploadedFile,
+            'hasFile' => $hasFile,
             'driveId' => $driveId !== '' ? 'ok' : 'missing',
             'model' => $model,
         ]);
 
-        // 1) Drive-Link Pflicht (wie Newsletter – sorgt für saubere Quellen)
-        if ($driveId === '') {
+        // 1) Drive-Link nur nötig, wenn KEIN Upload-File mitkommt
+        if ($driveId === '' && !$hasFile) {
             return [
                 'type' => 'need_drive',
                 'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
             ];
         }
 
-        // 2) File Pflicht
-        if (!$file instanceof UploadedFile) {
+        // 2) Mindestens Drive ODER File muss vorhanden sein (Controller-Guard deckt das meist schon ab)
+        if (!$hasFile && $driveId === '') {
             return [
-                'type' => 'error',
-                'answer' => 'Kein PDF hochgeladen. Bitte Datei auswählen und erneut senden.',
+                'type' => 'need_input',
+                'answer' => 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
             ];
         }
 
-        // 3) PDF -> TEXT
-        $text = $this->extractPdfTextWithPdftotext($file->getPathname());
+        // 3) Dateityp zentral erkennen (Magic Bytes + ZIP-Inspection)
+        if (!$hasFile) {
+            return [
+                'type' => ResponseCode::NEED_DRIVE,
+                'answer' => 'Bitte lade eine Datei hoch oder füge einen Google-Drive Link ein, der direkt abrufbar ist.',
+            ];
+        }
+
+        $class = $this->fileClassifier->classify($file);
+
+        if ($class['kind'] === 'invalid') {
+            return [
+                'type' => $class['code'] ?? ResponseCode::INVALID_FILE_TYPE,
+                'answer' => $class['message'] ?? 'Ungültiger Dateityp.',
+            ];
+        }
+
+        if ($class['kind'] !== 'pdf') {
+            $hint = match ($class['kind']) {
+                'docx' => 'DOCX erkannt. Bitte als PDF exportieren (oder Parser folgt).',
+                'xlsx' => 'XLSX erkannt. Bitte als PDF exportieren (oder Parser folgt).',
+                'numbers' => 'Apple Numbers erkannt. Bitte als XLSX oder PDF exportieren.',
+                default => 'Dateityp nicht unterstützt. Bitte als PDF exportieren.',
+            };
+
+            return [
+                'type' => ResponseCode::UNSUPPORTED_FILE_TYPE,
+                'answer' => $hint . sprintf(
+                        ' (kind=%s, ext=%s, mime=%s)',
+                        $class['kind'],
+                        $class['ext'] ?? '',
+                        $class['mime'] ?? ''
+                    ),
+            ];
+        }
+
+
+        // ab hier: echtes PDF
+        $originalName = (string) $file->getClientOriginalName();
+        $path = $file->getPathname();
+
+
+        // 4) PDF -> TEXT
+        $text = $this->extractPdfTextWithPdftotext($path);
         $text = trim($text);
 
-        if ($text === '') {
+        if ($text === '' || mb_strlen($text) < 80) {
             $this->supportSolutionLogger->warning('document_create.analyze.pdf_empty', [
                 'sessionId' => $sessionId,
-                'filename' => $file->getClientOriginalName(),
+                'filename' => $originalName,
             ]);
 
             return [
-                'type' => 'error',
-                'answer' => 'PDF-Text-Extraktion fehlgeschlagen (pdftotext liefert leer). Bitte PDF prüfen oder Parser wechseln.',
+                'type' => 'pdf_scanned_needs_ocr',
+                'answer' => 'Dieses PDF enthält keinen auslesbaren Text (wahrscheinlich Scan/Bild-PDF). Bitte OCR aktivieren oder ein textbasiertes PDF hochladen.',
             ];
         }
 
+
+
         $originalName = (string) $file->getClientOriginalName();
+        if (!preg_match('/^[a-zA-Z0-9äöüÄÖÜß_\-\. ]+$/u', $originalName)) {
+            return [
+                'type' => ResponseCode::INVALID_FILENAME,
+                'answer' =>
+                    "⚠️ Der Dateiname enthält Sonderzeichen oder ungültige Unicode-Zeichen.\n\n"
+                    . "Bitte Datei umbenennen (z.B. absage_nach_gespraech.docx) und erneut hochladen.\n"
+                    . "Erlaubt: Buchstaben, Zahlen, Leerzeichen, _ - .",
+            ];
+
+        }
+
+
         $now = $this->nowMidnight();
 
         // 4) OpenAI Draft bauen (JSON)
@@ -97,10 +158,10 @@ final class FormCreateResolver
         ];
 
         $tpl = $this->promptLoader->load('FormCreatePrompt.config');
-                $history = [
-                        ['role' => 'system', 'content' => $tpl['system']],
-                        ['role' => 'user', 'content' => $prompt],
-                    ];
+        $history = [
+            ['role' => 'system', 'content' => $tpl['system']],
+            ['role' => 'user', 'content' => $prompt],
+        ];
 
         $this->supportSolutionLogger->info('form_create.ai.request', [
             'sessionId' => $sessionId,
@@ -153,20 +214,32 @@ final class FormCreateResolver
             $title = $this->fallbackTitleFromFilename($originalName);
         }
 
-        $symptoms = $this->normalizeSymptoms((string)($json['symptoms'] ?? ''), $driveUrl);
+        // ✅ Symptoms normalisieren: Drive-Link nur anhängen, wenn Drive wirklich vorhanden ist
+        $symptoms = $this->normalizeSymptoms(
+            (string)($json['symptoms'] ?? ''),
+            $hasDrive ? $driveUrl : ''
+        );
+
         $contextNotes = trim((string)($json['context_notes'] ?? ''));
 
         $keywords = $this->normalizeKeywords($json['keywords'] ?? []);
+
+        // ✅ Media-Felder korrekt setzen:
+        // - Drive vorhanden => external/google_drive + URL/ID
+        // - nur File => upload, keine external_* Felder
+        $mediaType = $hasDrive ? 'external' : 'upload';
 
         $draft = [
             'type' => 'FORM',
             'title' => $title,
             'symptoms' => $symptoms,
             'context_notes' => $contextNotes !== '' ? $contextNotes : ("Quelle: {$originalName}"),
-            'media_type' => 'external',
-            'external_media_provider' => 'google_drive',
-            'external_media_url' => $driveUrl,
-            'external_media_id' => $driveId,
+
+            'media_type' => $mediaType,
+            'external_media_provider' => $hasDrive ? 'google_drive' : '',
+            'external_media_url' => $hasDrive ? $driveUrl : '',
+            'external_media_id' => $hasDrive ? $driveId : '',
+
             'created_at' => $now,
             'updated_at' => $now,
             // Dokument: kein Wochen-/Jahresbezug -> published_at = created_at
@@ -187,15 +260,20 @@ final class FormCreateResolver
         ]);
 
         return [
-            'type' => 'needs_confirmation',
+            'type' => ResponseCode::NEEDS_CONFIRMATION,
             'answer' => $this->renderConfirmText($draft),
             'draftId' => $draftId,
             'confirmCard' => [
                 'draftId' => $draftId,
                 'fields' => $draft,
             ],
+            '_meta' => [
+                'ai_used' => true,
+            ],
         ];
+
     }
+
 
     public function patch(
         string $sessionId,
@@ -344,6 +422,7 @@ final class FormCreateResolver
     private function normalizeSymptoms(string $symptoms, string $driveUrl): string
     {
         $symptoms = trim($symptoms);
+        $driveUrl = trim($driveUrl);
 
         // Falls das Modell Mist liefert: minimal retten
         if ($symptoms === '' || mb_strlen($symptoms) < 10) {
@@ -353,23 +432,37 @@ final class FormCreateResolver
         // jede Zeile soll mit "* " starten
         $lines = preg_split('/\R/u', $symptoms) ?: [];
         $out = [];
+
         foreach ($lines as $ln) {
             $ln = trim($ln);
-            if ($ln === '') continue;
+            if ($ln === '') {
+                continue;
+            }
+
             $ln = preg_replace('/^[\-\•\*]\s*/u', '', $ln) ?? $ln;
+
+            // optional: leere Drive-Links rausfiltern
+            if ($driveUrl === '' && preg_match('/Dokument\s*\(Drive\)\]\(\s*\)/ui', $ln)) {
+                continue;
+            }
+
             $out[] = '* ' . $ln;
         }
 
-        // Drive-Link Bullet sicherstellen (Dokument-Link)
-        $hasDrive = false;
-        foreach ($out as $ln) {
-            if (str_contains($ln, 'drive.google.com')) {
-                $hasDrive = true;
-                break;
+        // Drive-Link Bullet nur sicherstellen, wenn driveUrl wirklich vorhanden ist
+        if ($driveUrl !== '') {
+            $hasDrive = false;
+
+            foreach ($out as $ln) {
+                if (str_contains($ln, 'drive.google.com')) {
+                    $hasDrive = true;
+                    break;
+                }
             }
-        }
-        if (!$hasDrive) {
-            $out[] = "* [Dokument (Drive)]({$driveUrl})";
+
+            if (!$hasDrive) {
+                $out[] = "* [Dokument (Drive)]({$driveUrl})";
+            }
         }
 
         return implode("\n", $out);

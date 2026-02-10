@@ -820,7 +820,11 @@ final class SupportChatService
                 'matches' => $sops,
                 'choices' => $formChoices,
                 'modeHint' => 'ai_with_db',
+                '_meta' => [
+                    'ai_used' => true,
+                ],
             ];
+
         }
 
         // save history
@@ -856,7 +860,11 @@ final class SupportChatService
             'matches' => $sops,
             'modeHint' => 'ai_with_db',
             'choices' => $formChoices, // only forms in UI
+            '_meta' => [
+                'ai_used' => true,
+            ],
         ];
+
     }
 
     // ---------------------------------------------------------------------

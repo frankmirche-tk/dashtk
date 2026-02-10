@@ -19,6 +19,7 @@ final class ChatController extends AbstractController
         private readonly SupportChatService $chatService,
         private readonly TraceManager $traceManager,
         private readonly LoggerInterface $logger,
+        private readonly \App\Service\ExternalUrlInspector $externalUrlInspector,
     ) {}
 
     #[Route('/api/chat', name: 'app_chat', methods: ['POST'])]
@@ -108,13 +109,24 @@ final class ChatController extends AbstractController
                 'db_only' => $dbOnlySolutionId !== null,
             ]);
 
-            // Provider/Model zurückgeben:
-            $result['provider'] = $result['provider'] ?? $provider;
-            if ($model !== null) {
-                $result['model'] = $result['model'] ?? $model;
+            $result['trace_id'] = $trace->getTraceId();
+
+// provider/model nur dann zurückgeben, wenn AI wirklich genutzt wurde
+            $aiUsed = (bool) (($result['_meta']['ai_used'] ?? false));
+
+// falls der Service selbst provider/model setzt (bei AI), respektieren wir das.
+            // ansonsten setzen wir provider/model nur, wenn aiUsed=true
+            if ($aiUsed) {
+                $result['provider'] = $result['provider'] ?? $provider;
+
+                if ($model !== null) {
+                    $result['model'] = $result['model'] ?? $model;
+                }
             }
 
-            $result['trace_id'] = $trace->getTraceId();
+            // Meta nicht an Client ausgeben
+            unset($result['_meta']);
+
 
             $this->logger->info('chat.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -154,6 +166,49 @@ final class ChatController extends AbstractController
             $driveUrl  = (string) $request->request->get('drive_url', '');
             $file      = $request->files->get('file'); // UploadedFile|null
 
+            // ✅ Guard: mindestens file ODER drive_url
+            if ($file === null && $driveUrl === '') {
+                $this->logger->info('newsletter.analyze.missing_input', [
+                    'trace_id' => $trace->getTraceId(),
+                    'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
+                    'sessionId' => $sessionId,
+                ]);
+
+                return new JsonResponse([
+                    'type' => 'need_input',
+                    'answer' => 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
+                ], 422);
+            }
+            // ✅ Drive/External URL vorhanden, aber kein Upload-File: Erreichbarkeit prüfen
+            if ($file === null && $driveUrl !== '') {
+                $check = $this->externalUrlInspector->inspect($driveUrl);
+
+                if (($check['ok'] ?? false) !== true) {
+                    $this->logger->info('newsletter.analyze.drive_url_unreachable', [
+                        'trace_id' => $trace->getTraceId(),
+                        'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
+                        'sessionId' => $sessionId,
+                        'reason' => $check['reason'] ?? null,
+                        'status' => $check['status'] ?? null,
+                        'contentType' => $check['contentType'] ?? null,
+                    ]);
+
+                    $type = ($check['reason'] ?? '') === 'invalid_url' || ($check['reason'] ?? '') === 'invalid_scheme'
+                        ? 'drive_url_invalid'
+                        : 'drive_url_unreachable';
+
+                    return new JsonResponse([
+                        'type' => $type,
+                        'answer' => $type === 'drive_url_invalid'
+                            ? 'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.'
+                            : 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
+                    ], 422);
+                }
+            }
+
+
+
+
             // 🔒 Newsletter immer OpenAI
             $provider = 'openai';
 
@@ -180,10 +235,19 @@ final class ChatController extends AbstractController
             );
 
             $result['trace_id'] = $trace->getTraceId();
-            $result['provider'] = $provider;
-            if (is_string($model)) {
-                $result['model'] = $model;
+
+            // provider/model nur dann zurückgeben, wenn AI wirklich genutzt wurde
+            $aiUsed = (bool) (($result['_meta']['ai_used'] ?? false));
+            if ($aiUsed) {
+                $result['provider'] = $provider;
+                if (is_string($model)) {
+                    $result['model'] = $model;
+                }
             }
+
+            // Meta nicht an Client ausgeben
+            unset($result['_meta']);
+
 
             $this->logger->info('newsletter.analyze.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -319,12 +383,65 @@ final class ChatController extends AbstractController
 
         $uiReqId = (string) $request->headers->get('X-UI-Req-Id', '');
 
+
+
         try {
             $sessionId = (string) $request->request->get('sessionId', '');
             $message   = (string) $request->request->get('message', '');
             $model     = $request->request->get('model');
             $driveUrl  = (string) $request->request->get('drive_url', '');
             $file      = $request->files->get('file'); // UploadedFile|null
+
+            $this->logger->info('document.analyze.debug_upload', [
+                'files_keys' => array_keys($request->files->all()),
+                'has_file' => $file instanceof UploadedFile,
+                'content_type' => $request->headers->get('content-type'),
+                'content_length' => $request->headers->get('content-length'),
+            ]);
+
+
+            // ✅ Guard: mindestens file ODER drive_url
+            if ($file === null && $driveUrl === '') {
+                $this->logger->info('document.analyze.missing_input', [
+                    'trace_id' => $trace->getTraceId(),
+                    'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
+                    'sessionId' => $sessionId,
+                ]);
+
+                return new JsonResponse([
+                    'type' => 'need_input',
+                    'answer' => 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
+                ], 422);
+            }
+
+            // ✅ Drive/External URL vorhanden, aber kein Upload-File: Erreichbarkeit prüfen
+            if ($file === null && $driveUrl !== '') {
+                $check = $this->externalUrlInspector->inspect($driveUrl);
+
+                if (($check['ok'] ?? false) !== true) {
+                    $this->logger->info('document.analyze.drive_url_unreachable', [
+                        'trace_id' => $trace->getTraceId(),
+                        'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
+                        'sessionId' => $sessionId,
+                        'reason' => $check['reason'] ?? null,
+                        'status' => $check['status'] ?? null,
+                        'contentType' => $check['contentType'] ?? null,
+                    ]);
+
+                    $type = ($check['reason'] ?? '') === 'invalid_url' || ($check['reason'] ?? '') === 'invalid_scheme'
+                        ? 'drive_url_invalid'
+                        : 'drive_url_unreachable';
+
+                    return new JsonResponse([
+                        'type' => $type,
+                        'answer' => $type === 'drive_url_invalid'
+                            ? 'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.'
+                            : 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
+                    ], 422);
+                }
+            }
+
+
 
             // 🔒 Dokumente auch immer OpenAI (wie Newsletter)
             $provider = 'openai';
@@ -352,10 +469,19 @@ final class ChatController extends AbstractController
             );
 
             $result['trace_id'] = $trace->getTraceId();
-            $result['provider'] = $provider;
-            if (is_string($model)) {
-                $result['model'] = $model;
+
+            // provider/model nur dann zurückgeben, wenn AI wirklich genutzt wurde
+            $aiUsed = (bool) (($result['_meta']['ai_used'] ?? false));
+            if ($aiUsed) {
+                $result['provider'] = $provider;
+                if (is_string($model)) {
+                    $result['model'] = $model;
+                }
             }
+
+            // Meta nicht an Client ausgeben
+            unset($result['_meta']);
+
 
             $this->logger->info('document.analyze.response', [
                 'trace_id' => $trace->getTraceId(),
