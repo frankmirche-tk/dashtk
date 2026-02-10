@@ -43,6 +43,15 @@ final class FormCreateResolver
         $driveUrl = trim($driveUrl);
         $driveId  = $this->extractDriveId($driveUrl);
 
+        // ✅ Forms brauchen immer eine Drive-Quelle (auch wenn ein Upload kommt)
+        if ($driveId === '') {
+            return [
+                'type' => ResponseCode::NEED_DRIVE, // oder 'need_drive' wenn ihr keine Const wollt
+                'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
+                '_meta' => ['ai_used' => false],
+            ];
+        }
+
         $hasFile  = $file instanceof UploadedFile;
         $hasDrive = ($driveId !== '') || ($driveUrl !== '');
 
@@ -235,10 +244,10 @@ final class FormCreateResolver
             'symptoms' => $symptoms,
             'context_notes' => $contextNotes !== '' ? $contextNotes : ("Quelle: {$originalName}"),
 
-            'media_type' => $mediaType,
-            'external_media_provider' => $hasDrive ? 'google_drive' : '',
-            'external_media_url' => $hasDrive ? $driveUrl : '',
-            'external_media_id' => $hasDrive ? $driveId : '',
+            'media_type' => 'external',
+            'external_media_provider' => 'google_drive',
+            'external_media_url' => $driveUrl,
+            'external_media_id' => $driveId,
 
             'created_at' => $now,
             'updated_at' => $now,

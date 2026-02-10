@@ -147,7 +147,7 @@
                 <!-- ✅ Newsletter Confirm Card (preview ODER fields) -->
                 <div v-if="newsletterPreview(m)" class="contactCard">
                     <div class="contactTitle">
-                        ✅ <strong>Newsletter-Insert – Bitte bestätigen</strong>
+                        ✅ ✅ <strong>{{ confirmHeader(m) }}</strong>
                     </div>
 
                     <div class="contactGrid">
@@ -717,6 +717,14 @@ function insertedId(m) {
     const mm = s.match(/\bID:\s*(\d+)\b/i)
     return mm ? Number(mm[1]) : null
 }
+
+function confirmHeader(m) {
+    const category = m?.confirmCard?.fields?.category ?? ''
+    if (category === 'NEWSLETTER') return 'Newsletter-Insert – Bitte bestätigen'
+    return 'Dokument/Formular – Bitte bestätigen'
+}
+
+
 
 
 </script>

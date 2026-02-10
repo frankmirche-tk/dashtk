@@ -14,6 +14,7 @@ use Symfony\Contracts\Cache\ItemInterface;
 use Doctrine\DBAL\Connection;
 use App\Validator\TKFashionPolicyKeywords;
 
+
 final class NewsletterCreateResolver
 {
     private readonly bool $isDev;
@@ -63,6 +64,49 @@ final class NewsletterCreateResolver
                 'answer' => 'Kein PDF hochgeladen. Bitte Datei auswählen und erneut senden.',
             ];
         }
+        // 2.1) Newsletter akzeptiert NUR echte PDFs (Magic Bytes)
+        $path = $file->getPathname();
+        $fh = @fopen($path, 'rb');
+        $head = $fh ? fread($fh, 8) : '';
+        if (is_resource($fh)) {
+            fclose($fh);
+        }
+        $head = is_string($head) ? $head : '';
+
+        $isPdf = str_starts_with($head, '%PDF-');
+        $ext = strtolower(pathinfo((string) $file->getClientOriginalName(), PATHINFO_EXTENSION));
+
+        // Fake PDFs (Endung .pdf aber kein echtes PDF) und alle Nicht-PDFs hart blocken
+        if (!$isPdf) {
+            $this->supportSolutionLogger->warning('newsletter_create.analyze.not_pdf', [
+                'sessionId' => $sessionId,
+                'filename' => $file->getClientOriginalName(),
+                'ext' => $ext,
+                'mime' => $file->getMimeType(),
+                'head' => bin2hex($head),
+            ]);
+
+            return [
+                'type' => ResponseCode::UNSUPPORTED_FILE_TYPE,
+                'answer' => 'Vorlage ist kein Newsletter PDF',
+            ];
+        }
+
+        // Optional streng: wenn du wirklich NUR .pdf zulassen willst (auch wenn Inhalt PDF ist)
+        if ($ext !== 'pdf') {
+            $this->supportSolutionLogger->warning('newsletter_create.analyze.not_pdf_extension', [
+                'sessionId' => $sessionId,
+                'filename' => $file->getClientOriginalName(),
+                'ext' => $ext,
+                'mime' => $file->getMimeType(),
+            ]);
+
+            return [
+                'type' => ResponseCode::UNSUPPORTED_FILE_TYPE,
+                'answer' => 'Vorlage ist kein Newsletter PDF',
+            ];
+        }
+
 
         // 3) PDF -> TEXT
         $text = $this->extractPdfTextWithPdftotext($file->getPathname());
@@ -80,6 +124,14 @@ final class NewsletterCreateResolver
             ];
         }
 
+        if (!$this->looksLikeNewsletter($text)) {
+            return [
+                'type' => ResponseCode::UNSUPPORTED_TEMPLATE,
+                'answer' => 'Vorlage ist kein Newsletter PDF',
+            ];
+        }
+
+
         // 4) Jahr/KW aus Dateiname
         $originalName = (string) $file->getClientOriginalName();
         $parsed = $this->parseYearKwFromFilename($originalName);
@@ -95,7 +147,7 @@ final class NewsletterCreateResolver
             ]);
 
             return [
-                'type' => 'error',
+                'type' => ResponseCode::INVALID_FILENAME,
                 'answer' =>
                     "Konnte **Jahr/KW** nicht sicher aus dem Dateinamen lesen.\n"
                     . "Erwartet z.B.: `Newsletter_2025_KW53.pdf`.\n"
@@ -180,20 +232,33 @@ final class NewsletterCreateResolver
 
         $keywords = $this->normalizeKeywords($json['keywords'] ?? [], $kw, $year);
 
+        // ✅ Media-Felder für Newsletter:
+        // Newsletter sind immer "external" (Google Drive). Wenn kein Drive-Link vorhanden ist,
+        // dann sauber abbrechen (weil sonst später die Quelle fehlt).
+        if ($driveId === '') {
+            return [
+                'type' => ResponseCode::NEED_DRIVE,
+                'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
+            ];
+        }
+
         $draft = [
             'type' => 'FORM',
             'title' => "Newsletter KW {$kw}/{$year}",
             'symptoms' => $symptoms,
             'context_notes' => $contextNotes !== '' ? $contextNotes : ("Quelle: {$originalName}"),
+
             'media_type' => 'external',
             'external_media_provider' => 'google_drive',
             'external_media_url' => $driveUrl,
             'external_media_id' => $driveId,
+
             'created_at' => $now,
             'updated_at' => $now,
             'published_at' => $publishedAt,
+
             'newsletter_year' => $year,
-            'newsletter_kw' => $kw, // ✅ integer Feld
+            'newsletter_kw' => $kw,
             'newsletter_edition' => 'STANDARD',
             'category' => 'NEWSLETTER',
             'keywords' => $keywords,
@@ -383,20 +448,38 @@ final class NewsletterCreateResolver
             $ln = trim($ln);
             if ($ln === '') continue;
             $ln = preg_replace('/^[\-\•\*]\s*/u', '', $ln) ?? $ln;
+
+            // 1) Leere Markdown-Links killen: [Text]() oder [Text](   )
+            if (preg_match('/\[[^\]]+\]\(\s*\)/u', $ln)) {
+                continue;
+            }
+
+            // 2) Optional: falls Modell sowas wie "(Drive-Ordner)()" liefert
+            if (preg_match('/\(\s*\)\s*$/u', $ln)) {
+                continue;
+            }
+
             $out[] = '* ' . $ln;
+
         }
 
         // Drive-Link Bullet sicherstellen
-        $hasDrive = false;
-        foreach ($out as $ln) {
-            if (str_contains($ln, 'drive.google.com')) {
-                $hasDrive = true;
-                break;
+        $driveUrl = trim($driveUrl);
+
+        // Drive-Link Bullet nur wenn driveUrl wirklich vorhanden ist
+        if ($driveUrl !== '') {
+            $hasDrive = false;
+            foreach ($out as $ln) {
+                if (str_contains($ln, 'drive.google.com')) {
+                    $hasDrive = true;
+                    break;
+                }
+            }
+            if (!$hasDrive) {
+                $out[] = "* [Newsletter (Drive-Ordner)]({$driveUrl})";
             }
         }
-        if (!$hasDrive) {
-            $out[] = "* [Newsletter (Drive-Ordner)]({$driveUrl})";
-        }
+
 
         return implode("\n", $out);
     }
@@ -535,6 +618,43 @@ final class NewsletterCreateResolver
             'kw' => $kw,
         ];
     }
+
+    private function looksLikeNewsletter(string $text): bool
+    {
+        $t = mb_strtolower(trim($text));
+
+        // zu kurz => sehr wahrscheinlich kein Newsletter
+        if (mb_strlen($t) < 800) {
+            return false;
+        }
+
+        // starke Indikatoren (mind. 1 Treffer)
+        $needles = [
+            'newsletter',
+            'kw ',
+            'kalenderwoche',
+            'filiale',
+            'filiale des monats',
+            'umsatz',
+            'bonwert',
+            'gewinnspiel',
+            'promotion',
+        ];
+
+        foreach ($needles as $n) {
+            if (str_contains($t, $n)) {
+                return true;
+            }
+        }
+
+        // optional: eure Filialcodes als Indikator (mind. 1)
+        if (preg_match('/\b(lpdo|lpsa|cola|cosu)\b/i', $text)) {
+            return true;
+        }
+
+        return false;
+    }
+
 
     private function mondayOfIsoWeek(int $year, int $kw): \DateTimeImmutable
     {

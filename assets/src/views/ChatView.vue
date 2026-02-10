@@ -199,6 +199,12 @@ function onNewsletterFile(f) {
     newsletterFile.value = f
     newsletterFileName.value = f?.name || ''
     dlog('newsletter file selected:', newsletterFileName.value)
+
+    // ✅ Auto-select category based on filename
+    const name = (newsletterFileName.value || '').toLowerCase()
+    if (name.includes('newsletter')) {
+        importCategory.value = 'NEWSLETTER'
+    }
 }
 function clearNewsletterFile() {
     newsletterFile.value = null

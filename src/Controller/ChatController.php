@@ -399,6 +399,23 @@ final class ChatController extends AbstractController
                 'content_length' => $request->headers->get('content-length'),
             ]);
 
+            // ✅ Form-Analyse: Datei ist Pflicht
+            if (!$file instanceof \Symfony\Component\HttpFoundation\File\UploadedFile) {
+                return new JsonResponse([
+                    'type' => 'need_input',
+                    'answer' => 'Bitte lade eine Datei hoch.',
+                ], 422);
+            }
+
+            // ✅ Form-Analyse: Drive-Link ist zusätzlich Pflicht
+            if (trim($driveUrl) === '') {
+                return new JsonResponse([
+                    'type' => 'need_drive',
+                    'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
+                ], 422);
+            }
+
+
 
             // ✅ Guard: mindestens file ODER drive_url
             if ($file === null && $driveUrl === '') {

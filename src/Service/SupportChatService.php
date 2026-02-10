@@ -774,7 +774,8 @@ final class SupportChatService
         $context ??= [];
         $context['usage_key']  = $context['usage_key'] ?? 'support_chat.ask';
         $context['mode_hint']  = $context['mode_hint'] ?? 'ai_with_db';
-        $context['kb_matches'] = $context['kb_matches'] ?? ($mappedMatches ?? []);
+        $context['kb_matches'] = $context['kb_matches'] ?? $matches;
+
 
         try {
             $answer = $this->span($trace, 'ai.call', function () use ($trimmedHistory, $kbContext, $provider, $model, $context) {
@@ -820,6 +821,7 @@ final class SupportChatService
                 'matches' => $sops,
                 'choices' => $formChoices,
                 'modeHint' => 'ai_with_db',
+                'model' => $model,
                 '_meta' => [
                     'ai_used' => true,
                 ],
@@ -860,6 +862,7 @@ final class SupportChatService
             'matches' => $sops,
             'modeHint' => 'ai_with_db',
             'choices' => $formChoices, // only forms in UI
+            'model' => $model,
             '_meta' => [
                 'ai_used' => true,
             ],
@@ -1173,6 +1176,7 @@ final class SupportChatService
             $others[] = $m;
         }
 
+        $lines = [];
         $lines[] = "KB_CONTEXT: present";
         $lines[] = "KONTEXT: Interne Wissensdatenbank-Treffer (zur Beantwortung der Nutzerfrage).";
         $lines[] = "HINWEIS: Gib nur eine normale Nutzer-Antwort aus (keine internen Hinweise, keine Meta-Erklärungen).";
