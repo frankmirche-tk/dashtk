@@ -79,7 +79,7 @@ final class NewsletterCreateResolver
         // Newsletter-Metadaten (Resolver entscheidet!)
         $year = 0;
         $kw = 0;
-        $edition = null; // int|null
+        $edition = 'STANDARD'; // string enum: STANDARD | TEIL_1 | TEIL_2 | SPECIAL ...
         $publishedAt = null; // \DateTimeImmutable|null
 
         try {
@@ -171,26 +171,26 @@ final class NewsletterCreateResolver
                 $warnings[] = 'Jahr/KW konnten nicht sicher aus Dateiname/Text erkannt werden. Fallback: aktuelle KW verwendet.';
             }
 
-            // Edition aus Dateiname oder Text (Teil X / Part X)
-            $edition = null;
-            if (preg_match('/\bteil\s*([1-9]\d?)\b/iu', $normalizedName, $m)) {
-                $edition = (int)$m[1];
-            } elseif ($pdfText !== '' && preg_match('/\bteil\s*([1-9]\d?)\b/iu', mb_substr($pdfText, 0, 2000), $m)) {
-                $edition = (int)$m[1];
-            } elseif (preg_match('/\bpart\s*([1-9]\d?)\b/iu', $normalizedName, $m)) {
-                $edition = (int)$m[1];
-            } elseif ($pdfText !== '' && preg_match('/\bpart\s*([1-9]\d?)\b/iu', mb_substr($pdfText, 0, 2000), $m)) {
-                $edition = (int)$m[1];
-            }
+            // Edition immer als String/Enum, Default STANDARD.
+            // Quelle: erst (ggf.) GUI, dann Dateiname, dann Titel, dann PDF-Text.
+            $edition = $this->resolveNewsletterEdition(
+                guiEdition: null, // aktuell habt ihr im Analyze-Flow kein GUI-Feld; später ggf. $obj['newsletter_edition'] ?? null
+                filename: $normalizedName,
+                title: $message,  // falls ihr den "Titel" im Message-Text habt; sonst '' lassen
+                pdfText: $pdfText
+            );
+
 
             // published_at = Montag der ISO-KW
             $publishedAt = $this->mondayOfIsoWeek($year, $kw);
 
-            // Title strikt
             $title = "Newsletter KW {$kw}/{$year}";
-            if (is_int($edition) && $edition > 0) {
-                $title .= " – Teil {$edition}";
+            if (is_string($edition) && preg_match('/^TEIL_(\d+)$/', $edition, $m)) {
+                $title .= " – Teil " . (int)$m[1];
+            } elseif ($edition === 'SPECIAL') {
+                $title .= " – Special";
             }
+
 
             // 5) Prompt bauen (KI liefert NUR symptoms/context_notes/keywords)
             $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
@@ -305,11 +305,13 @@ final class NewsletterCreateResolver
             $now = $this->nowMidnight();
 
             $draft = [
-                'type' => 'NEWSLETTER',
+                // Business-Regel: Newsletter sind in support_solution immer type="FORM"
+                'type' => 'FORM',
                 'title' => $title,
                 'symptoms' => $symptoms,
                 'context_notes' => $contextNotes,
                 'keywords' => $keywords,
+
 
                 // Media: Drive wenn vorhanden, sonst Upload
                 'media_type' => $driveUrl !== '' ? 'external' : 'upload',
@@ -322,9 +324,8 @@ final class NewsletterCreateResolver
                 'published_at' => $publishedAt?->format('Y-m-d H:i:s'),
                 'newsletter_year' => $year,
                 'newsletter_kw' => $kw,
-                'newsletter_edition' => (is_int($edition) && $edition > 0) ? $edition : null,
+                'newsletter_edition' => $edition, // nie NULL, immer STANDARD/TEIL_X/SPECIAL
                 'category' => 'NEWSLETTER',
-
                 'drive_url' => $driveUrl,
                 'filename' => $normalizedName,
             ];
@@ -340,9 +341,14 @@ final class NewsletterCreateResolver
             $answerLines[] = "Bitte prüfen und bestätigen:";
             $answerLines[] = "- Titel: {$title}";
             $answerLines[] = "- Ausgabe: {$year} / KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
-            if (is_int($edition) && $edition > 0) {
-                $answerLines[] = "- Edition: Teil {$edition}";
+            if (is_string($edition) && preg_match('/^TEIL_(\d+)$/', $edition, $m)) {
+                $answerLines[] = "- Edition: Teil " . (int)$m[1];
+            } elseif ($edition === 'SPECIAL') {
+                $answerLines[] = "- Edition: Special";
+            } else {
+                $answerLines[] = "- Edition: STANDARD";
             }
+
             $answerLines[] = "- Kategorie: NEWSLETTER";
             $answer = implode("\n", $answerLines);
 
@@ -790,6 +796,107 @@ final class NewsletterCreateResolver
         return [0, 0];
     }
 
+    private function resolveNewsletterEdition(?string $guiEdition, string $filename, string $title, string $pdfText = ''): string
+    {
+        // 1) GUI hat Vorrang (falls ihr später im Flow eine Edition mitschickt)
+        $guiEdition = is_string($guiEdition) ? trim($guiEdition) : '';
+        if ($guiEdition !== '') {
+            return $this->normalizeNewsletterEdition($guiEdition);
+        }
+
+        // 2) Dateiname ist die wichtigste Quelle
+        $fromFile = $this->editionFromFilename($filename);
+        if ($fromFile !== '') {
+            return $fromFile;
+        }
+
+        // 3) Fallback: Titel (letztes Token)
+        $fromTitle = $this->editionFromTitle($title);
+        if ($fromTitle !== '') {
+            return $fromTitle;
+        }
+
+        // 4) Optionaler Fallback: PDF-Text (nur am Anfang, damit es nicht teuer wird)
+        $pdfText = trim($pdfText);
+        if ($pdfText !== '') {
+            $head = mb_substr($pdfText, 0, 2000);
+            if (preg_match('/\bteil\s*0*([1-9]\d?)\b/iu', $head, $m)) {
+                return 'TEIL_' . (int)$m[1];
+            }
+            if (preg_match('/\bpart\s*0*([1-9]\d?)\b/iu', $head, $m)) {
+                return 'TEIL_' . (int)$m[1];
+            }
+            if (preg_match('/\bspecial\b/iu', $head)) {
+                return 'SPECIAL';
+            }
+        }
+
+        return 'STANDARD';
+    }
+
+    private function editionFromFilename(string $filename): string
+    {
+        $name = trim($filename);
+        if ($name === '') return '';
+
+        $base = pathinfo($name, PATHINFO_FILENAME); // ohne .pdf
+
+        // Alles nach KWxx ist Kandidat für Edition
+        // Beispiele:
+        // Newsletter_2026_KW5_Teil2.pdf   => suffix "Teil2"
+        // Newsletter_2026_KW05_SPECIAL.pdf => suffix "SPECIAL"
+        if (!preg_match('/\bkw\s*0?([1-9]|[1-4]\d|5[0-3])\b(.*)$/iu', $base, $m)) {
+            return ''; // kein KW gefunden => keine Edition ableitbar
+        }
+
+        $suffix = trim((string)($m[2] ?? ''), " _-");
+        if ($suffix === '') {
+            return 'STANDARD';
+        }
+
+        return $this->normalizeNewsletterEdition($suffix);
+    }
+
+    private function editionFromTitle(string $title): string
+    {
+        $t = trim($title);
+        if ($t === '') return '';
+
+        // letzter "Token" nach Space/_/-
+        $parts = preg_split('/[\s_\-]+/u', $t);
+        if (!$parts || count($parts) === 0) return '';
+
+        $last = trim((string)end($parts));
+        if ($last === '') return '';
+
+        return $this->normalizeNewsletterEdition($last);
+    }
+
+    private function normalizeNewsletterEdition(string $raw): string
+    {
+        $s = strtoupper(trim($raw));
+
+        // STANDARD
+        if ($s === 'STANDARD') return 'STANDARD';
+
+        // SPECIAL
+        if (str_contains($s, 'SPECIAL')) return 'SPECIAL';
+
+        // TEIL2 / TEIL_2 / TEIL-2 / PART2 / PART_2
+        if (preg_match('/\b(TEIL|PART)[_\- ]*0*([1-9]\d*)\b/iu', $s, $m)) {
+            return 'TEIL_' . (int)$m[2];
+        }
+
+        // Falls schon "TEIL_2" kommt
+        if (preg_match('/^TEIL_0*([1-9]\d*)$/iu', $s, $m)) {
+            return 'TEIL_' . (int)$m[1];
+        }
+
+        // Unknown => Default
+        return 'STANDARD';
+    }
+
+
     private function looksLikeNewsletter(string $pdfText): bool
     {
         $t = mb_strtolower($pdfText);
@@ -892,4 +999,6 @@ final class NewsletterCreateResolver
 
         return $w;
     }
+
+
 }
