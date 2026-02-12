@@ -6,14 +6,14 @@ namespace App\Service;
 
 use App\AI\AiChatGateway;
 use App\Tracing\Trace;
+use Doctrine\DBAL\Connection;
 use Psr\Log\LoggerInterface;
+use Ramsey\Uuid\Uuid;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
-use Doctrine\DBAL\Connection;
 use App\Validator\TKFashionPolicyKeywords;
-
 
 final class NewsletterCreateResolver
 {
@@ -25,11 +25,13 @@ final class NewsletterCreateResolver
         private readonly Connection $db,
         private readonly LoggerInterface $supportSolutionLogger,
         private readonly PromptTemplateLoader $promptLoader,
+        private readonly DocumentLoader $documentLoader,
         private readonly TKFashionPolicyKeywords $keywordPolicy,
         KernelInterface $kernel,
     ) {
         $this->isDev = $kernel->getEnvironment() === 'dev';
     }
+
 
     public function analyze(
         string $sessionId,
@@ -37,325 +39,491 @@ final class NewsletterCreateResolver
         string $driveUrl,
         ?UploadedFile $file,
         ?string $model = null,
-        ?Trace $trace = null
+        ?Trace $trace = null,
+        ?string $provider = null,
+        ?string $traceId = null,
     ): array {
+        $traceId  = $this->ensureTraceId($traceId);
+        $provider = $this->normalizeProvider($provider);
+
         $driveUrl = trim($driveUrl);
-        $driveId = $this->extractDriveId($driveUrl);
+        $driveId  = $driveUrl !== '' ? $this->extractDriveId($driveUrl) : '';
 
-        $this->supportSolutionLogger->info('newsletter_create.analyze.start', [
-            'sessionId' => $sessionId,
-            'hasFile' => $file instanceof UploadedFile,
-            'driveId' => $driveId !== '' ? 'ok' : 'missing',
-            'model' => $model,
-        ]);
+        $hasFile  = $file instanceof UploadedFile;
+        $hasDrive = $driveUrl !== '';
 
-        // 1) Drive-Link Pflicht
-        if ($driveId === '' && !$file instanceof UploadedFile) {
-            return [
-                'type' => 'need_drive',
-                'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
-            ];
+        if (!$hasFile && !$hasDrive) {
+            return $this->errorResponse(
+                traceId: $traceId,
+                code: 'need_input',
+                message: 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
+            );
         }
 
-        // 2) File Pflicht
-        if (!$file instanceof UploadedFile) {
-            return [
-                'type' => 'error',
-                'answer' => 'Kein PDF hochgeladen. Bitte Datei auswählen und erneut senden.',
-            ];
-        }
-        // 2.1) Newsletter akzeptiert NUR echte PDFs (Magic Bytes)
-        $path = $file->getPathname();
-        $fh = @fopen($path, 'rb');
-        $head = $fh ? fread($fh, 8) : '';
-        if (is_resource($fh)) {
-            fclose($fh);
-        }
-        $head = is_string($head) ? $head : '';
-
-        $isPdf = str_starts_with($head, '%PDF-');
-        $ext = strtolower(pathinfo((string) $file->getClientOriginalName(), PATHINFO_EXTENSION));
-
-        // Fake PDFs (Endung .pdf aber kein echtes PDF) und alle Nicht-PDFs hart blocken
-        if (!$isPdf) {
-            $this->supportSolutionLogger->warning('newsletter_create.analyze.not_pdf', [
-                'sessionId' => $sessionId,
-                'filename' => $file->getClientOriginalName(),
-                'ext' => $ext,
-                'mime' => $file->getMimeType(),
-                'head' => bin2hex($head),
-            ]);
-
-            return [
-                'type' => ResponseCode::UNSUPPORTED_FILE_TYPE,
-                'answer' => 'Vorlage ist kein Newsletter PDF',
-            ];
+        // Wenn Drive-Link angegeben wurde, dann muss er auch gültig sein
+        if ($hasDrive && $driveId === '') {
+            return $this->errorResponse(
+                traceId: $traceId,
+                code: 'need_drive',
+                message: 'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link und kopiere ihn erneut.',
+            );
         }
 
-        // Optional streng: wenn du wirklich NUR .pdf zulassen willst (auch wenn Inhalt PDF ist)
-        if ($ext !== 'pdf') {
-            $this->supportSolutionLogger->warning('newsletter_create.analyze.not_pdf_extension', [
-                'sessionId' => $sessionId,
-                'filename' => $file->getClientOriginalName(),
-                'ext' => $ext,
-                'mime' => $file->getMimeType(),
-            ]);
+        $doc = null;
 
-            return [
-                'type' => ResponseCode::UNSUPPORTED_FILE_TYPE,
-                'answer' => 'Vorlage ist kein Newsletter PDF',
-            ];
-        }
+        $normalizedName = '';
+        $warnings = [];
+        $pdfText = '';
+        $isScannedHint = false;
 
-
-        // 3) PDF -> TEXT
-        $text = $this->extractPdfTextWithPdftotext($file->getPathname());
-        $text = trim($text);
-
-        if ($text === '') {
-            $this->supportSolutionLogger->warning('newsletter_create.analyze.pdf_empty', [
-                'sessionId' => $sessionId,
-                'filename' => $file->getClientOriginalName(),
-            ]);
-
-            return [
-                'type' => 'error',
-                'answer' => 'PDF-Text-Extraktion fehlgeschlagen (pdftotext liefert leer). Bitte PDF prüfen oder Parser wechseln.',
-            ];
-        }
-
-        if (!$this->looksLikeNewsletter($text)) {
-            return [
-                'type' => ResponseCode::UNSUPPORTED_TEMPLATE,
-                'answer' => 'Vorlage ist kein Newsletter PDF',
-            ];
-        }
-
-
-        // 4) Jahr/KW aus Dateiname
-        $originalName = (string) $file->getClientOriginalName();
-        $parsed = $this->parseYearKwFromFilename($originalName);
-
-        $year = $parsed['year'];
-        $kw = $parsed['kw'];
-
-        if (!is_int($year) || $year < 2000 || $year > 2100 || !is_int($kw) || $kw < 1 || $kw > 53) {
-            $this->supportSolutionLogger->warning('newsletter_create.analyze.filename_parse_failed', [
-                'sessionId' => $sessionId,
-                'filename' => $originalName,
-                'parsed' => $parsed,
-            ]);
-
-            return [
-                'type' => ResponseCode::INVALID_FILENAME,
-                'answer' =>
-                    "Konnte **Jahr/KW** nicht sicher aus dem Dateinamen lesen.\n"
-                    . "Erwartet z.B.: `Newsletter_2025_KW53.pdf`.\n"
-                    . "Dateiname war: `{$parsed['raw']}`",
-            ];
-        }
-
-        $publishedAt = $this->mondayOfIsoWeek($year, $kw)->format('Y-m-d 00:00:00');
-        $now = $this->nowMidnight();
-
-        // 5) OpenAI Draft bauen (JSON)
-        $prompt = $this->buildNewsletterPrompt(
-            filename: $originalName,
-            year: $year,
-            kw: $kw,
-            driveUrl: $driveUrl,
-            pdfText: $text,
-        );
-
-        $aiContext = [
-            'usage_key' => 'support_chat.newsletter_create',
-            'response_format' => ['type' => 'json_object'],
-            'temperature' => 0.2,
-        ];
-
-        $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
-                $history = [
-                        ['role' => 'system', 'content' => $tpl['system']],
-                        ['role' => 'user', 'content' => $prompt],
-                    ];
-
-        $this->supportSolutionLogger->info('newsletter_create.ai.request', [
-            'sessionId' => $sessionId,
-            'model' => $model,
-            'kw' => $kw,
-            'year' => $year,
-            'textChars' => mb_strlen($text),
-        ]);
+        // Newsletter-Metadaten (Resolver entscheidet!)
+        $year = 0;
+        $kw = 0;
+        $edition = null; // int|null
+        $publishedAt = null; // \DateTimeImmutable|null
 
         try {
-            $raw = $this->aiChat->chat(
+            // 1) PDF laden: Drive preferred, sonst Upload
+            if ($driveId !== '') {
+                $doc = $this->documentLoader->loadPdf($driveId, $file);
+                $path = (string)($doc['pdfPath'] ?? '');
+                if ($path === '' || !is_file($path)) {
+                    return $this->errorResponse(
+                        traceId: $traceId,
+                        code: 'drive_url_unreachable',
+                        message: 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
+                    );
+                }
+                $normalizedName = $this->normalizeFilename((string)($doc['originalName'] ?? 'Newsletter.pdf'));
+            } else {
+                // Upload-only
+                if (!$file instanceof UploadedFile) {
+                    return $this->errorResponse(
+                        traceId: $traceId,
+                        code: 'need_input',
+                        message: 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
+                    );
+                }
+                $path = $file->getPathname();
+                $normalizedName = $this->normalizeFilename((string)$file->getClientOriginalName());
+            }
+
+            $warnings = $this->filenameWarnings($normalizedName);
+
+            // 2) PDF Magic Bytes (echtes PDF)
+            $fh = @fopen($path, 'rb');
+            $head = $fh ? fread($fh, 8) : '';
+            if (is_resource($fh)) { fclose($fh); }
+            $head = is_string($head) ? $head : '';
+
+            if (!str_starts_with($head, '%PDF-')) {
+                return $this->errorResponse(
+                    traceId: $traceId,
+                    code: 'invalid_filetype',
+                    message: 'Die Datei ist kein echtes PDF. Bitte nutze ein gültiges PDF.',
+                );
+            }
+
+            // 3) Text extrahieren + Scan-Hinweis
+            try {
+                // wenn docLoader vorhanden und Drive genutzt wurde: nutzen, sonst fallback pdftotext
+                if ($driveId !== '' && method_exists($this->documentLoader, 'extractTextOrThrowScanned')) {
+                    $pdfText = $this->documentLoader->extractTextOrThrowScanned($path);
+                } else {
+                    $pdfText = $this->extractPdfTextWithPdftotext($path);
+                    if (mb_strlen(trim($pdfText)) < 120) {
+                        throw new \RuntimeException('PDF_SCANNED_NEEDS_OCR');
+                    }
+                }
+            } catch (\RuntimeException $e) {
+                if ($e->getMessage() === 'PDF_SCANNED_NEEDS_OCR') {
+                    $isScannedHint = true;
+                    $warnings[] = 'PDF wirkt gescannt (wenig Text extrahierbar). OCR kann später die Qualität verbessern.';
+                    $pdfText = '';
+                } else {
+                    throw $e;
+                }
+            }
+
+            // 4) Year/KW/Edition ermitteln (Resolver!)
+            [$yFromFn, $kwFromFn] = $this->parseYearKwFromFilename($normalizedName);
+            $year = $yFromFn;
+            $kw   = $kwFromFn;
+
+            // Optional: aus Text ziehen, falls Dateiname nicht hilft
+            if (($year <= 0 || $kw <= 0) && $pdfText !== '') {
+                $t = mb_strtolower($pdfText);
+                // Beispiele: "KW 07/2026", "KW07 2026", "Kalenderwoche 7 2026"
+                if (preg_match('/\bkw\s*0?([1-9]|[1-4]\d|5[0-3])\b.*?\b([12]\d{3})\b/u', $t, $m)) {
+                    $kw = (int)$m[1];
+                    $year = (int)$m[2];
+                } elseif (preg_match('/\b([12]\d{3})\b.*?\bkw\s*0?([1-9]|[1-4]\d|5[0-3])\b/u', $t, $m)) {
+                    $year = (int)$m[1];
+                    $kw = (int)$m[2];
+                }
+            }
+
+            // Fallback: aktuelle ISO-Woche/Jahr (nur wenn sonst nichts)
+            if ($year <= 0 || $kw <= 0) {
+                $now = new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin'));
+                $year = (int)$now->format('o'); // ISO year
+                $kw   = (int)$now->format('W');
+                $warnings[] = 'Jahr/KW konnten nicht sicher aus Dateiname/Text erkannt werden. Fallback: aktuelle KW verwendet.';
+            }
+
+            // Edition aus Dateiname oder Text (Teil X / Part X)
+            $edition = null;
+            if (preg_match('/\bteil\s*([1-9]\d?)\b/iu', $normalizedName, $m)) {
+                $edition = (int)$m[1];
+            } elseif ($pdfText !== '' && preg_match('/\bteil\s*([1-9]\d?)\b/iu', mb_substr($pdfText, 0, 2000), $m)) {
+                $edition = (int)$m[1];
+            } elseif (preg_match('/\bpart\s*([1-9]\d?)\b/iu', $normalizedName, $m)) {
+                $edition = (int)$m[1];
+            } elseif ($pdfText !== '' && preg_match('/\bpart\s*([1-9]\d?)\b/iu', mb_substr($pdfText, 0, 2000), $m)) {
+                $edition = (int)$m[1];
+            }
+
+            // published_at = Montag der ISO-KW
+            $publishedAt = $this->mondayOfIsoWeek($year, $kw);
+
+            // Title strikt
+            $title = "Newsletter KW {$kw}/{$year}";
+            if (is_int($edition) && $edition > 0) {
+                $title .= " – Teil {$edition}";
+            }
+
+            // 5) Prompt bauen (KI liefert NUR symptoms/context_notes/keywords)
+            $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
+
+            $system = $this->promptLoader->render((string)($tpl['system'] ?? ''), [
+                'today' => (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d'),
+            ]);
+
+            $user = $this->promptLoader->render((string)($tpl['user'] ?? ''), [
+                'filename' => ($normalizedName !== '' ? $normalizedName : 'Newsletter.pdf'),
+                'year' => $year,
+                'kw' => $kw,
+                'driveUrl' => $driveUrl !== '' ? $driveUrl : '#',
+                'pdfText' => trim($pdfText),
+            ]);
+
+            $history = [
+                ['role' => 'system', 'content' => $system !== '' ? $system : 'Antworte ausschließlich als JSON. Keine Extras.'],
+                ['role' => 'user', 'content' => $user],
+            ];
+
+            $aiRaw = $this->aiChat->chat(
                 history: $history,
                 kbContext: '',
-                provider: 'openai',
+                provider: $provider,
                 model: $model,
-                context: $aiContext
+                context: [
+                    'usage_key' => 'support_chat.newsletter_create.analyze',
+                    'mode_hint' => 'newsletter_create',
+                    'trace_id' => $traceId,
+                    'scan_hint' => $isScannedHint,
+                ]
             );
-        } catch (\Throwable $e) {
-            $this->supportSolutionLogger->error('newsletter_create.ai.failed', [
-                'sessionId' => $sessionId,
-                'error' => $e->getMessage(),
-                'class' => $e::class,
-            ]);
 
-            return [
-                'type' => 'error',
-                'answer' => $this->isDev
-                    ? ('OpenAI Fehler (DEV): ' . $e->getMessage())
-                    : 'OpenAI Anfrage fehlgeschlagen. Bitte dev.log prüfen.',
+            $obj = $this->decodeJsonObject($aiRaw);
+            if (!is_array($obj)) {
+                return $this->errorResponse(
+                    traceId: $traceId,
+                    code: 'ai_invalid_response',
+                    message: 'Ich konnte die Newsletter-Analyse nicht zuverlässig auswerten. Bitte versuche es erneut.',
+                    extra: ['provider' => $provider, 'model' => $model],
+                );
+            }
+
+            // 6) KI-Felder übernehmen (NUR diese!)
+            $symptomsRaw = is_string($obj['symptoms'] ?? null) ? (string)$obj['symptoms'] : '';
+            $contextNotes = is_string($obj['context_notes'] ?? null) ? (string)$obj['context_notes'] : '';
+            $keywords = $this->normalizeKeywords($obj['keywords'] ?? []);
+            $keywords = $this->keywordPolicy->filterKeywordObjects($keywords, 20);
+
+            // Zusätzliche Keyword-Regeln (entspricht eurer Policy grob; endgültig am besten via TKFashionPolicyKeywords im Service)
+            $keywords = array_values(array_filter($keywords, static function ($k) {
+                if (!is_array($k)) return false;
+                $kw = (string)($k['keyword'] ?? '');
+                $kw = mb_strtolower(trim($kw));
+                if ($kw === '') return false;
+
+                // harte Pattern (wie Validator)
+                if (mb_strlen($kw) < 3) return false;
+                if (preg_match('/^\d+$/', $kw)) return false;
+                if (preg_match('/^[a-z0-9]{4,5}$/i', $kw)) return false;
+                if (preg_match('/^kw[\s\-_]?\d{1,2}$/i', $kw)) return false;
+
+                // häufige Unsinn-Keywords aus eurer Config (minimal, damit ihr sofort Ruhe habt)
+                $block = [
+                    'problem','probleme','fehler','status',
+                    'hilfe','support','anleitung','thema','info','information','beschreibung','meldung',
+                    'deutschland','dokument','newsletter','formular',
+                    'montag','dienstag','mittwoch','donnerstag','freitag','samstag','sonntag',
+                    'system','software','hardware','gerät','drucker','service','filiale','filialen',
+                    'test','ok','ja','nein','neu','alt',
+                ];
+                if (in_array($kw, $block, true)) return false;
+
+                return true;
+            }));
+
+            if (count($keywords) > 20) {
+                $keywords = array_slice($keywords, 0, 20);
+            }
+
+            // symptoms normalisieren + finaler Newsletter-Link (genau 1x)
+            $symptoms = trim($symptomsRaw);
+            $symptoms = preg_replace('/\r\n?/', "\n", $symptoms) ?? $symptoms;
+
+            // nur *-Zeilen behalten, leere raus
+            $lines = $symptoms === '' ? [] : explode("\n", $symptoms);
+            $clean = [];
+            foreach ($lines as $ln) {
+                $ln = trim($ln);
+                if ($ln === '') continue;
+                // entferne alte Drive/Newsletter-Links aus KI-Antwort (wird unten neu gesetzt)
+                if (stripos($ln, 'drive.google.com') !== false) continue;
+                if (preg_match('/^\*\s*\[newsletter\s*kw/i', $ln)) continue;
+
+                // erzwinge "* "
+                $ln = preg_replace('/^\*\s*/u', '* ', $ln) ?? $ln;
+                if (!str_starts_with($ln, '* ')) {
+                    $ln = '* ' . ltrim($ln, "-•\t ");
+                }
+                $clean[] = $ln;
+            }
+
+            $kwLabel = (string)$kw; // ohne 0-padding im Link-Text war bei euch ok
+            $linkUrl = $driveUrl !== '' ? $driveUrl : '#';
+            $clean[] = "* [Newsletter KW{$kwLabel} ({$year}) (Drive-Ordner)]({$linkUrl})";
+
+            $symptoms = trim(implode("\n", $clean));
+
+            // 7) Draft bauen (Resolver entscheidet ALLES außer symptoms/context/keywords)
+            $draftId = 'doc_' . str_replace('-', '', (string)Uuid::uuid4());
+            $now = $this->nowMidnight();
+
+            $draft = [
+                'type' => 'NEWSLETTER',
+                'title' => $title,
+                'symptoms' => $symptoms,
+                'context_notes' => $contextNotes,
+                'keywords' => $keywords,
+
+                // Media: Drive wenn vorhanden, sonst Upload
+                'media_type' => $driveUrl !== '' ? 'external' : 'upload',
+                'external_media_provider' => $driveUrl !== '' ? 'gdrive' : null,
+                'external_media_url' => $driveUrl !== '' ? $driveUrl : null,
+                'external_media_id' => $driveUrl !== '' ? $driveId : null,
+
+                'created_at' => $now->format('Y-m-d H:i:s'),
+                'updated_at' => $now->format('Y-m-d H:i:s'),
+                'published_at' => $publishedAt?->format('Y-m-d H:i:s'),
+                'newsletter_year' => $year,
+                'newsletter_kw' => $kw,
+                'newsletter_edition' => (is_int($edition) && $edition > 0) ? $edition : null,
+                'category' => 'NEWSLETTER',
+
+                'drive_url' => $driveUrl,
+                'filename' => $normalizedName,
             ];
+
+            $this->storeDraft($draftId, $draft);
+
+            $headerTitle = "Newsletter {$year} • KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
+            $headerSubtitle = ($driveUrl !== '')
+                ? ($normalizedName !== '' ? "Quelle: Google Drive • {$normalizedName}" : "Quelle: Google Drive")
+                : ($normalizedName !== '' ? "Quelle: Upload • {$normalizedName}" : "Quelle: Upload");
+
+            $answerLines = [];
+            $answerLines[] = "Bitte prüfen und bestätigen:";
+            $answerLines[] = "- Titel: {$title}";
+            $answerLines[] = "- Ausgabe: {$year} / KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
+            if (is_int($edition) && $edition > 0) {
+                $answerLines[] = "- Edition: Teil {$edition}";
+            }
+            $answerLines[] = "- Kategorie: NEWSLETTER";
+            $answer = implode("\n", $answerLines);
+
+            return $this->confirmResponse(
+                traceId: $traceId,
+                code: 'needs_confirmation',
+                answer: $answer,
+                draftId: $draftId,
+                confirmCard: $this->buildConfirmCard(
+                    kind: 'newsletter',
+                    draftId: $draftId,
+                    category: 'NEWSLETTER',
+                    headerTitle: $headerTitle,
+                    headerSubtitle: $headerSubtitle,
+                    fields: $draft,
+                    warnings: $warnings,
+                ),
+                extra: ['provider' => $provider, 'model' => $model]
+            );
+        } finally {
+            // Drive-Download cleanup (nur wenn documentLoader genutzt wurde)
+            if (is_array($doc) && !empty($doc['pdfPath'])) {
+                $this->documentLoader->cleanup((string)$doc['pdfPath']);
+            }
         }
-
-        $json = $this->decodeJsonObject($raw);
-        if (!is_array($json)) {
-            $this->supportSolutionLogger->warning('newsletter_create.ai.bad_json', [
-                'sessionId' => $sessionId,
-                'answerPreview' => mb_substr((string)$raw, 0, 500),
-            ]);
-
-            return [
-                'type' => 'error',
-                'answer' => "OpenAI hat kein gültiges JSON geliefert. Bitte dev.log prüfen.\n"
-                    . ($this->isDev ? ("Antwort (Preview):\n" . mb_substr((string)$raw, 0, 800)) : ''),
-            ];
-        }
-
-        // 6) Draft finalisieren (Hardfacts überschreiben/erzwingen)
-        $draftId = bin2hex(random_bytes(16));
-
-        $symptoms = $this->normalizeSymptoms((string)($json['symptoms'] ?? ''), $driveUrl);
-        $contextNotes = trim((string)($json['context_notes'] ?? ''));
-
-        $keywords = $this->normalizeKeywords($json['keywords'] ?? [], $kw, $year);
-
-        // ✅ Media-Felder für Newsletter:
-        // Newsletter sind immer "external" (Google Drive). Wenn kein Drive-Link vorhanden ist,
-        // dann sauber abbrechen (weil sonst später die Quelle fehlt).
-        if ($driveId === '') {
-            return [
-                'type' => ResponseCode::NEED_DRIVE,
-                'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
-            ];
-        }
-
-        $draft = [
-            'type' => 'FORM',
-            'title' => "Newsletter KW {$kw}/{$year}",
-            'symptoms' => $symptoms,
-            'context_notes' => $contextNotes !== '' ? $contextNotes : ("Quelle: {$originalName}"),
-
-            'media_type' => 'external',
-            'external_media_provider' => 'google_drive',
-            'external_media_url' => $driveUrl,
-            'external_media_id' => $driveId,
-
-            'created_at' => $now,
-            'updated_at' => $now,
-            'published_at' => $publishedAt,
-
-            'newsletter_year' => $year,
-            'newsletter_kw' => $kw,
-            'newsletter_edition' => 'STANDARD',
-            'category' => 'NEWSLETTER',
-            'keywords' => $keywords,
-            '_source_filename' => $originalName,
-        ];
-
-        $this->storeDraft($draftId, $draft);
-
-        $this->supportSolutionLogger->info('newsletter_create.analyze.ready_for_confirm', [
-            'sessionId' => $sessionId,
-            'draftId' => $draftId,
-            'kw' => $kw,
-            'year' => $year,
-            'keywords' => count($keywords),
-            'symptomsChars' => mb_strlen($symptoms),
-            'contextChars' => mb_strlen($draft['context_notes']),
-        ]);
-
-        return [
-            'type' => ResponseCode::NEEDS_CONFIRMATION,
-            'answer' => $this->renderConfirmText($draft),
-            'draftId' => $draftId,
-            'confirmCard' => [
-                'draftId' => $draftId,
-                'fields' => $draft,
-            ],
-            '_meta' => [
-                'ai_used' => true,
-            ],
-        ];
-
     }
+
+
+
+    /**
+     * Newsletter-spezifisch:
+     * - Entfernt alle vorhandenen Drive-Links aus symptoms
+     * - Erzwingt am Ende exakt:
+     *   * [Newsletter KW{{kw}} ({{year}}) (Drive-Ordner)]({{driveUrl}})
+     */
+    private function normalizeNewsletterSymptoms(string $symptoms, string $driveUrl, int $year, int $kw): string
+    {
+        $s = trim($symptoms);
+        $s = preg_replace('/\r\n?/', "\n", $s) ?? $s;
+
+        $lines = $s === '' ? [] : explode("\n", $s);
+        $filtered = [];
+        foreach ($lines as $line) {
+            if (stripos($line, 'drive.google.com') !== false) {
+                continue;
+            }
+            $filtered[] = rtrim($line);
+        }
+
+        $s = trim(implode("\n", $filtered));
+        if ($s !== '') { $s .= "\n"; }
+
+        $driveUrl = trim($driveUrl);
+        if ($driveUrl !== '') {
+            $kw2 = str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
+            $s .= "* [Newsletter KW{$kw2} ({$year}) (Drive-Ordner)]({$driveUrl})";
+        }
+
+        return trim($s);
+    }
+
+
+
 
     public function patch(
         string $sessionId,
         string $draftId,
-        string $message
+        string $message,
+        string $provider = 'openai',
+        ?string $model = null,
+        ?Trace $trace = null,
+        ?string $traceId = null,
     ): array {
+        $traceId = $this->ensureTraceId($traceId);
+        $provider = $this->normalizeProvider($provider);
+
         $draft = $this->loadDraft($draftId);
-
         if (!is_array($draft)) {
-            return [
-                'type' => 'error',
-                'answer' => 'Draft nicht gefunden/abgelaufen. Bitte Newsletter erneut analysieren.',
-            ];
+            return $this->errorResponse($traceId, 'draft_missing', 'Draft nicht gefunden/abgelaufen. Bitte Newsletter erneut analysieren.');
         }
 
-        $msg = trim($message);
-
-        // bewusst simpel (du kannst das später AI-gestützt machen)
-        if (preg_match('/published_at\s*(=|auf)\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/i', $msg, $m)) {
-            $draft['published_at'] = $m[2] . ' 00:00:00';
-        }
-        if (preg_match('/created_at\s*(=|auf)\s*([0-9]{4}-[0-9]{2}-[0-9]{2})/i', $msg, $m)) {
-            $draft['created_at'] = $m[2] . ' 00:00:00';
-            $draft['updated_at'] = $m[2] . ' 00:00:00';
-        }
-        if (preg_match('~drive[- ]link\s*(=|ist)?\s*(https?://\S+)~i', $msg, $m)) {
-            $draft['external_media_url'] = $m[2];
-            $draft['external_media_id'] = $this->extractDriveId($m[2]);
-        }
-
-        $this->storeDraft($draftId, $draft);
-
-        $this->supportSolutionLogger->info('newsletter_create.patch', [
-            'sessionId' => $sessionId,
-            'draftId' => $draftId,
+        $tpl = $this->promptLoader->load('NewsletterPatchPrompt.config');
+        $prompt = $this->promptLoader->render((string)$tpl['user'], [
+            'draft' => json_encode($draft, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            'message' => $message,
         ]);
 
-        return [
-            'type' => 'needs_confirmation',
-            'answer' => $this->renderConfirmText($draft),
-            'draftId' => $draftId,
-            'confirmCard' => [
-                'draftId' => $draftId,
-                'fields' => $draft,
-            ],
+        $history = [
+            ['role' => 'system', 'content' => 'Du bist ein Assistenzsystem. Antworte ausschließlich als JSON (Patch auf Draft).'],
+            ['role' => 'user', 'content' => $prompt],
         ];
+
+        $aiRaw = $this->aiChat->chat(
+            history: $history,
+            kbContext: '',
+            provider: $provider,
+            model: $model,
+            context: [
+                'usage_key' => 'support_chat.newsletter_create.patch',
+                'mode_hint' => 'newsletter_create_patch',
+                'trace_id' => $traceId,
+            ]
+        );
+
+        $obj = $this->decodeJsonObject($aiRaw);
+        if (!is_array($obj)) {
+            return $this->errorResponse($traceId, 'ai_invalid_response', 'Ich konnte die Änderungen nicht zuverlässig auswerten. Bitte formuliere die Änderung noch einmal.', [
+                'provider' => $provider, 'model' => $model
+            ]);
+        }
+
+        $patched = $draft;
+
+        if (isset($obj['title']) && is_string($obj['title'])) {
+            $t = trim($obj['title']);
+            if ($t !== '') { $patched['title'] = $t; }
+        }
+
+        if (isset($obj['symptoms']) && is_string($obj['symptoms'])) {
+            $patched['symptoms'] = $this->normalizeSymptoms($obj['symptoms'], (string)($draft['drive_url'] ?? ''));
+        }
+
+        if (isset($obj['keywords'])) {
+            $patched['keywords'] = $this->normalizeKeywords($obj['keywords']);
+        }
+
+        if (isset($obj['published_at']) && is_string($obj['published_at'])) {
+            $p = trim($obj['published_at']);
+            if ($p !== '') { $patched['published_at'] = $p; }
+        }
+
+        if (array_key_exists('newsletter_edition', $obj)) {
+            $ed = is_string($obj['newsletter_edition']) ? trim($obj['newsletter_edition']) : '';
+            $patched['newsletter_edition'] = ($ed !== '' ? $ed : null);
+        }
+
+        // hard rules
+        $patched['category'] = 'NEWSLETTER';
+        $patched['type'] = 'NEWSLETTER';
+        $patched['updated_at'] = $this->nowMidnight()->format('Y-m-d H:i:s');
+
+        $this->storeDraft($draftId, $patched);
+
+        $year = (int)($patched['newsletter_year'] ?? 0);
+        $kw = (int)($patched['newsletter_kw'] ?? 0);
+        $filename = (string)($patched['filename'] ?? 'Newsletter.pdf');
+
+        $headerTitle = ($year > 0 && $kw > 0)
+            ? "Newsletter {$year} • KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT)
+            : "Newsletter (Draft)";
+        $headerSubtitle = "Quelle: Upload • {$filename}";
+
+        return $this->confirmResponse(
+            traceId: $traceId,
+            code: 'needs_confirmation',
+            answer: 'Änderungen übernommen. Bitte prüfen und bestätigen.',
+            draftId: $draftId,
+            confirmCard: $this->buildConfirmCard(
+                kind: 'newsletter',
+                draftId: $draftId,
+                category: 'NEWSLETTER',
+                headerTitle: $headerTitle,
+                headerSubtitle: $headerSubtitle,
+                fields: $patched,
+                warnings: $this->filenameWarnings($this->normalizeFilename($filename)),
+            ),
+            extra: ['provider' => $provider, 'model' => $model]
+        );
     }
 
     public function confirm(
         string $sessionId,
-        string $draftId
+        string $draftId,
+        ?string $traceId = null
     ): array {
+        $traceId = $this->ensureTraceId($traceId);
         $draft = $this->loadDraft($draftId);
 
         if (!is_array($draft)) {
-            return [
-                'type' => 'error',
-                'answer' => 'Draft nicht gefunden/abgelaufen. Bitte Newsletter erneut analysieren.',
-            ];
+            return $this->errorResponse($traceId, 'draft_missing', 'Draft nicht gefunden/abgelaufen. Bitte Newsletter erneut analysieren.');
         }
-
-        $this->supportSolutionLogger->info('newsletter_create.confirm.start', [
-            'sessionId' => $sessionId,
-            'draftId' => $draftId,
-        ]);
 
         $this->db->beginTransaction();
         try {
@@ -371,327 +539,357 @@ final class NewsletterCreateResolver
                 'created_at' => $draft['created_at'],
                 'updated_at' => $draft['updated_at'],
                 'published_at' => $draft['published_at'],
-                'newsletter_year' => (int) $draft['newsletter_year'],
-                'newsletter_kw' => (int) $draft['newsletter_kw'],
+                'newsletter_year' => (int)$draft['newsletter_year'],
+                'newsletter_kw' => (int)$draft['newsletter_kw'],
                 'newsletter_edition' => $draft['newsletter_edition'],
                 'category' => $draft['category'],
             ]);
 
-            $solutionId = (int) $this->db->lastInsertId();
+            $solutionId = (int)$this->db->lastInsertId();
 
             foreach (($draft['keywords'] ?? []) as $kw) {
+                if (!is_array($kw)) { continue; }
+                $keyword = trim((string)($kw['keyword'] ?? ''));
+                if ($keyword === '') { continue; }
                 $this->db->insert('support_solution_keyword', [
                     'solution_id' => $solutionId,
-                    'keyword' => (string) $kw['keyword'],
-                    'weight' => (int) $kw['weight'],
+                    'keyword' => $keyword,
+                    'weight' => (int)($kw['weight'] ?? 1),
                 ]);
             }
 
             $this->db->commit();
             $this->cache->delete($this->draftCacheKey($draftId));
 
-            $this->supportSolutionLogger->info('newsletter_create.confirm.ok', [
-                'sessionId' => $sessionId,
-                'draftId' => $draftId,
-                'solutionId' => $solutionId,
+            return $this->answerResponse($traceId, 'ok', "✅ Newsletter wurde gespeichert (ID: {$solutionId}).", [
+                'draftId' => $draftId
             ]);
-
-            return [
-                'type' => 'ok',
-                'answer' => "✅ Newsletter wurde eingefügt. ID: {$solutionId}",
-            ];
         } catch (\Throwable $e) {
             $this->db->rollBack();
-
-            $this->supportSolutionLogger->error('newsletter_create.confirm.failed', [
-                'sessionId' => $sessionId,
-                'draftId' => $draftId,
-                'error' => $e->getMessage(),
-                'class' => $e::class,
-            ]);
-
-            throw $e;
+            return $this->errorResponse(
+                $traceId,
+                'db_insert_failed',
+                $this->isDev ? ('DB Insert fehlgeschlagen (DEV): ' . $e->getMessage()) : 'Speichern fehlgeschlagen. Bitte später erneut versuchen.'
+            );
         }
     }
 
     // ----------------------------
-    // Prompt / Normalizer
+    // ConfirmCard + Response Helpers
+    // ----------------------------
+
+    private function buildConfirmCard(
+        string $kind,
+        string $draftId,
+        string $category,
+        string $headerTitle,
+        string $headerSubtitle,
+        array $fields,
+        array $warnings = [],
+    ): array {
+        return [
+            'kind' => $kind,
+            'draftId' => $draftId,
+            'category' => $category,
+            'header' => ['title' => $headerTitle, 'subtitle' => $headerSubtitle],
+            'fields' => $fields,
+            'warnings' => array_values(array_filter(array_map('strval', $warnings))),
+            'actions' => ['patch', 'confirm'],
+        ];
+    }
+
+    private function answerResponse(string $traceId, string $code, string $message, array $extra = []): array
+    {
+        return array_merge([
+            'type' => 'answer',
+            'answer' => $message,
+            'trace_id' => $traceId,
+            'code' => $code,
+        ], $extra);
+    }
+
+    private function confirmResponse(string $traceId, string $code, string $answer, string $draftId, array $confirmCard, array $extra = []): array
+    {
+        return array_merge([
+            'type' => 'confirm',
+            'answer' => $answer,
+            'trace_id' => $traceId,
+            'code' => $code,
+            'draftId' => $draftId,
+            'confirmCard' => $confirmCard,
+        ], $extra);
+    }
+
+    private function errorResponse(string $traceId, string $code, string $message, array $extra = []): array
+    {
+        return array_merge([
+            'type' => 'error',
+            'answer' => $message,
+            'trace_id' => $traceId,
+            'code' => $code,
+        ], $extra);
+    }
+
+    // ----------------------------
+    // Prompt / Normalizer / Helpers
     // ----------------------------
 
     private function buildNewsletterPrompt(string $filename, int $year, int $kw, string $driveUrl, string $pdfText): string
     {
         $pdfText = $this->truncateForPrompt($pdfText, 18000);
-
         $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
-                return $this->promptLoader->render($tpl['user'], [
-                    'filename' => $filename,
-                    'year' => $year,
-                    'kw' => $kw,
-                    'driveUrl' => $driveUrl,
-                    'pdfText' => $pdfText,
-                ]);
+
+        return $this->promptLoader->render((string)$tpl['user'], [
+            'filename' => $filename,
+            'year' => $year,
+            'kw' => $kw,
+            'driveUrl' => $driveUrl,
+            'pdfText' => $pdfText,
+        ]);
+    }
+
+    private function renderConfirmText(array $draft): string
+    {
+        $title = (string)($draft['title'] ?? '');
+        $year = (int)($draft['newsletter_year'] ?? 0);
+        $kw = (int)($draft['newsletter_kw'] ?? 0);
+
+        $lines = [];
+        $lines[] = "Bitte prüfen und bestätigen:";
+        $lines[] = "- Titel: {$title}";
+        if ($year > 0 && $kw > 0) {
+            $lines[] = "- Ausgabe: {$year} / KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
+        }
+        $lines[] = "- Kategorie: NEWSLETTER";
+        return implode("\n", $lines);
     }
 
     private function normalizeSymptoms(string $symptoms, string $driveUrl): string
     {
-        $symptoms = trim($symptoms);
+        $s = trim($symptoms);
+        $s = preg_replace('/\r\n?/', "\n", $s) ?? $s;
+        $s = preg_replace("/\n{3,}/", "\n\n", $s) ?? $s;
 
-        // Falls das Modell Mist liefert: minimal retten
-        if ($symptoms === '' || mb_strlen($symptoms) < 10) {
-            $symptoms = "* Newsletter\n";
-        }
-
-        // jede Zeile soll mit "* " starten
-        $lines = preg_split('/\R/u', $symptoms) ?: [];
-        $out = [];
-        foreach ($lines as $ln) {
-            $ln = trim($ln);
-            if ($ln === '') continue;
-            $ln = preg_replace('/^[\-\•\*]\s*/u', '', $ln) ?? $ln;
-
-            // 1) Leere Markdown-Links killen: [Text]() oder [Text](   )
-            if (preg_match('/\[[^\]]+\]\(\s*\)/u', $ln)) {
-                continue;
-            }
-
-            // 2) Optional: falls Modell sowas wie "(Drive-Ordner)()" liefert
-            if (preg_match('/\(\s*\)\s*$/u', $ln)) {
-                continue;
-            }
-
-            $out[] = '* ' . $ln;
-
-        }
-
-        // Drive-Link Bullet sicherstellen
         $driveUrl = trim($driveUrl);
-
-        // Drive-Link Bullet nur wenn driveUrl wirklich vorhanden ist
         if ($driveUrl !== '') {
-            $hasDrive = false;
-            foreach ($out as $ln) {
-                if (str_contains($ln, 'drive.google.com')) {
-                    $hasDrive = true;
-                    break;
+            $lines = $s === '' ? [] : explode("\n", $s);
+            $filtered = [];
+            foreach ($lines as $line) {
+                if (stripos($line, 'drive.google.com') !== false) {
+                    continue;
                 }
+                $filtered[] = $line;
             }
-            if (!$hasDrive) {
-                $out[] = "* [Newsletter (Drive-Ordner)]({$driveUrl})";
-            }
+            $s = trim(implode("\n", $filtered));
+            $s = ($s !== '' ? $s . "\n" : '');
+            $s .= "* [Dokument (Drive)]({$driveUrl})";
         }
 
-
-        return implode("\n", $out);
+        return trim($s);
     }
 
-    /**
-     * @param mixed $keywords
-     * @return array<int, array{keyword:string, weight:int}>
-     */
     private function normalizeKeywords(mixed $keywords): array
     {
-        if (!is_array($keywords)) {
-            return [];
+        $items = [];
+
+        if (is_array($keywords)) {
+            foreach ($keywords as $kw) {
+                if (is_string($kw)) {
+                    $k = trim(mb_strtolower($kw));
+                    if ($k !== '') { $items[] = ['keyword' => $k, 'weight' => 1]; }
+                    continue;
+                }
+                if (is_array($kw)) {
+                    $k = trim(mb_strtolower((string)($kw['keyword'] ?? '')));
+                    if ($k === '') { continue; }
+                    $w = (int)($kw['weight'] ?? 1);
+                    if ($w <= 0) { $w = 1; }
+                    $items[] = ['keyword' => $k, 'weight' => $w];
+                }
+            }
         }
 
-        // Delegiere Normalisierung + Filterung komplett an die Policy
-        return $this->keywordPolicy->filterKeywordObjects($keywords, 20);
-    }
+        // dedupe + simple stopwords + trim/limits
+        $stop = ['und','oder','der','die','das','ein','eine','mit','für','von','im','in','am','an','auf','zu','zum','zur','bei','ist','sind'];
+        $map = [];
+        foreach ($items as $it) {
+            $k = preg_replace('/\s+/', ' ', (string)$it['keyword']) ?? (string)$it['keyword'];
+            $k = trim($k);
+            if ($k === '' || in_array($k, $stop, true)) { continue; }
+            $map[$k] = max($map[$k] ?? 0, (int)$it['weight']);
+        }
 
-    // ----------------------------
-    // Cache Draft
-    // ----------------------------
+        $out = [];
+        foreach ($map as $k => $w) {
+            $out[] = ['keyword' => $k, 'weight' => $w];
+        }
+
+        // limit
+        if (count($out) > 18) {
+            $out = array_slice($out, 0, 18);
+        }
+
+        return $out;
+    }
 
     private function draftCacheKey(string $draftId): string
     {
-        return 'support_chat.newsletter_draft.' . sha1($draftId);
+        return 'support_chat.newsletter_create.draft.' . sha1($draftId);
     }
 
     private function storeDraft(string $draftId, array $draft): void
     {
         $key = $this->draftCacheKey($draftId);
-
         $this->cache->delete($key);
-        $this->cache->get($key, static function (ItemInterface $i) use ($draft) {
-            $i->expiresAfter(1800);
+        $this->cache->get($key, function (ItemInterface $item) use ($draft) {
+            $item->expiresAfter(3600);
             return $draft;
         });
     }
 
-    private function loadDraft(string $draftId): mixed
+    private function loadDraft(string $draftId): ?array
     {
         $key = $this->draftCacheKey($draftId);
-        return $this->cache->get($key, static fn(ItemInterface $i) => null);
+        $val = $this->cache->get($key, static fn(ItemInterface $item) => null);
+        return is_array($val) ? $val : null;
     }
 
-    private function renderConfirmText(array $draft): string
+    private function extractDriveId(string $url): string
     {
-        return "Bitte prüfe vor dem Einfügen:\n\n"
-            . "- created_at: **{$draft['created_at']}**\n"
-            . "- updated_at: **{$draft['updated_at']}**\n"
-            . "- published_at: **{$draft['published_at']}**\n"
-            . "- Drive-Link: **{$draft['external_media_url']}**\n"
-            . "- Drive-ID: **{$draft['external_media_id']}**\n\n"
-            . "Wenn ok, klicke **Einfügen**. Oder schreibe z.B. „published_at auf 2025-12-29“.";
-    }
-
-    // ----------------------------
-    // Helpers (PDF, Filename, Dates, JSON)
-    // ----------------------------
-
-    private function extractDriveId(string $driveUrl): string
-    {
-        $driveUrl = trim($driveUrl);
-        if ($driveUrl === '') {
-            return '';
-        }
-
-        // Normalize (Browser / Windows / Copy-Paste)
-        $driveUrl = str_replace('\\', '/', $driveUrl);
-
-        // 1) Folder URL
-        // https://drive.google.com/drive/folders/<ID>
-        // https://drive.google.com/folders/<ID>
-        if (preg_match('~/(?:drive/)?folders/([a-zA-Z0-9_-]+)~', $driveUrl, $m)) {
-            return $m[1];
-        }
-
-        // 2) File URL
-        // https://drive.google.com/file/d/<ID>/view?usp=drivesdk
-        // https://drive.google.com/file/d/<ID>/view?usp=drive_link
-        if (preg_match('~/file/d/([a-zA-Z0-9_-]+)~', $driveUrl, $m)) {
-            return $m[1];
-        }
-
-        // 3) Open-by-id URL
-        // https://drive.google.com/open?id=<ID>
-        if (preg_match('~[?&]id=([a-zA-Z0-9_-]+)~', $driveUrl, $m)) {
-            return $m[1];
-        }
-
-        // 4) UC URL (direct download/view)
-        // https://drive.google.com/uc?id=<ID>&export=download
-        if (preg_match('~/uc\?id=([a-zA-Z0-9_-]+)~', $driveUrl, $m)) {
-            return $m[1];
-        }
-
-        // 5) "sharing" links sometimes appear in other formats; as last resort:
-        // If user pasted only an ID by accident, accept it (optional, but practical)
-        if (preg_match('~^[a-zA-Z0-9_-]{10,}$~', $driveUrl)) {
-            return $driveUrl;
-        }
-
+        $url = trim($url);
+        if ($url === '') { return ''; }
+        if (preg_match('~drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
+        if (preg_match('~drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
+        if (preg_match('~drive\.google\.com\/drive\/folders\/([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
         return '';
     }
 
-
     /**
-     * Akzeptiert:
-     * - Newsletter_2025_KW53.pdf
-     * - Newsletter_2025_KW53_Teil2.pdf
-     * - Newsletter_2025_KW53_Sondernewsletter.pdf
-     * - Newsletter-2025-KW53-irgendwas.pdf
+     * @return array{0:int,1:int}
      */
     private function parseYearKwFromFilename(string $filename): array
     {
-        $raw = $filename;
-        $name = trim($filename);
+        $fn = trim($filename);
 
-        // Normalisieren
-        $name = str_replace([' ', '__'], ['_', '_'], $name);
-
-        $year = null;
-        $kw = null;
-
-        if (preg_match('/newsletter[_-]?(\d{4})[_-]?kw\s*([0-9]{1,2})/i', $name, $m)) {
+        if (preg_match('/newsletter[\s_\-]*([12]\d{3})[\s_\-]*kw\s*([0-5]\d)\.pdf$/iu', $fn, $m)) {
             $year = (int)$m[1];
             $kw = (int)$m[2];
-        } elseif (preg_match('/(\d{4}).*kw\s*([0-9]{1,2})/i', $name, $m)) {
-            // Fallback: irgendwo im Namen
-            $year = (int)$m[1];
-            $kw = (int)$m[2];
-        }
-
-        return [
-            'raw' => $raw,
-            'year' => $year,
-            'kw' => $kw,
-        ];
-    }
-
-    private function looksLikeNewsletter(string $text): bool
-    {
-        $t = mb_strtolower(trim($text));
-
-        // zu kurz => sehr wahrscheinlich kein Newsletter
-        if (mb_strlen($t) < 800) {
-            return false;
-        }
-
-        // starke Indikatoren (mind. 1 Treffer)
-        $needles = [
-            'newsletter',
-            'kw ',
-            'kalenderwoche',
-            'filiale',
-            'filiale des monats',
-            'umsatz',
-            'bonwert',
-            'gewinnspiel',
-            'promotion',
-        ];
-
-        foreach ($needles as $n) {
-            if (str_contains($t, $n)) {
-                return true;
+            if ($kw >= 1 && $kw <= 53) {
+                return [$year, $kw];
             }
         }
 
-        // optional: eure Filialcodes als Indikator (mind. 1)
-        if (preg_match('/\b(lpdo|lpsa|cola|cosu)\b/i', $text)) {
-            return true;
+        if (preg_match('/^Newsletter_([12]\d{3})_KW([0-5]\d)\.pdf$/u', $fn, $m)) {
+            $year = (int)$m[1];
+            $kw = (int)$m[2];
+            if ($kw >= 1 && $kw <= 53) {
+                return [$year, $kw];
+            }
         }
 
-        return false;
+        return [0, 0];
     }
 
-
-    private function mondayOfIsoWeek(int $year, int $kw): \DateTimeImmutable
+    private function looksLikeNewsletter(string $pdfText): bool
     {
-        $dt = new \DateTimeImmutable();
-        return $dt->setISODate($year, $kw, 1)->setTime(0, 0, 0);
+        $t = mb_strtolower($pdfText);
+        $needles = ['newsletter', 'kw', 'kollektion', 'neuheiten', 'outfit'];
+        $hits = 0;
+        foreach ($needles as $n) {
+            if (str_contains($t, $n)) { $hits++; }
+        }
+        return mb_strlen(trim($pdfText)) >= 200 && $hits >= 2;
     }
 
-    private function nowMidnight(): string
+    private function mondayOfIsoWeek(int $year, int $week): \DateTimeImmutable
     {
-        return (new \DateTimeImmutable('now'))->setTime(0, 0, 0)->format('Y-m-d H:i:s');
+        return (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))
+            ->setISODate($year, $week, 1)
+            ->setTime(0, 0, 0);
+    }
+
+    private function nowMidnight(): \DateTimeImmutable
+    {
+        return (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->setTime(0, 0, 0);
     }
 
     private function extractPdfTextWithPdftotext(string $path): string
     {
-        $bin = 'pdftotext';
-        $cmd = escapeshellcmd($bin) . ' -layout ' . escapeshellarg($path) . ' -';
+        $cmd = 'pdftotext -layout ' . escapeshellarg($path) . ' -';
         $out = @shell_exec($cmd);
         return is_string($out) ? $out : '';
     }
 
-    private function truncateForPrompt(string $s, int $maxChars): string
+    private function truncateForPrompt(string $text, int $maxChars): string
     {
-        $s = trim($s);
-        if (mb_strlen($s) <= $maxChars) return $s;
-        return mb_substr($s, 0, $maxChars) . "\n\n[TRUNCATED]";
+        $t = trim($text);
+        if (mb_strlen($t) <= $maxChars) { return $t; }
+        return mb_substr($t, 0, $maxChars) . "\n\n[...TRUNCATED...]";
     }
 
     private function decodeJsonObject(string $raw): ?array
     {
-        $raw = trim($raw);
+        $s = trim($raw);
+        $obj = json_decode($s, true);
+        if (is_array($obj)) { return $obj; }
+        if (preg_match('/\{.*\}/s', $s, $m)) {
+            $obj = json_decode((string)$m[0], true);
+            if (is_array($obj)) { return $obj; }
+        }
+        return null;
+    }
 
-        // häufige Modelle packen JSON in ```json ... ```
-        if (preg_match('/```(?:json)?\s*(\{.*\})\s*```/su', $raw, $m)) {
-            $raw = trim($m[1]);
+    private function ensureTraceId(?string $traceId): string
+    {
+        $traceId = trim((string)$traceId);
+        return $traceId !== '' ? $traceId : (string)Uuid::uuid4();
+    }
+
+    private function normalizeProvider(?string $provider): ?string
+    {
+        $p = trim((string)$provider);
+        if ($p === '') { return null; } // gateway may route
+        return mb_strtolower($p);
+    }
+
+    private function normalizeFilename(string $name): string
+    {
+        $n = trim($name);
+        if ($n === '') { return $n; }
+
+        if (class_exists(\Normalizer::class)) {
+            $normalized = \Normalizer::normalize($n, \Normalizer::FORM_C);
+            if (is_string($normalized) && $normalized !== '') {
+                $n = $normalized;
+            }
         }
 
-        $decoded = json_decode($raw, true);
-        return is_array($decoded) ? $decoded : null;
+        return str_replace("\0", '', $n);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function filenameWarnings(string $filename): array
+    {
+        $w = [];
+        $fn = $filename;
+
+        if ($fn === '') { return []; }
+
+        if (str_contains($fn, '..') || str_contains($fn, '/') || str_contains($fn, '\\')) {
+            $w[] = 'Dateiname enthält Pfadzeichen. Bitte umbenennen (keine /, \\, ..).';
+            return $w;
+        }
+
+        if (!preg_match('/^[\p{L}\p{N} äöüÄÖÜß_\-\.]+$/u', $fn)) {
+            $w[] = 'Dateiname enthält Sonderzeichen, die Probleme verursachen können. Bitte umbenennen (nur Buchstaben/Zahlen/_/-).';
+        }
+
+        if (mb_strlen($fn) > 120) {
+            $w[] = 'Dateiname ist sehr lang. Bitte ggf. kürzen.';
+        }
+
+        return $w;
     }
 }

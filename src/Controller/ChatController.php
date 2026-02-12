@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace App\Controller;
 
+use App\Service\ExternalUrlInspector;
+use App\Service\ResponseCode;
 use App\Service\SupportChatService;
 use App\Tracing\TraceContext;
 use App\Tracing\TraceManager;
 use Psr\Log\LoggerInterface;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Routing\Annotation\Route;
@@ -19,7 +22,7 @@ final class ChatController extends AbstractController
         private readonly SupportChatService $chatService,
         private readonly TraceManager $traceManager,
         private readonly LoggerInterface $logger,
-        private readonly \App\Service\ExternalUrlInspector $externalUrlInspector,
+        private readonly ExternalUrlInspector $externalUrlInspector,
     ) {}
 
     #[Route('/api/chat', name: 'app_chat', methods: ['POST'])]
@@ -29,8 +32,8 @@ final class ChatController extends AbstractController
         TraceContext::set($trace);
 
         // UI span
-        $uiSpan = (string) $request->headers->get('X-UI-Span', '');
-        $uiAt   = (string) $request->headers->get('X-UI-At', '');
+        $uiSpan  = (string) $request->headers->get('X-UI-Span', '');
+        $uiAt    = (string) $request->headers->get('X-UI-At', '');
         $uiReqId = (string) $request->headers->get('X-UI-Req-Id', '');
 
         if ($uiSpan !== '') {
@@ -109,24 +112,21 @@ final class ChatController extends AbstractController
                 'db_only' => $dbOnlySolutionId !== null,
             ]);
 
-            $result['trace_id'] = $trace->getTraceId();
+            // --- Mini-Contract: type, answer, trace_id immer setzen ---
+            $result['trace_id'] ??= $trace->getTraceId();
+            $result['type'] ??= ResponseCode::TYPE_ANSWER;
+            $result['answer'] = (string)($result['answer'] ?? '');
 
-// provider/model nur dann zurückgeben, wenn AI wirklich genutzt wurde
-            $aiUsed = (bool) (($result['_meta']['ai_used'] ?? false));
-
-// falls der Service selbst provider/model setzt (bei AI), respektieren wir das.
-            // ansonsten setzen wir provider/model nur, wenn aiUsed=true
+            // provider/model nur dann zurückgeben, wenn AI wirklich genutzt wurde
+            $aiUsed = (bool)(($result['_meta']['ai_used'] ?? false));
             if ($aiUsed) {
                 $result['provider'] = $result['provider'] ?? $provider;
-
-                if ($model !== null) {
+                if ($model !== null && trim($model) !== '') {
                     $result['model'] = $result['model'] ?? $model;
                 }
             }
 
-            // Meta nicht an Client ausgeben
             unset($result['_meta']);
-
 
             $this->logger->info('chat.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -144,7 +144,11 @@ final class ChatController extends AbstractController
                 'error' => $e->getMessage(),
                 'class' => $e::class,
             ]);
-            throw $e;
+
+            return new JsonResponse(
+                ResponseCode::error($trace->getTraceId(), 'Interner Fehler. Bitte später erneut versuchen.', ResponseCode::ERROR),
+                500
+            );
         } finally {
             TraceContext::set(null);
             $trace->finish();
@@ -163,99 +167,99 @@ final class ChatController extends AbstractController
             $sessionId = (string) $request->request->get('sessionId', '');
             $message   = (string) $request->request->get('message', '');
             $model     = $request->request->get('model');
-            $driveUrl  = (string) $request->request->get('drive_url', '');
-            $file      = $request->files->get('file'); // UploadedFile|null
 
-            // ✅ Guard: mindestens file ODER drive_url
-            if ($file === null && $driveUrl === '') {
-                $this->logger->info('newsletter.analyze.missing_input', [
-                    'trace_id' => $trace->getTraceId(),
-                    'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
-                    'sessionId' => $sessionId,
-                ]);
+            $driveUrl = (string)($request->request->get('drive_url', '') ?: $request->request->get('driveUrl', ''));
 
-                return new JsonResponse([
-                    'type' => 'need_input',
-                    'answer' => 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
-                ], 422);
+            /** @var UploadedFile|null $file */
+            $file = $request->files->get('file');
+
+            // ✅ Pflicht: mindestens File ODER Drive-Link
+            if (!$file instanceof UploadedFile && trim($driveUrl) === '') {
+                return new JsonResponse(
+                    ResponseCode::error(
+                        $trace->getTraceId(),
+                        'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
+                        ResponseCode::NEED_INPUT
+                    ),
+                    422
+                );
             }
-            // ✅ Drive/External URL vorhanden, aber kein Upload-File: Erreichbarkeit prüfen
-            if ($file === null && $driveUrl !== '') {
-                $check = $this->externalUrlInspector->inspect($driveUrl);
+
+            // ✅ Drive-Link nur prüfen, wenn vorhanden
+            // ✅ Drive-Link nur prüfen, wenn vorhanden (und kein Upload als Fallback)
+            if (trim($driveUrl) !== '' && !$file instanceof UploadedFile) {
+
+                // 1) Normalisieren (z.B. "/drive.google.com/..." -> fileId -> uc?export=download)
+                $norm = $this->normalizeDriveUrl($driveUrl);
+
+                if (($norm['ok'] ?? false) !== true) {
+                    return new JsonResponse(
+                        ResponseCode::error(
+                            $trace->getTraceId(),
+                            'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.',
+                            ResponseCode::DRIVE_URL_INVALID
+                        ),
+                        422
+                    );
+                }
+
+                // Ordner-Link: für Newsletter NICHT zulassen (Newsletter braucht File)
+                if (($norm['type'] ?? '') !== 'file' || !is_string($norm['inspect_url'] ?? null) || $norm['inspect_url'] === '') {
+                    return new JsonResponse(
+                        ResponseCode::error(
+                            $trace->getTraceId(),
+                            'Bitte nutze einen Google-Drive-Dateilink (PDF). Ordner-Links sind hier nicht zulässig.',
+                            ResponseCode::DRIVE_URL_INVALID
+                        ),
+                        422
+                    );
+                }
+
+                // 2) Inspector soll den Direktdownload prüfen, nicht die /view Seite
+                $check = $this->externalUrlInspector->inspect((string)$norm['inspect_url']);
 
                 if (($check['ok'] ?? false) !== true) {
-                    $this->logger->info('newsletter.analyze.drive_url_unreachable', [
-                        'trace_id' => $trace->getTraceId(),
-                        'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
-                        'sessionId' => $sessionId,
-                        'reason' => $check['reason'] ?? null,
-                        'status' => $check['status'] ?? null,
-                        'contentType' => $check['contentType'] ?? null,
-                    ]);
+                    $invalid = ($check['reason'] ?? '') === 'invalid_url' || ($check['reason'] ?? '') === 'invalid_scheme';
 
-                    $type = ($check['reason'] ?? '') === 'invalid_url' || ($check['reason'] ?? '') === 'invalid_scheme'
-                        ? 'drive_url_invalid'
-                        : 'drive_url_unreachable';
-
-                    return new JsonResponse([
-                        'type' => $type,
-                        'answer' => $type === 'drive_url_invalid'
-                            ? 'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.'
-                            : 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
-                    ], 422);
+                    return new JsonResponse(
+                        ResponseCode::error(
+                            $trace->getTraceId(),
+                            $invalid
+                                ? 'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.'
+                                : 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
+                            $invalid ? ResponseCode::DRIVE_URL_INVALID : ResponseCode::DRIVE_URL_UNREACHABLE
+                        ),
+                        422
+                    );
                 }
             }
 
-
-
-
-            // 🔒 Newsletter immer OpenAI
             $provider = 'openai';
-
-            $this->logger->info('newsletter.analyze.request', [
-                'trace_id' => $trace->getTraceId(),
-                'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
-                'sessionId' => $sessionId,
-                'provider' => $provider,
-                'model' => is_string($model) ? $model : null,
-                'drive_url_present' => $driveUrl !== '',
-                'file_present' => $file !== null,
-                'file_name' => $file?->getClientOriginalName(),
-                'file_size' => $file?->getSize(),
-            ]);
 
             $result = $this->chatService->newsletterAnalyze(
                 sessionId: $sessionId,
                 message: $message,
-                driveUrl: $driveUrl,
+                driveUrl: trim($driveUrl), // darf leer sein
                 file: $file,
                 provider: $provider,
                 model: is_string($model) ? $model : null,
                 trace: $trace,
             );
 
-            $result['trace_id'] = $trace->getTraceId();
+            // --- Mini-Contract ---
+            $result['trace_id'] ??= $trace->getTraceId();
+            $result['type'] ??= ResponseCode::TYPE_ANSWER;
+            $result['answer'] = (string)($result['answer'] ?? '');
 
-            // provider/model nur dann zurückgeben, wenn AI wirklich genutzt wurde
-            $aiUsed = (bool) (($result['_meta']['ai_used'] ?? false));
+            $aiUsed = (bool)(($result['_meta']['ai_used'] ?? false));
             if ($aiUsed) {
                 $result['provider'] = $provider;
-                if (is_string($model)) {
-                    $result['model'] = $model;
+                if (is_string($model) && trim((string)$model) !== '') {
+                    $result['model'] = (string)$model;
                 }
             }
 
-            // Meta nicht an Client ausgeben
             unset($result['_meta']);
-
-
-            $this->logger->info('newsletter.analyze.response', [
-                'trace_id' => $trace->getTraceId(),
-                'sessionId' => $sessionId,
-                'type' => $result['type'] ?? null,
-                'draftId' => $result['draftId'] ?? null,
-                'answer_len' => mb_strlen((string)($result['answer'] ?? '')),
-            ]);
 
             return new JsonResponse($result);
         } catch (\Throwable $e) {
@@ -264,12 +268,20 @@ final class ChatController extends AbstractController
                 'error' => $e->getMessage(),
                 'class' => $e::class,
             ]);
-            throw $e;
+
+            return new JsonResponse(
+                ResponseCode::error($trace->getTraceId(), $e->getMessage(), ResponseCode::UNSUPPORTED_TEMPLATE),
+                500
+            );
         } finally {
             TraceContext::set(null);
             $trace->finish();
         }
     }
+
+
+
+
 
     #[Route('/api/chat/newsletter/patch', name: 'app_chat_newsletter_patch', methods: ['POST'])]
     public function newsletterPatch(Request $request): JsonResponse
@@ -304,7 +316,20 @@ final class ChatController extends AbstractController
                 trace: $trace,
             );
 
-            $result['trace_id'] = $trace->getTraceId();
+            // --- Mini-Contract ---
+            $result['trace_id'] ??= $trace->getTraceId();
+            $result['type'] ??= ResponseCode::TYPE_ANSWER;
+            $result['answer'] = (string)($result['answer'] ?? '');
+
+            $aiUsed = (bool)(($result['_meta']['ai_used'] ?? false));
+            if ($aiUsed) {
+                $result['provider'] = $provider;
+                if ($model !== null && trim($model) !== '') {
+                    $result['model'] = $model;
+                }
+            }
+
+            unset($result['_meta']);
 
             $this->logger->info('newsletter.patch.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -321,7 +346,11 @@ final class ChatController extends AbstractController
                 'error' => $e->getMessage(),
                 'class' => $e::class,
             ]);
-            throw $e;
+
+            return new JsonResponse(
+                ResponseCode::error($trace->getTraceId(), 'Interner Fehler. Bitte später erneut versuchen.', ResponseCode::ERROR),
+                500
+            );
         } finally {
             TraceContext::set(null);
             $trace->finish();
@@ -336,8 +365,11 @@ final class ChatController extends AbstractController
 
         try {
             $payload = json_decode((string) $request->getContent(), true) ?: [];
+
             $sessionId = (string)($payload['sessionId'] ?? '');
             $draftId   = (string)($payload['draftId'] ?? '');
+            $provider  = (string)($payload['provider'] ?? 'openai');
+            $model     = isset($payload['model']) && is_string($payload['model']) ? $payload['model'] : null;
 
             $this->logger->info('newsletter.confirm.request', [
                 'trace_id' => $trace->getTraceId(),
@@ -351,7 +383,20 @@ final class ChatController extends AbstractController
                 trace: $trace,
             );
 
-            $result['trace_id'] = $trace->getTraceId();
+            // --- Mini-Contract ---
+            $result['trace_id'] ??= $trace->getTraceId();
+            $result['type'] ??= ResponseCode::TYPE_ANSWER;
+            $result['answer'] = (string)($result['answer'] ?? '');
+
+            $aiUsed = (bool)(($result['_meta']['ai_used'] ?? false));
+            if ($aiUsed) {
+                $result['provider'] = $provider;
+                if ($model !== null && trim($model) !== '') {
+                    $result['model'] = $model;
+                }
+            }
+
+            unset($result['_meta']);
 
             $this->logger->info('newsletter.confirm.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -368,7 +413,11 @@ final class ChatController extends AbstractController
                 'error' => $e->getMessage(),
                 'class' => $e::class,
             ]);
-            throw $e;
+
+            return new JsonResponse(
+                ResponseCode::error($trace->getTraceId(), 'Interner Fehler. Bitte später erneut versuchen.', ResponseCode::ERROR),
+                500
+            );
         } finally {
             TraceContext::set(null);
             $trace->finish();
@@ -383,84 +432,89 @@ final class ChatController extends AbstractController
 
         $uiReqId = (string) $request->headers->get('X-UI-Req-Id', '');
 
-
-
         try {
             $sessionId = (string) $request->request->get('sessionId', '');
             $message   = (string) $request->request->get('message', '');
             $model     = $request->request->get('model');
-            $driveUrl  = (string) $request->request->get('drive_url', '');
-            $file      = $request->files->get('file'); // UploadedFile|null
+
+            // akzeptiere beide Keys aus UI: drive_url oder driveUrl
+            $driveUrl = (string)($request->request->get('drive_url', '') ?: $request->request->get('driveUrl', ''));
+
+            /** @var UploadedFile|null $file */
+            $file = $request->files->get('file');
 
             $this->logger->info('document.analyze.debug_upload', [
+                'trace_id' => $trace->getTraceId(),
                 'files_keys' => array_keys($request->files->all()),
                 'has_file' => $file instanceof UploadedFile,
                 'content_type' => $request->headers->get('content-type'),
                 'content_length' => $request->headers->get('content-length'),
+                'drive_url_len' => mb_strlen(trim($driveUrl)),
             ]);
 
-            // ✅ Form-Analyse: Datei ist Pflicht
-            if (!$file instanceof \Symfony\Component\HttpFoundation\File\UploadedFile) {
-                return new JsonResponse([
-                    'type' => 'need_input',
-                    'answer' => 'Bitte lade eine Datei hoch.',
-                ], 422);
+            // ✅ Pflicht: mindestens File ODER Drive-Link
+            if (!$file instanceof UploadedFile && trim($driveUrl) === '') {
+                return new JsonResponse(
+                    ResponseCode::error(
+                        $trace->getTraceId(),
+                        'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
+                        ResponseCode::NEED_INPUT
+                    ),
+                    422
+                );
             }
 
-            // ✅ Form-Analyse: Drive-Link ist zusätzlich Pflicht
-            if (trim($driveUrl) === '') {
-                return new JsonResponse([
-                    'type' => 'need_drive',
-                    'answer' => 'Mir fehlt der Google-Drive Link (Ordner oder Datei). Bitte füge ihn ein, dann kann ich fortfahren.',
-                ], 422);
-            }
+            // ✅ Drive-Link nur prüfen, wenn er wirklich mitgegeben wurde
+            // ✅ Drive-Link nur prüfen, wenn vorhanden (und kein Upload als Fallback)
+            if (trim($driveUrl) !== '' && !$file instanceof UploadedFile) {
 
+                // 1) Normalisieren (z.B. "/drive.google.com/..." -> fileId -> uc?export=download)
+                $norm = $this->normalizeDriveUrl($driveUrl);
 
+                if (($norm['ok'] ?? false) !== true) {
+                    return new JsonResponse(
+                        ResponseCode::error(
+                            $trace->getTraceId(),
+                            'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.',
+                            ResponseCode::DRIVE_URL_INVALID
+                        ),
+                        422
+                    );
+                }
 
-            // ✅ Guard: mindestens file ODER drive_url
-            if ($file === null && $driveUrl === '') {
-                $this->logger->info('document.analyze.missing_input', [
-                    'trace_id' => $trace->getTraceId(),
-                    'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
-                    'sessionId' => $sessionId,
-                ]);
+                // Ordner-Link: für Newsletter NICHT zulassen (Newsletter braucht File)
+                if (($norm['type'] ?? '') !== 'file' || !is_string($norm['inspect_url'] ?? null) || $norm['inspect_url'] === '') {
+                    return new JsonResponse(
+                        ResponseCode::error(
+                            $trace->getTraceId(),
+                            'Bitte nutze einen Google-Drive-Dateilink (PDF). Ordner-Links sind hier nicht zulässig.',
+                            ResponseCode::DRIVE_URL_INVALID
+                        ),
+                        422
+                    );
+                }
 
-                return new JsonResponse([
-                    'type' => 'need_input',
-                    'answer' => 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
-                ], 422);
-            }
-
-            // ✅ Drive/External URL vorhanden, aber kein Upload-File: Erreichbarkeit prüfen
-            if ($file === null && $driveUrl !== '') {
-                $check = $this->externalUrlInspector->inspect($driveUrl);
+                // 2) Inspector soll den Direktdownload prüfen, nicht die /view Seite
+                $check = $this->externalUrlInspector->inspect((string)$norm['inspect_url']);
 
                 if (($check['ok'] ?? false) !== true) {
-                    $this->logger->info('document.analyze.drive_url_unreachable', [
-                        'trace_id' => $trace->getTraceId(),
-                        'ui_req_id' => $uiReqId !== '' ? $uiReqId : null,
-                        'sessionId' => $sessionId,
-                        'reason' => $check['reason'] ?? null,
-                        'status' => $check['status'] ?? null,
-                        'contentType' => $check['contentType'] ?? null,
-                    ]);
+                    $invalid = ($check['reason'] ?? '') === 'invalid_url' || ($check['reason'] ?? '') === 'invalid_scheme';
 
-                    $type = ($check['reason'] ?? '') === 'invalid_url' || ($check['reason'] ?? '') === 'invalid_scheme'
-                        ? 'drive_url_invalid'
-                        : 'drive_url_unreachable';
-
-                    return new JsonResponse([
-                        'type' => $type,
-                        'answer' => $type === 'drive_url_invalid'
-                            ? 'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.'
-                            : 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
-                    ], 422);
+                    return new JsonResponse(
+                        ResponseCode::error(
+                            $trace->getTraceId(),
+                            $invalid
+                                ? 'Der Google-Drive-Link ist ungültig. Bitte prüfe den Link.'
+                                : 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
+                            $invalid ? ResponseCode::DRIVE_URL_INVALID : ResponseCode::DRIVE_URL_UNREACHABLE
+                        ),
+                        422
+                    );
                 }
             }
 
 
-
-            // 🔒 Dokumente auch immer OpenAI (wie Newsletter)
+            // Dokumente: Analyze läuft OpenAI-only
             $provider = 'openai';
 
             $this->logger->info('document.analyze.request', [
@@ -469,8 +523,8 @@ final class ChatController extends AbstractController
                 'sessionId' => $sessionId,
                 'provider' => $provider,
                 'model' => is_string($model) ? $model : null,
-                'drive_url_present' => $driveUrl !== '',
-                'file_present' => $file !== null,
+                'drive_url_present' => trim($driveUrl) !== '',
+                'file_present' => $file instanceof UploadedFile,
                 'file_name' => $file?->getClientOriginalName(),
                 'file_size' => $file?->getSize(),
             ]);
@@ -478,27 +532,27 @@ final class ChatController extends AbstractController
             $result = $this->chatService->documentAnalyze(
                 sessionId: $sessionId,
                 message: $message,
-                driveUrl: $driveUrl,
-                file: $file,
+                driveUrl: trim($driveUrl),           // kann leer sein -> muss Service akzeptieren
+                file: $file,                         // kann null sein
                 provider: $provider,
                 model: is_string($model) ? $model : null,
                 trace: $trace,
             );
 
-            $result['trace_id'] = $trace->getTraceId();
+            // --- Mini-Contract ---
+            $result['trace_id'] ??= $trace->getTraceId();
+            $result['type'] ??= ResponseCode::TYPE_ANSWER;
+            $result['answer'] = (string)($result['answer'] ?? '');
 
-            // provider/model nur dann zurückgeben, wenn AI wirklich genutzt wurde
-            $aiUsed = (bool) (($result['_meta']['ai_used'] ?? false));
+            $aiUsed = (bool)(($result['_meta']['ai_used'] ?? false));
             if ($aiUsed) {
                 $result['provider'] = $provider;
-                if (is_string($model)) {
-                    $result['model'] = $model;
+                if (is_string($model) && trim((string)$model) !== '') {
+                    $result['model'] = (string)$model;
                 }
             }
 
-            // Meta nicht an Client ausgeben
             unset($result['_meta']);
-
 
             $this->logger->info('document.analyze.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -515,12 +569,20 @@ final class ChatController extends AbstractController
                 'error' => $e->getMessage(),
                 'class' => $e::class,
             ]);
-            throw $e;
+
+            return new JsonResponse(
+                ResponseCode::error($trace->getTraceId(), $e->getMessage(), ResponseCode::UNSUPPORTED_TEMPLATE),
+                500
+            );
         } finally {
             TraceContext::set(null);
             $trace->finish();
         }
     }
+
+
+
+
 
     #[Route('/api/chat/form/patch', name: 'app_chat_document_patch', methods: ['POST'])]
     public function documentPatch(Request $request): JsonResponse
@@ -555,7 +617,20 @@ final class ChatController extends AbstractController
                 trace: $trace,
             );
 
-            $result['trace_id'] = $trace->getTraceId();
+            // --- Mini-Contract ---
+            $result['trace_id'] ??= $trace->getTraceId();
+            $result['type'] ??= ResponseCode::TYPE_ANSWER;
+            $result['answer'] = (string)($result['answer'] ?? '');
+
+            $aiUsed = (bool)(($result['_meta']['ai_used'] ?? false));
+            if ($aiUsed) {
+                $result['provider'] = $provider;
+                if ($model !== null && trim($model) !== '') {
+                    $result['model'] = $model;
+                }
+            }
+
+            unset($result['_meta']);
 
             $this->logger->info('document.patch.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -572,7 +647,11 @@ final class ChatController extends AbstractController
                 'error' => $e->getMessage(),
                 'class' => $e::class,
             ]);
-            throw $e;
+
+            return new JsonResponse(
+                ResponseCode::error($trace->getTraceId(), 'Interner Fehler. Bitte später erneut versuchen.', ResponseCode::ERROR),
+                500
+            );
         } finally {
             TraceContext::set(null);
             $trace->finish();
@@ -587,8 +666,11 @@ final class ChatController extends AbstractController
 
         try {
             $payload = json_decode((string) $request->getContent(), true) ?: [];
+
             $sessionId = (string)($payload['sessionId'] ?? '');
             $draftId   = (string)($payload['draftId'] ?? '');
+            $provider  = (string)($payload['provider'] ?? 'openai');
+            $model     = isset($payload['model']) && is_string($payload['model']) ? $payload['model'] : null;
 
             $this->logger->info('document.confirm.request', [
                 'trace_id' => $trace->getTraceId(),
@@ -602,7 +684,20 @@ final class ChatController extends AbstractController
                 trace: $trace,
             );
 
-            $result['trace_id'] = $trace->getTraceId();
+            // --- Mini-Contract ---
+            $result['trace_id'] ??= $trace->getTraceId();
+            $result['type'] ??= ResponseCode::TYPE_ANSWER;
+            $result['answer'] = (string)($result['answer'] ?? '');
+
+            $aiUsed = (bool)(($result['_meta']['ai_used'] ?? false));
+            if ($aiUsed) {
+                $result['provider'] = $provider;
+                if ($model !== null && trim($model) !== '') {
+                    $result['model'] = $model;
+                }
+            }
+
+            unset($result['_meta']);
 
             $this->logger->info('document.confirm.response', [
                 'trace_id' => $trace->getTraceId(),
@@ -619,11 +714,100 @@ final class ChatController extends AbstractController
                 'error' => $e->getMessage(),
                 'class' => $e::class,
             ]);
-            throw $e;
+
+            return new JsonResponse(
+                ResponseCode::error($trace->getTraceId(), 'Interner Fehler. Bitte später erneut versuchen.', ResponseCode::ERROR),
+                500
+            );
         } finally {
             TraceContext::set(null);
             $trace->finish();
         }
+    }
+
+    private function parseGoogleDriveLink(string $url): array
+    {
+        $u = trim((string) $url);
+        if ($u === '') {
+            return ['type' => 'empty', 'id' => null, 'download' => null, 'original' => ''];
+        }
+
+        $u = ltrim($u);          // whitespace
+        $u = ltrim($u, '/');     // <-- wichtig: führenden Slash entfernen
+        if (!str_starts_with($u, 'http://') && !str_starts_with($u, 'https://')) {
+            $u = 'https://' . $u; // <-- falls UI ohne Schema liefert
+        }
+
+
+
+        $u = preg_replace('~#.*$~', '', $u) ?? $u;
+
+        // Folder link: /drive/u/0/folders/<ID> or /drive/folders/<ID>
+        if (preg_match('~/(?:drive/)?folders/([a-zA-Z0-9_-]+)~', $u, $m)) {
+            return ['type' => 'folder', 'id' => $m[1], 'download' => null, 'original' => $u];
+        }
+
+        // File link: /file/d/<ID>/
+        if (preg_match('~/file/d/([a-zA-Z0-9_-]+)~', $u, $m)) {
+            $id = $m[1];
+            return [
+                'type' => 'file',
+                'id' => $id,
+                'download' => 'https://drive.google.com/uc?export=download&id=' . $id,
+                'original' => $u,
+            ];
+        }
+
+        // Alternate: ?id=<ID>
+        $parts = parse_url($u);
+        if (is_array($parts) && isset($parts['query'])) {
+            parse_str($parts['query'], $q);
+            if (isset($q['id']) && is_string($q['id']) && $q['id'] !== '') {
+                $id = $q['id'];
+                return [
+                    'type' => 'file',
+                    'id' => $id,
+                    'download' => 'https://drive.google.com/uc?export=download&id=' . $id,
+                    'original' => $u,
+                ];
+            }
+        }
+
+        return ['type' => 'unknown', 'id' => null, 'download' => null, 'original' => $u];
+    }
+
+    private function normalizeDriveUrl(string $driveUrl): array
+    {
+        $parsed = $this->parseGoogleDriveLink($driveUrl);
+
+        // We keep original for business logic, but provide download URL for inspection if it's a file.
+        if ($parsed['type'] === 'file' && is_string($parsed['download']) && $parsed['download'] !== '') {
+            return [
+                'ok' => true,
+                'type' => 'file',
+                'id' => $parsed['id'],
+                'original_url' => $parsed['original'],
+                'inspect_url' => $parsed['download'], // <- only for ExternalUrlInspector
+            ];
+        }
+
+        if ($parsed['type'] === 'folder') {
+            return [
+                'ok' => true,
+                'type' => 'folder',
+                'id' => $parsed['id'],
+                'original_url' => $parsed['original'],
+                'inspect_url' => null, // <- don't inspect folder with HTTP download logic
+            ];
+        }
+
+        return [
+            'ok' => false,
+            'type' => $parsed['type'],
+            'id' => $parsed['id'],
+            'original_url' => $parsed['original'],
+            'inspect_url' => null,
+        ];
     }
 
 

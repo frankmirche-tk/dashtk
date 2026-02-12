@@ -79,4 +79,118 @@ final class GoogleDriveService
 
         return $folders;
     }
+
+    public function getFileMeta(string $fileId): array
+    {
+        $file = $this->drive->files->get($fileId, [
+            'fields' => 'id,name,mimeType,webViewLink',
+            'supportsAllDrives' => true,
+        ]);
+
+        return [
+            'id' => (string)$file->getId(),
+            'name' => (string)$file->getName(),
+            'mimeType' => (string)$file->getMimeType(),
+            'webViewLink' => $file->getWebViewLink(),
+        ];
+    }
+
+    public function downloadFileContent(string $fileId): string
+    {
+        $response = $this->drive->files->get($fileId, [
+            'alt' => 'media',
+            'supportsAllDrives' => true,
+        ]);
+
+        // Google API liefert meist PSR-7 Stream
+        $body = $response->getBody();
+
+        if (is_object($body) && method_exists($body, 'getContents')) {
+            return (string)$body->getContents();
+        }
+
+        return (string)$body;
+    }
+
+    public function exportFile(string $fileId, string $mimeType = 'application/pdf'): string
+    {
+        $response = $this->drive->files->export($fileId, $mimeType, [
+            'supportsAllDrives' => true,
+        ]);
+
+        $body = $response->getBody();
+
+        if (is_object($body) && method_exists($body, 'getContents')) {
+            return (string)$body->getContents();
+        }
+
+        return (string)$body;
+    }
+
+    /**
+     * Lädt eine Datei (binary) als Stream in eine lokale Datei (z.B. Temp).
+     * Gibt die Ziel-Pfad-Location zurück.
+     */
+    public function downloadFileToPath(string $fileId, string $targetPath): string
+    {
+        $response = $this->drive->files->get($fileId, [
+            'alt' => 'media',
+            'supportsAllDrives' => true,
+        ]);
+
+        $body = $response->getBody();
+
+        $out = fopen($targetPath, 'wb');
+        if ($out === false) {
+            throw new \RuntimeException('Cannot open targetPath for writing: '.$targetPath);
+        }
+
+        try {
+            if (is_object($body) && method_exists($body, 'read')) {
+                // PSR-7 Stream
+                while (!$body->eof()) {
+                    fwrite($out, $body->read(1024 * 1024)); // 1MB chunks
+                }
+            } else {
+                // Fallback
+                fwrite($out, (string)$body);
+            }
+        } finally {
+            fclose($out);
+        }
+
+        return $targetPath;
+    }
+
+    /**
+     * Falls es KEIN echtes PDF ist (Google Doc/Sheet/etc), exportiert als PDF und streamt in Datei.
+     */
+    public function exportFileToPath(string $fileId, string $targetPath, string $mimeType = 'application/pdf'): string
+    {
+        $response = $this->drive->files->export($fileId, $mimeType, [
+            'supportsAllDrives' => true,
+        ]);
+
+        $body = $response->getBody();
+
+        $out = fopen($targetPath, 'wb');
+        if ($out === false) {
+            throw new \RuntimeException('Cannot open targetPath for writing: '.$targetPath);
+        }
+
+        try {
+            if (is_object($body) && method_exists($body, 'read')) {
+                while (!$body->eof()) {
+                    fwrite($out, $body->read(1024 * 1024));
+                }
+            } else {
+                fwrite($out, (string)$body);
+            }
+        } finally {
+            fclose($out);
+        }
+
+        return $targetPath;
+    }
+
 }

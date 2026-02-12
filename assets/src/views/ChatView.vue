@@ -195,6 +195,24 @@ function createBaseUrl() {
         : '/api/chat/form'
 }
 
+function extractDriveFileId(url) {
+    const u = String(url || '').trim()
+    if (!u) return ''
+
+    let m = u.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/)
+    if (m?.[1]) return m[1]
+
+    m = u.match(/drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)/)
+    if (m?.[1]) return m[1]
+
+    m = u.match(/drive\.google\.com\/uc\?id=([a-zA-Z0-9_-]+)/)
+    if (m?.[1]) return m[1]
+
+    return ''
+}
+
+
+
 function onNewsletterFile(f) {
     newsletterFile.value = f
     newsletterFileName.value = f?.name || ''
@@ -311,34 +329,55 @@ function pushContactCardMessage(type, match) {
 async function patchNewsletterDraft(text) {
     dlog('newsletter patch ->', { draftId: pendingNewsletterDraftId.value, text })
 
-    const { data } = await axios.post(`${createBaseUrl()}/patch`, {
-        sessionId: sessionId.value,
-        draftId: pendingNewsletterDraftId.value,
-        message: text,
-        provider: provider.value,
-        model: model.value,
-    })
+    try {
+        const { data } = await axios.post(`${createBaseUrl()}/patch`, {
+            sessionId: sessionId.value,
+            draftId: pendingNewsletterDraftId.value,
+            message: text,
+            provider: provider.value,
+            model: model.value,
+        })
 
-    lastTraceId.value = data.trace_id ?? null
+        lastTraceId.value = data.trace_id ?? null
 
-    messages.value.push({
-        role: 'assistant',
-        content: data.answer ?? 'Aktualisiert. Bitte erneut prüfen.',
-        newsletterConfirmCard: data.confirmCard ?? null,
-    })
+        if (data.type === 'error') {
+            messages.value.push({
+                role: 'assistant',
+                content: (data.answer ?? 'Fehler') + (data.code ? ` [${data.code}]` : ''),
+            })
+            waitingForNewsletterPatch.value = false
+            return
+        }
 
-    waitingForNewsletterPatch.value = false
-    if (data.draftId) pendingNewsletterDraftId.value = data.draftId
+        messages.value.push({
+            role: 'assistant',
+            content: data.answer ?? 'Aktualisiert. Bitte erneut prüfen.',
+            newsletterConfirmCard: data.confirmCard ?? null,
+        })
+
+        waitingForNewsletterPatch.value = false
+        if (data.draftId) pendingNewsletterDraftId.value = data.draftId
+    } catch (err) {
+        dlog('newsletter patch error:', err)
+        pushApiErrorMessage(err)
+        waitingForNewsletterPatch.value = false
+    }
 }
+
 
 /**
  * Newsletter: ANALYZE (multipart)
  */
 async function analyzeNewsletter(text) {
+    const cleanDriveUrl = String(driveUrl.value || '').trim()
+    const driveFileId = extractDriveFileId(cleanDriveUrl)
+
     dlog('newsletter analyze ->', {
         text,
-        driveUrl: driveUrl.value,
+        driveUrl: cleanDriveUrl,
+        driveFileId: driveFileId || null,
         fileName: newsletterFile.value?.name ?? null,
+        baseUrl: createBaseUrl(),
     })
 
     const form = new FormData()
@@ -346,31 +385,44 @@ async function analyzeNewsletter(text) {
     form.append('message', text)
     form.append('provider', provider.value)
     if (model.value) form.append('model', model.value)
-    if (driveUrl.value) form.append('drive_url', driveUrl.value)
+
+    // ✅ Drive always preferred if present
+    if (cleanDriveUrl) form.append('drive_url', cleanDriveUrl)
+    if (driveFileId) form.append('drive_file_id', driveFileId)
+
+    // ✅ Upload optional
     if (newsletterFile.value) form.append('file', newsletterFile.value)
 
-    const { data } = await axios.post(`${createBaseUrl()}/analyze`, form, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-    })
-
-    lastTraceId.value = data.trace_id ?? null
-
-    if (data.type === 'need_drive') {
-        messages.value.push({ role: 'assistant', content: data.answer })
-        return
-    }
-
-    if (data.type === 'needs_confirmation') {
-        pendingNewsletterDraftId.value = data.draftId ?? null
-        messages.value.push({
-            role: 'assistant',
-            content: data.answer ?? 'Bitte prüfen und bestätigen.',
-            newsletterConfirmCard: data.confirmCard ?? null,
+    try {
+        const { data } = await axios.post(`${createBaseUrl()}/analyze`, form, {
+            headers: { 'Content-Type': 'multipart/form-data' },
         })
-        return
-    }
 
-    messages.value.push({ role: 'assistant', content: data.answer ?? '[leer]' })
+        lastTraceId.value = data.trace_id ?? null
+
+        if (data.type === 'error') {
+            messages.value.push({
+                role: 'assistant',
+                content: (data.answer ?? 'Fehler') + (data.code ? ` [${data.code}]` : ''),
+            })
+            return
+        }
+
+        if (data.type === 'confirm' || data.code === 'needs_confirmation') {
+            pendingNewsletterDraftId.value = data.draftId ?? null
+            messages.value.push({
+                role: 'assistant',
+                content: data.answer ?? 'Bitte prüfen und bestätigen.',
+                newsletterConfirmCard: data.confirmCard ?? null,
+            })
+            return
+        }
+
+        messages.value.push({ role: 'assistant', content: data.answer ?? '[leer]' })
+    } catch (err) {
+        dlog('newsletter analyze error:', err)
+        pushApiErrorMessage(err)
+    }
 }
 
 /**
@@ -390,6 +442,14 @@ async function confirmNewsletterInsert(draftId) {
 
         lastTraceId.value = data.trace_id ?? null
 
+        if (data.type === 'error') {
+            messages.value.push({
+                role: 'assistant',
+                content: (data.answer ?? 'Fehler') + (data.code ? ` [${data.code}]` : ''),
+            })
+            return
+        }
+
         messages.value.push({
             role: 'assistant',
             content: data.answer ?? 'OK, eingefügt.',
@@ -399,10 +459,14 @@ async function confirmNewsletterInsert(draftId) {
         waitingForNewsletterPatch.value = false
         clearNewsletterFile()
         driveUrl.value = ''
+    } catch (err) {
+        dlog('newsletter confirm error:', err)
+        pushApiErrorMessage(err)
     } finally {
         sending.value = false
     }
 }
+
 
 /**
  * SEND
@@ -422,11 +486,14 @@ async function send(textFromComposer) {
     try {
         const lower = text.toLowerCase()
 
-        // ✅ 0) "Einfügen" als Shortcut: wenn Draft existiert -> CONFIRM
-        // (sonst würdest du wegen newsletterFile.value wieder in analyze landen)
-        if ((lower === 'einfügen' || lower === 'einfuegen' || lower === 'ok einfügen' || lower === 'ok einfuegen')
-            && pendingNewsletterDraftId.value
-            && !waitingForNewsletterPatch.value
+        // ✅ 0) "Einfügen" Shortcut
+        if (
+            (lower === 'einfügen' ||
+                lower === 'einfuegen' ||
+                lower === 'ok einfügen' ||
+                lower === 'ok einfuegen') &&
+            pendingNewsletterDraftId.value &&
+            !waitingForNewsletterPatch.value
         ) {
             await confirmNewsletterInsert(pendingNewsletterDraftId.value)
             return
@@ -438,9 +505,11 @@ async function send(textFromComposer) {
             return
         }
 
-        // 2) Form/Newsletter Analyze (Keyword oder File)
-        // ✅ Import Analyze: wenn Datei vorhanden und noch kein Draft existiert
-        if (newsletterFile.value && !pendingNewsletterDraftId.value) {
+        // ✅ 2) Import Analyze (Drive-only ODER Upload) – sobald Link oder Datei vorhanden, nicht auf /api/chat fallen
+        const hasDrive = String(driveUrl.value || '').trim() !== ''
+        const hasFile = !!newsletterFile.value
+
+        if (!pendingNewsletterDraftId.value && (hasFile || hasDrive)) {
             await analyzeNewsletter(text)
             return
         }
@@ -449,18 +518,25 @@ async function send(textFromComposer) {
         const uiSpanContact = 'ui.ChatView.send.contactResolve'
         const uiAtContact = Date.now()
 
-        const { data: c } = await axios.post(
-            '/api/contact/resolve',
-            { query: text },
-            {
-                headers: {
-                    'X-UI-Span': uiSpanContact,
-                    'X-UI-At': String(uiAtContact),
-                },
-            }
-        )
+        let c
+        try {
+            const resp = await axios.post(
+                '/api/contact/resolve',
+                { query: text },
+                {
+                    headers: {
+                        'X-UI-Span': uiSpanContact,
+                        'X-UI-At': String(uiAtContact),
+                    },
+                }
+            )
+            c = resp.data
+        } catch (err) {
+            dlog('contact resolve error:', err)
+            c = null
+        }
 
-        lastTraceId.value = c?.trace_id ?? null
+        if (c?.trace_id) lastTraceId.value = c.trace_id
 
         if (c?.type && c.type !== 'none' && Array.isArray(c.matches) && c.matches.length > 0) {
             for (const hit of c.matches) {
@@ -475,7 +551,6 @@ async function send(textFromComposer) {
 
         // 4) Normaler KI-Chat
         const headers = {}
-
         if (isDev) {
             headers['X-UI-Span'] = 'ui.ChatView.send.normal'
             headers['X-UI-At'] = String(Date.now())
@@ -496,35 +571,53 @@ async function send(textFromComposer) {
 
         lastTraceId.value = data.trace_id ?? null
 
+        // Provider/Model aus Backend übernehmen (falls Backend umschaltet)
         const p = data.provider ?? provider.value
         const m = data.model ?? model.value
         provider.value = p
         model.value = m ?? null
 
+        // System-Text aktualisieren
         if (messages.value.length > 0 && messages.value[0].role === 'system') {
             messages.value[0].content = systemText()
         }
 
+        if (data.type === 'error') {
+            messages.value.push({
+                role: 'assistant',
+                content: (data.answer ?? 'Fehler') + (data.code ? ` [${data.code}]` : ''),
+            })
+            return
+        }
+
+        // ✅ WICHTIG: matches/choices/cards/steps mitschicken, sonst rendert ChatMessages.vue keine SOP/Form/Newsletter-Boxen
         messages.value.push({
             role: 'assistant',
+            // optional: Provider-Label wie früher (wenn du es nicht willst -> entferne den Prefix)
             content: `(${providerModelLabel(p, m)}) ${data.answer ?? '[leer]'}`,
+
+            // Diese Felder steuern die DIV-Ausgabe in ChatMessages.vue:
             matches: data.matches ?? [],
             choices: data.choices ?? [],
             formCard: data.formCard ?? null,
+            newsletterConfirmCard: data.confirmCard ?? data.newsletterConfirmCard ?? null,
+
+            // optional steps (falls Backend welche liefert)
             steps: mapSteps(data.steps),
+
             provider: p,
             model: m ?? null,
         })
-    } catch (e) {
-        dlog('send error:', e)
-        messages.value.push({
-            role: 'assistant',
-            content: 'Fehler beim Senden. Bitte dev.log prüfen.',
-        })
+    } catch (err) {
+        dlog('send error:', err)
+        pushApiErrorMessage(err)
     } finally {
         sending.value = false
     }
 }
+
+
+
 
 /**
  * DB-only steps
@@ -563,6 +656,15 @@ async function useDbStepsOnly(solutionId) {
             messages.value[0].content = systemText()
         }
 
+        // Wenn Backend mal error liefert, anzeigen statt "kaputt"
+        if (data.type === 'error') {
+            messages.value.push({
+                role: 'assistant',
+                content: (data.answer ?? 'Fehler') + (data.code ? ` [${data.code}]` : ''),
+            })
+            return
+        }
+
         messages.value.push({
             role: 'assistant',
             content: `(${providerModelLabel(p, m)}) ${data.answer ?? '[leer]'}`,
@@ -573,10 +675,14 @@ async function useDbStepsOnly(solutionId) {
             provider: p,
             model: m ?? null,
         })
+    } catch (err) {
+        dlog('dbOnly error:', err)
+        pushApiErrorMessage(err)
     } finally {
         sending.value = false
     }
 }
+
 
 /**
  * CHOICE click
@@ -670,6 +776,48 @@ function confirmPin() {
 
 function lockNewsletterTools() {
     newsletterToolsUnlocked.value = false
+}
+
+function pickApiData(err) {
+    // Axios error mit Backend-JSON (z.B. 422) -> err.response.data
+    const data = err?.response?.data
+    if (data && typeof data === 'object') return data
+
+    // selten: Backend liefert JSON als string
+    if (typeof data === 'string') {
+        try { return JSON.parse(data) } catch (_) {}
+    }
+
+    return null
+}
+
+function pushApiErrorMessage(err, fallbackText = 'Fehler beim Senden. Bitte dev.log prüfen.') {
+    const data = pickApiData(err)
+
+    // Trace merken, wenn vorhanden
+    if (data?.trace_id) lastTraceId.value = data.trace_id
+
+    if (data && typeof data === 'object') {
+        // Backend-Contract: type/code/answer
+        const answer = String(data.answer ?? fallbackText)
+        const code = data.code ? ` [${data.code}]` : ''
+        const type = data.type ? String(data.type) : 'error'
+
+        messages.value.push({
+            role: 'assistant',
+            content: answer + code,
+            // optional: falls du das später im UI brauchst
+            apiError: { type, code: data.code ?? null },
+        })
+        return true
+    }
+
+    // kein Backend-JSON vorhanden -> echter Netzwerk/JS Fehler
+    messages.value.push({
+        role: 'assistant',
+        content: fallbackText,
+    })
+    return false
 }
 
 

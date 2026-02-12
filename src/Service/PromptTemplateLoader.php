@@ -40,13 +40,13 @@ final class PromptTemplateLoader
         $system = $this->extractBlock($raw, 'SYSTEM');
         $user   = $this->extractBlock($raw, 'USER');
 
-        // Includes in beiden Bereichen erlauben (SYSTEM und USER)
-        $system = $this->resolveIncludes($system, $stack);
-        $user   = $this->resolveIncludes($user, $stack);
+        // Includes korrekt je nach Bereich auflösen
+        $system = $this->resolveIncludes($system, $stack, 'system');
+        $user   = $this->resolveIncludes($user, $stack, 'user');
 
         return [
             'system' => trim($system),
-            'user' => trim($user),
+            'user'   => trim($user),
         ];
     }
 
@@ -57,7 +57,7 @@ final class PromptTemplateLoader
     {
         $map = [];
         foreach ($vars as $k => $v) {
-            $map['{{' . $k . '}}'] = (string)($v ?? '');
+            $map['{{' . $k . '}}'] = (string) ($v ?? '');
         }
         return strtr($template, $map);
     }
@@ -72,30 +72,33 @@ final class PromptTemplateLoader
     }
 
     /**
-     * Include syntax: [[include:FILE]]
+     * Include syntax:
+     *   [[include:FILE]]           -> includes matching block (system/user) depending on current section
+     *   [[include:FILE#system]]    -> force include SYSTEM block
+     *   [[include:FILE#user]]      -> force include USER block
+     *
      * @param array<string, bool> $stack
+     * @param 'system'|'user' $section
      */
-    private function resolveIncludes(string $text, array $stack): string
+    private function resolveIncludes(string $text, array $stack, string $section): string
     {
         return preg_replace_callback(
-            '/\[\[include:([a-zA-Z0-9_.\-\/]+)\]\]/',
-            function (array $m) use ($stack): string {
+            '/\[\[include:([a-zA-Z0-9_.\-\/]+)(?:#(system|user))?\]\]/',
+            function (array $m) use ($stack, $section): string {
                 $file = $m[1];
+                $forced = $m[2] ?? null;
 
                 $tpl = $this->loadInternal($file, $stack);
 
-                // Wir inkludieren IMMER den SYSTEM-Teil der Include-Datei,
-                // weil es typischerweise Policies/Shared Context sind.
-                // Falls du später auch USER-Includes brauchst: kann man erweitern.
-                return $tpl['system'];
+                $pick = $forced ?: $section; // default: same section
+                return $tpl[$pick] ?? '';
             },
             $text
         ) ?? $text;
     }
+
     public function getBaseDir(): string
     {
         return $this->baseDir;
     }
-
-
 }

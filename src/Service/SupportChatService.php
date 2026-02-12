@@ -236,24 +236,8 @@ final class SupportChatService
         ?Trace  $trace = null
     ): array {
         $sessionId = trim($sessionId);
-        $message = trim($message);
+        $rawMessage = trim($message);
         $provider = strtolower(trim($provider));
-
-        // "mehr" -> Newsletter paging (nur vorbereitet, kein offset/limit implementiert)
-        if (mb_strtolower($message) === 'mehr') {
-            $key = 'support_chat.newsletter_paging.' . sha1($sessionId);
-            $paging = $this->cache->get($key, fn(ItemInterface $i) => null);
-
-            if (is_array($paging) && isset($paging['query'], $paging['offset'], $paging['pageSize'], $paging['from'], $paging['to'])) {
-                return [
-                    'answer' => "Paging ist vorbereitet, aber die Server-seitige Pagination (offset/limit) bauen wir als nächsten Schritt sauber ins Repository.\n"
-                        . "Sag mir kurz: Sollen wir zuerst **Repository-Pagination** umsetzen oder direkt die **Newsletter-Import/Redaktionsmaske** finalisieren?",
-                    'matches' => [],
-                    'choices' => [],
-                    'modeHint' => 'newsletter_paging_todo',
-                ];
-            }
-        }
 
         $this->span($trace, 'usage.increment', function () {
             $this->usageTracker->increment(self::USAGE_KEY_ASK);
@@ -265,610 +249,351 @@ final class SupportChatService
         }
 
         // 0) Numeric selection ("1", "2", "3")
-        $selection = $this->span($trace, 'choice.try_resolve', fn() => $this->resolveNumericSelection($sessionId, $message));
+        $selection = $this->span($trace, 'choice.try_resolve', fn() => $this->resolveNumericSelection($sessionId, $rawMessage));
         if (is_array($selection)) {
-            /** @var AskResponse $selection */
             return $selection;
         }
 
-        // A) DB-only (explicit SOP click from UI)
+        // A) DB-only (explicit click from UI)
         if ($dbOnlySolutionId !== null) {
-            $result = $this->span($trace, 'db_only.answer', fn() => $this->answerDbOnly($sessionId, $dbOnlySolutionId), [
+            return $this->span($trace, 'db_only.answer', fn() => $this->answerDbOnly($sessionId, $dbOnlySolutionId), [
                 'solution_id' => $dbOnlySolutionId,
             ]);
-
-            $this->supportSolutionLogger->info('db_only_response', [
-                'sessionId' => $sessionId,
-                'solutionId' => $dbOnlySolutionId,
-                'stepsCount' => isset($result['steps']) && is_array($result['steps']) ? count($result['steps']) : 0,
-            ]);
-
-            /** @var AskResponse $result */
-            return $result;
         }
 
+        // Blacklist immer vor allem (außer Numeric selection)
+        $cleanMessage = $this->applyKeywordBlacklist($rawMessage);
+        $mLower = mb_strtolower($cleanMessage);
+
         /**
-         * B0) Local Contact Resolver (privacy: local_only, send_to_ai=false)
+         * 1.1 / 1.2 Kontakt + Filiale (JSON) – Early Exit
+         * - Wenn Vor-/Nachname oder Filialkürzel getroffen: sofort Karte ausgeben
+         * - KEINE KI, KEINE Keyword-Suche in support_solution
          */
-        $contactHint = $this->span($trace, 'contact.intent.detect', function () use ($message) {
-            $m = mb_strtolower($message);
-
-            $keywords = [
-                'kontakt', 'kontaktperson', 'ansprechpartner', 'telefon', 'tel', 'email', 'e-mail',
-                'filiale', 'filialen', 'standort', 'adresse', 'anschrift', 'öffnungszeiten',
-            ];
-
-            $tokens = preg_split('/[^\p{L}\p{N}]+/u', $m) ?: [];
-            $tokens = array_values(array_filter($tokens, static fn($t) => $t !== ''));
-
-            foreach ($keywords as $k) {
-                if (in_array($k, $tokens, true)) {
-                    return ['hit' => true, 'keyword' => $k];
-                }
-            }
-
-            if (preg_match('/\b(tel|telefon|e-mail|email)\s*:/u', $m)) {
-                return ['hit' => true, 'keyword' => 'contact_explicit'];
-            }
-
-            return ['hit' => false, 'keyword' => null];
-        }, ['msg_len' => mb_strlen($message)]);
-
-        $contactResult = $this->span($trace, 'contact.resolve', function () use ($message, $trace) {
-            return $this->contactResolver->resolve($message, 5, $trace);
+        $contactResult = $this->span($trace, 'contact.resolve', function () use ($cleanMessage, $trace) {
+            // nutzt /var/data/kontakt_personen.json + kontakt_filialen.json (wie bei euch konfiguriert)
+            return $this->contactResolver->resolve($cleanMessage, 5, $trace);
         }, [
             'policy' => 'local_only',
             'send_to_ai' => false,
             'source' => 'var/data/kontakt_*.json',
         ]);
 
-        $hasContactMatches = is_array($contactResult) && !empty($contactResult['matches']);
-        $intentHit = (bool)($contactHint['hit'] ?? false);
-
-        if ($hasContactMatches) {
+        if (is_array($contactResult) && !empty($contactResult['matches'])) {
             $this->supportSolutionLogger->info('contact_resolved', [
                 'sessionId' => $sessionId,
-                'query' => $message,
-                'intentHit' => $intentHit,
-                'matchCount' => is_array($contactResult['matches'] ?? null) ? count($contactResult['matches']) : 0,
+                'query_raw' => $rawMessage,
+                'query_clean' => $cleanMessage,
                 'type' => $contactResult['type'] ?? null,
+                'matchCount' => is_array($contactResult['matches']) ? count($contactResult['matches']) : 0,
             ]);
 
-            $payload = $this->span($trace, 'contact.answer.build', function () use ($contactResult) {
-                $type = (string)($contactResult['type'] ?? 'none');
-                $matches = $contactResult['matches'] ?? [];
+            // als Choices speichern, damit "1-5" Auswahl funktioniert, wenn ihr das wollt
+            $choices = [];
+            $lines = [];
 
-                if (!is_array($matches) || $matches === []) {
-                    return [
-                        'answer' => "Ich habe lokal keine passenden Kontaktdaten gefunden. Bitte nenne mir einen Namen, eine FilialenNr (z.B. COSU) oder einen Standort.",
-                        'choices' => [],
-                    ];
-                }
+            $type = (string)($contactResult['type'] ?? 'none');
+            $matches = is_array($contactResult['matches']) ? $contactResult['matches'] : [];
 
-                $lines = [];
-                $lines[] = $type === 'branch' ? "Gefundene Filiale(n):"
-                    : ($type === 'person' ? "Gefundene Kontaktperson(en):" : "Treffer:");
+            // Wenn ihr im UI bereits "Info Cards" rendert, könnt ihr hier auch einfach 'contact' payload zurückgeben.
+            // Ich mache beides: Karten + nummerierte Auswahl.
+            $lines[] = $type === 'branch' ? "Gefundene Filiale(n):"
+                : ($type === 'person' ? "Gefundene Kontaktperson(en):" : "Treffer:");
 
-                $choices = [];
-                $i = 1;
-                foreach ($matches as $m) {
-                    $label = (string)($m['label'] ?? '');
-                    if ($label === '') {
-                        continue;
-                    }
-                    $lines[] = "{$i}) {$label}";
-                    $choices[] = [
-                        'kind' => 'contact',
-                        'label' => $label,
-                        'payload' => $m,
-                    ];
-                    $i++;
-                    if ($i > self::MAX_CHOICES) {
-                        break;
-                    }
-                }
-
-                if ($choices !== []) {
-                    $lines[] = "";
-                    $lines[] = "Antworte mit **1–" . count($choices) . "**, um einen Eintrag zu öffnen.";
-                }
-
-                return [
-                    'answer' => implode("\n", $lines),
-                    'choices' => $choices,
-                ];
-            });
-
-            if (!empty($payload['choices'])) {
-                /** @var list<ChoiceItem> $choices */
-                $choices = is_array($payload['choices']) ? $payload['choices'] : [];
-                $this->storeChoices($sessionId, $choices);
-            }
-
-            return [
-                'answer' => (string)($payload['answer'] ?? ''),
-                'matches' => [],
-                'modeHint' => 'contact_local',
-                'contact' => $contactResult,
-                'choices' => $payload['choices'] ?? [],
-            ];
-        }
-
-        /**
-         * NewsletterResolver (Suche/Query) mit Pending-State (Zeitraum First-Class)
-         */
-        $pendingKey = 'support_chat.newsletter_pending.' . sha1($sessionId);
-        $pagingKey = 'support_chat.newsletter_paging.' . sha1($sessionId);
-
-        // 1) Pending? (wir warten nur noch auf Zeitraum)
-        $pending = $this->cache->get($pendingKey, static fn(ItemInterface $item) => null);
-
-        if (is_array($pending) && ($pending['awaitingRange'] ?? false) === true) {
-            $combined = trim(($pending['query'] ?? 'newsletter') . ' ' . $message);
-
-            $nlPayload = $this->safeResolveNewsletter($sessionId, $combined);
-            if (is_array($nlPayload)) {
-                if (isset($nlPayload['newsletterPaging']) && is_array($nlPayload['newsletterPaging'])) {
-                    $this->cache->delete($pagingKey);
-                    $this->cache->get($pagingKey, function (ItemInterface $item) use ($nlPayload) {
-                        $item->expiresAfter(1800);
-                        return $nlPayload['newsletterPaging'];
-                    });
-                }
-
-                if (($nlPayload['modeHint'] ?? '') !== 'newsletter_need_range') {
-                    $this->cache->delete($pendingKey);
-                }
-
-                $this->supportSolutionLogger->info('newsletter_mode', [
-                    'sessionId' => $sessionId,
-                    'query' => $combined,
-                    'rawMessage' => $message,
-                    'mode' => (string)($nlPayload['modeHint'] ?? 'newsletter'),
-                    'matchCount' => is_array($nlPayload['matches'] ?? null) ? count($nlPayload['matches']) : 0,
-                    'matchIds' => is_array($nlPayload['matches'] ?? null)
-                        ? array_map(static fn($m) => $m['id'] ?? null, $nlPayload['matches'])
-                        : [],
-                    'choices' => is_array($nlPayload['choices'] ?? null) ? count($nlPayload['choices']) : 0,
-                ]);
-
-                if (!empty($nlPayload['choices']) && is_array($nlPayload['choices'])) {
-                    /** @var list<ChoiceItem> $choices */
-                    $choices = $nlPayload['choices'];
-                    $this->storeChoices($sessionId, $choices);
-                }
-
-                /** @var AskResponse $nlPayload */
-                return $nlPayload;
-            }
-
-            $this->cache->delete($pendingKey);
-        }
-
-        // 2) Normaler Einstieg (User schreibt Newsletter-Intent)
-        $nlPayload = $this->safeResolveNewsletter($sessionId, $message);
-        if (is_array($nlPayload)) {
-            if (isset($nlPayload['newsletterPaging']) && is_array($nlPayload['newsletterPaging'])) {
-                $this->cache->delete($pagingKey);
-                $this->cache->get($pagingKey, function (ItemInterface $item) use ($nlPayload) {
-                    $item->expiresAfter(1800);
-                    return $nlPayload['newsletterPaging'];
-                });
-            }
-
-            if (($nlPayload['modeHint'] ?? '') === 'newsletter_need_range') {
-                $this->cache->delete($pendingKey);
-                $this->cache->get($pendingKey, function (ItemInterface $item) use ($message) {
-                    $item->expiresAfter(1800);
-                    return [
-                        'awaitingRange' => true,
-                        'query' => $message,
-                    ];
-                });
-            }
-
-            $this->supportSolutionLogger->info('newsletter_mode', [
-                'sessionId' => $sessionId,
-                'query' => $message,
-                'mode' => (string)($nlPayload['modeHint'] ?? 'newsletter'),
-                'matchCount' => is_array($nlPayload['matches'] ?? null) ? count($nlPayload['matches']) : 0,
-                'matchIds' => is_array($nlPayload['matches'] ?? null)
-                    ? array_map(static fn($m) => $m['id'] ?? null, $nlPayload['matches'])
-                    : [],
-                'choices' => is_array($nlPayload['choices'] ?? null) ? count($nlPayload['choices']) : 0,
-            ]);
-
-            if (!empty($nlPayload['choices']) && is_array($nlPayload['choices'])) {
-                /** @var list<ChoiceItem> $choices */
-                $choices = $nlPayload['choices'];
-                $this->storeChoices($sessionId, $choices);
-            }
-
-            /** @var AskResponse $nlPayload */
-            return $nlPayload;
-        }
-
-        /**
-         * B1) KB match (DB) – yields SOP and FORM.
-         */
-        /** @var list<SupportMatch> $matches */
-        $matches = $this->span($trace, 'kb.match', fn() => $this->findMatches($message), [
-            'query_len' => mb_strlen($message),
-        ]);
-
-        $matches = $this->dedupeMatchesById($matches);
-
-        /** @var list<SupportMatch> $forms */
-        $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
-        /** @var list<SupportMatch> $sops */
-        $sops = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
-
-        $sops = $this->filterSopsDuplicatingFormTitles($sops, $forms);
-
-        /** @var list<ChoiceItem> $formChoices */
-        $formChoices = [];
-        if ($forms !== []) {
             $i = 1;
-            foreach ($forms as $f) {
-                $title = (string)($f['title'] ?? '');
-                if ($title === '') {
+            foreach ($matches as $m) {
+                $label = (string)($m['label'] ?? '');
+                if ($label === '') {
                     continue;
                 }
-                $formChoices[] = [
-                    'kind' => 'form',
-                    'label' => $title,
-                    'payload' => $f,
+
+                $lines[] = "{$i}) {$label}";
+                $choices[] = [
+                    'kind' => 'contact',
+                    'label' => $label,
+                    'payload' => $m,
                 ];
+
                 $i++;
                 if ($i > self::MAX_CHOICES) {
                     break;
                 }
             }
-        }
 
-        $hasFormKeywords = $this->span($trace, 'form.keyword.detect', fn() => $this->formResolver->hasFormKeywords($message), [
-            'query_len' => mb_strlen($message),
-        ]);
-
-        if ($hasFormKeywords) {
-            $this->supportSolutionLogger->info('form_keyword_mode', [
-                'sessionId' => $sessionId,
-                'query' => $message,
-                'forms' => count($forms),
-                'sops' => count($sops),
-                'mode' => ($formChoices !== []) ? 'form_kw_db' : 'form_kw_empty',
-            ]);
-
-            if ($formChoices !== []) {
-                $this->storeChoices($sessionId, $formChoices);
-
-                $lines = [];
-                $lines[] = "Ich habe passende **Formulare** gefunden:";
-                $n = 1;
-                foreach ($formChoices as $c) {
-                    $updated = (string)($c['payload']['updatedAt'] ?? '');
-                    $symptoms = trim((string)($c['payload']['symptoms'] ?? ''));
-
-                    $line = "{$n}) {$c['label']}" . ($updated !== '' ? " (zuletzt aktualisiert: {$updated})" : '');
-                    if ($symptoms !== '') {
-                        $line .= "\n   ↳ " . $symptoms;
-                    }
-
-                    $lines[] = $line;
-                    $n++;
-                }
+            if ($choices !== []) {
                 $lines[] = "";
-                $lines[] = "Antworte mit **1–" . count($formChoices) . "**, um ein Formular zu öffnen.";
-
-                return [
-                    'answer' => implode("\n", $lines),
-                    'matches' => $sops,
-                    'choices' => $formChoices,
-                    'modeHint' => 'form_kw_db',
-                ];
+                $lines[] = "Antworte mit **1–" . count($choices) . "**, um einen Eintrag zu öffnen.";
+                $this->storeChoices($sessionId, $choices);
             }
 
             return [
-                'answer' => "Ich habe kein passendes Formular gefunden. Bitte prüfe die Schreibweise oder ergänze 1–2 Stichwörter (z.B. „Etikettendruck Formular“).",
-                'matches' => $sops,
-                'choices' => [],
-                'modeHint' => 'form_kw_empty',
+                'answer' => implode("\n", $lines),
+                'matches' => [],
+                'choices' => $choices,
+                'modeHint' => 'contact_local',
+                'contact' => $contactResult,
             ];
         }
 
-        // Without form keywords: show form choices (UI) but still allow AI
+        // 1) Sonderfall: Tipps/Hilfe
+        $isHelp =
+            in_array(mb_strtolower($rawMessage), ['tipps', 'hilfe', 'help'], true)
+            || str_contains($mLower, 'wie nutze ich den chatbot')
+            || str_contains($mLower, 'was kann der bot')
+            || str_contains($mLower, 'wie funktioniert das');
+
+        if ($isHelp) {
+            // TODO: idealerweise aus TKFashionPolicyPrompt.config laden; hier bleibt euer aktueller Text
+            $answer =
+                "💡 So nutzt du diesen ChatBot effektiv\n\n" .
+                "1) Filialinformationen abrufen\n" .
+                "- Eingabe: nur das Filialkürzel\n" .
+                "- Beispiel: LASU, COLA\n" .
+                "- Ergebnis: Adresse, Kontaktdaten, EC-TerminalID\n\n" .
+                "2) Kontakte & Ansprechpartner finden\n" .
+                "- Eingabe: Vor- oder Nachname ODER Begriffe wie „Admin“, „Kontakt“, „Ansprechpartner“\n" .
+                "- Beispiel: Frank, Mirche, Admin\n" .
+                "- Ergebnis: passende Kontaktinformationen\n\n" .
+                "3) Hilfe bei technischen Problemen\n" .
+                "- Eingabe: kurze Beschreibung des Problems\n" .
+                "- Beispiel: „Kartenleser defekt“, „Bondrucker druckt nicht“, „E-Mail geht nicht“\n" .
+                "- Ergebnis: Lösungsvorschläge oder Weiterleitung\n\n" .
+                "Tipp: Du kannst sehr kurz schreiben – oft reicht ein Stichwort.";
+
+            return [
+                'answer' => $answer,
+                'matches' => [],
+                'choices' => [],
+                'modeHint' => 'help',
+            ];
+        }
+
+        // 2) Newsletter Intent?
+        $newsletterIntent = (bool)preg_match('/\bnews\s*letter\b|\bnewsletter\b/u', $mLower);
+        if ($newsletterIntent) {
+            $range = $this->parseNewsletterDateRange($rawMessage);
+            $from = $range['from'] ?? new \DateTimeImmutable('2000-01-01 00:00:00');
+            $to   = $range['to']   ?? (new \DateTimeImmutable('now'))->modify('+10 years');
+
+            $tokens = $this->extractKeywordTokens($cleanMessage, ['newsletter', 'news', 'letter']);
+
+            if ($tokens === []) {
+                return [
+                    'answer' => "Für Newsletter brauche ich mindestens **1 Keyword** (z.B. „Osterwoche“, „Filialperformance“). Optional mit Datum („seit 01.01.2026“).",
+                    'matches' => [],
+                    'choices' => [],
+                    'modeHint' => 'newsletter_need_keyword',
+                ];
+            }
+
+            $rows = $this->solutions->findNewsletterMatches($tokens, $from, $to, 0, self::MAX_CHOICES);
+
+            $matches = [];
+            foreach ($rows as $r) {
+                $sol = $r['solution'] ?? null;
+                if ($sol instanceof SupportSolution) {
+                    $matches[] = $this->mapMatch($sol, 100);
+                }
+            }
+
+            if ($matches === []) {
+                return [
+                    'answer' => "Ich habe **keinen Newsletter** gefunden, der zu **" . implode(', ', $tokens) . "** passt" .
+                        ($range ? (" (Zeitraum: " . $from->format('Y-m-d') . " bis " . $to->format('Y-m-d') . ").") : "."),
+                    'matches' => [],
+                    'choices' => [],
+                    'modeHint' => 'newsletter_empty',
+                ];
+            }
+
+            $choices = [];
+            $lines = ["Gefundene **Newsletter**:"];
+            $i = 1;
+            foreach ($matches as $m) {
+                $label = (string)($m['title'] ?? '');
+                $pub = (string)($m['publishedAt'] ?? '');
+                $line = $label . ($pub !== '' ? " ({$pub})" : '');
+                $lines[] = "{$i}) {$line}";
+                // Newsletter sind bei euch type=FORM, daher kind=form für Öffnen
+                $choices[] = ['kind' => 'form', 'label' => $line, 'payload' => $m];
+
+                $i++;
+                if ($i > self::MAX_CHOICES) break;
+            }
+            $lines[] = "";
+            $lines[] = "Antworte mit **1–" . count($choices) . "**, um einen Newsletter zu öffnen.";
+
+            $this->storeChoices($sessionId, $choices);
+
+            return [
+                'answer' => implode("\n", $lines),
+                'matches' => $matches,
+                'choices' => $choices,
+                'modeHint' => 'newsletter_only',
+            ];
+        }
+
+        // 3) Form Intent?
+        $formIntent = (bool)preg_match('/\b(form|formular|dokument|antrag|vertrag)(e|en|er)?\b/u', $mLower);
+        if ($formIntent) {
+            $tokens = $this->extractKeywordTokens($cleanMessage, ['form', 'formular', 'dokument', 'antrag', 'vertrag']);
+
+            if ($tokens === []) {
+                return [
+                    'answer' => "Für Formulare brauche ich mindestens **1 Keyword** (z.B. „Reisekosten“, „Urlaub“, „Arbeitsvertrag“).",
+                    'matches' => [],
+                    'choices' => [],
+                    'modeHint' => 'form_need_keyword',
+                ];
+            }
+
+            $qb = $this->solutions->createQueryBuilder('s')
+                ->join('s.keywords', 'k')
+                ->andWhere('s.active = true')
+                ->andWhere('s.type = :type')
+                ->andWhere('s.category = :category')
+                ->andWhere('LOWER(k.keyword) IN (:tokens)')
+                ->setParameter('type', 'FORM')
+                ->setParameter('category', 'GENERAL')
+                ->setParameter('tokens', array_map('mb_strtolower', $tokens))
+                ->addOrderBy('s.priority', 'DESC')
+                ->setMaxResults(self::MAX_CHOICES);
+
+            $solutions = $qb->getQuery()->getResult();
+
+            $matches = [];
+            foreach ($solutions as $sol) {
+                if ($sol instanceof SupportSolution) {
+                    $matches[] = $this->mapMatch($sol, 100);
+                }
+            }
+
+            if ($matches === []) {
+                return [
+                    'answer' => "Ich habe **kein Formular/Dokument** gefunden, das zu **" . implode(', ', $tokens) . "** passt.",
+                    'matches' => [],
+                    'choices' => [],
+                    'modeHint' => 'form_empty',
+                ];
+            }
+
+            $choices = [];
+            $lines = ["Gefundene **Formulare/Dokumente**:"];
+            $i = 1;
+            foreach ($matches as $m) {
+                $label = (string)($m['title'] ?? '');
+                $lines[] = "{$i}) {$label}";
+                $choices[] = ['kind' => 'form', 'label' => $label, 'payload' => $m];
+                $i++;
+                if ($i > self::MAX_CHOICES) break;
+            }
+
+            $lines[] = "";
+            $lines[] = "Antworte mit **1–" . count($choices) . "**, um ein Dokument zu öffnen.";
+
+            $this->storeChoices($sessionId, $choices);
+
+            return [
+                'answer' => implode("\n", $lines),
+                'matches' => $matches,
+                'choices' => $choices,
+                'modeHint' => 'form_only',
+            ];
+        }
+
+        // 4) ELSE: Keyword-Matching (alle Typen/Kategorien) + KI Antwort
+        $matches = $this->span($trace, 'kb.match', fn() => $this->findMatches($cleanMessage), [
+            'query_len' => mb_strlen($cleanMessage),
+        ]);
+        $matches = $this->dedupeMatchesById($matches);
+
+        $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
+        $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
+
+        $formChoices = [];
+        if ($forms !== []) {
+            $i = 1;
+            foreach ($forms as $f) {
+                $title = (string)($f['title'] ?? '');
+                if ($title === '') continue;
+                $formChoices[] = ['kind' => 'form', 'label' => $title, 'payload' => $f];
+                $i++;
+                if ($i > self::MAX_CHOICES) break;
+            }
+        }
         if ($formChoices !== []) {
             $this->storeChoices($sessionId, $formChoices);
         }
 
-        /**
-         * C) AI + DB (SOP guidance)
-         */
-        /** @var list<ChatMessage> $history */
         $history = $this->span($trace, 'cache.history_load', fn() => $this->loadHistory($sessionId), [
             'session_hash' => sha1($sessionId),
         ]);
 
         $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
             $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
-
             $today = (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d');
             $expectedSystem = $this->promptLoader->render($tpl['system'], ['today' => $today]);
 
-            $marker = 'PROMPT_ID: dashTk_assist_v2';
-
             $systemIndex = null;
             foreach ($history as $i => $msg) {
-                if (($msg['role'] ?? null) === 'system') {
-                    $systemIndex = $i;
-                    break;
-                }
+                if (($msg['role'] ?? null) === 'system') { $systemIndex = $i; break; }
             }
-
             if ($systemIndex === null) {
                 array_unshift($history, ['role' => 'system', 'content' => $expectedSystem]);
                 return $history;
             }
 
-            $current = (string)($history[$systemIndex]['content'] ?? '');
-            if ($marker !== '' && stripos($current, $marker) === false) {
-                $history[$systemIndex]['content'] = $expectedSystem;
-            }
-
+            $history[$systemIndex]['content'] = $expectedSystem;
             if ($systemIndex !== 0) {
                 $sys = $history[$systemIndex];
                 unset($history[$systemIndex]);
                 array_unshift($history, $sys);
                 $history = array_values($history);
             }
-
             return $history;
         });
 
-        $history[] = ['role' => 'user', 'content' => $message];
+        $history[] = ['role' => 'user', 'content' => $rawMessage];
 
         $kbContext = $this->span($trace, 'kb.build_context', fn() => $this->buildKbContext($matches), [
             'match_count' => count($matches),
         ]);
 
-        // DEV toggles
-        if ($this->isDev && isset($context['debug_mode']) && is_string($context['debug_mode'])) {
-            if ($context['debug_mode'] === 'no_kb') {
-                $kbContext = "KB_CONTEXT: none\n";
-            }
-        }
-
-        if ($formChoices !== []) {
-            $kbContext .= "\nFORM_CHOICES_UI:\n";
-            foreach ($formChoices as $c) {
-                $label = (string)($c['label'] ?? '');
-                $symptoms = trim((string)($c['payload']['symptoms'] ?? ''));
-                $kbContext .= "- {$label}" . ($symptoms !== '' ? (" | " . $symptoms) : "") . "\n";
-            }
-            $kbContext .= "ANWEISUNG: Wenn FORM_CHOICES_UI nicht leer ist, behaupte niemals \"kein Zugriff\" und biete Auswahl per Nummer an.\n";
-        }
-
-        $context = $this->span($trace, 'ai.context_defaults', function () use ($context) {
-            $context['usage_key'] ??= self::USAGE_KEY_ASK;
-            $context['cache_hit'] ??= false;
-            return $context;
-        }, ['usage_key' => $context['usage_key'] ?? self::USAGE_KEY_ASK]);
-
-        $model = $this->span($trace, 'ai.model_resolve', function () use ($provider, $model) {
-            if ($model === null || trim((string)$model) === '') {
-                if ($provider === 'openai') {
-                    $model = (string)($_ENV['OPENAI_DEFAULT_MODEL'] ?? $_SERVER['OPENAI_DEFAULT_MODEL'] ?? '');
-                } elseif ($provider === 'gemini') {
-                    $model = (string)($_ENV['GEMINI_DEFAULT_MODEL'] ?? $_SERVER['GEMINI_DEFAULT_MODEL'] ?? '');
-                }
-                $model = trim((string)$model);
-                $model = $model !== '' ? $model : null;
-            }
-            return $model;
-        }, ['provider' => $provider]);
-
-        /** @var list<ChatMessage> $trimmedHistory */
         $trimmedHistory = $this->span($trace, 'history.trim', fn() => $this->trimHistory($history), [
             'history_count_in' => count($history),
             'max' => self::MAX_HISTORY_MESSAGES,
         ]);
 
-        if ($this->isDev && isset($context['debug_mode']) && $context['debug_mode'] === 'fresh_history') {
-            $sys = null;
-            foreach ($trimmedHistory as $m) {
-                if (($m['role'] ?? null) === 'system') { $sys = $m; break; }
-            }
-            $trimmedHistory = [];
-            if ($sys) { $trimmedHistory[] = $sys; }
-            $trimmedHistory[] = ['role' => 'user', 'content' => $message];
-        }
+        $answer = $this->span($trace, 'ai.call', function () use ($trimmedHistory, $kbContext, $provider, $model, $context) {
+            return $this->aiChat->chat(
+                history: $trimmedHistory,
+                kbContext: $kbContext,
+                provider: $provider,
+                model: $model,
+                context: $context
+            );
+        });
 
-        if ($this->isDev) {
-            $systemCount = 0;
-            $firstRole = $trimmedHistory[0]['role'] ?? null;
-            foreach ($trimmedHistory as $msg) {
-                if (($msg['role'] ?? null) === 'system') {
-                    $systemCount++;
-                }
-            }
-            $this->supportSolutionLogger->debug('prompt_debug', [
-                'firstRole' => $firstRole,
-                'systemCount' => $systemCount,
-                'firstSystemPreview' => ($firstRole === 'system')
-                    ? mb_substr((string)($trimmedHistory[0]['content'] ?? ''), 0, 180)
-                    : null,
-            ]);
-        }
-
-        $this->supportSolutionLogger->info('chat_request', [
-            'sessionId' => $sessionId,
-            'message' => $message,
-            'matchCount' => count($matches),
-            'matchIds' => array_map(static fn($m) => $m['id'] ?? null, $matches),
-            'kbContextChars' => strlen($kbContext),
-            'provider' => $provider,
-            'model' => $model,
-            'usageKey' => $context['usage_key'] ?? self::USAGE_KEY_ASK,
-        ]);
-
-        if ($this->isDev) {
-            $sys = '';
-            foreach ($trimmedHistory as $msg) {
-                if (($msg['role'] ?? null) === 'system') {
-                    $sys = (string)($msg['content'] ?? '');
-                    break;
-                }
-            }
-
-            $userLast = '';
-            for ($i = count($trimmedHistory) - 1; $i >= 0; $i--) {
-                if (($trimmedHistory[$i]['role'] ?? null) === 'user') {
-                    $userLast = (string)($trimmedHistory[$i]['content'] ?? '');
-                    break;
-                }
-            }
-
-            $suspiciousNeedles = [
-                'denke schritt', 'chain of thought', 'policy', 'system prompt',
-                'prompt_id:', 'wichtig:', 'anweisung:', 'internal',
-                'safety', 'blocked', 'jailbreak',
-            ];
-            $hay = mb_strtolower($sys . "\n" . $kbContext . "\n" . $userLast);
-            $hits = [];
-            foreach ($suspiciousNeedles as $n) {
-                if (str_contains($hay, $n)) {
-                    $hits[] = $n;
-                }
-            }
-
-            $this->supportSolutionLogger->debug('ai_request_fingerprint', [
-                'sessionId' => $sessionId,
-                'provider' => $provider,
-                'model' => $model,
-                'history_count' => count($trimmedHistory),
-                'history_roles' => array_map(static fn($m) => $m['role'] ?? null, $trimmedHistory),
-                'history_lengths' => array_map(static fn($m) => mb_strlen((string)($m['content'] ?? '')), $trimmedHistory),
-                'system_len' => mb_strlen($sys),
-                'system_sha1' => sha1($sys),
-                'kb_len' => strlen($kbContext),
-                'kb_sha1' => sha1($kbContext),
-                'user_last_len' => mb_strlen($userLast),
-                'user_last_sha1' => sha1($userLast),
-                'suspicious_hits' => $hits,
-            ]);
-
-            $redact = static function (string $s): string {
-                $s = preg_replace('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', '[EMAIL]', $s) ?? $s;
-                $s = preg_replace('/\+?\d[\d\s().-]{7,}\d/', '[PHONE]', $s) ?? $s;
-                return $s;
-            };
-            $this->supportSolutionLogger->debug('ai_prompt_preview', [
-                'system_preview' => $redact(mb_substr($sys, 0, 400)),
-                'kb_head' => $redact(mb_substr($kbContext, 0, 400)),
-                'kb_tail' => $redact(mb_substr($kbContext, max(0, mb_strlen($kbContext) - 200), 200)),
-                'user_preview' => $redact(mb_substr($userLast, 0, 200)),
-            ]);
-        }
-
-        // --- Context anreichern: wichtig für Provider-Routing & Debug ---
-        $context ??= [];
-        $context['usage_key']  = $context['usage_key'] ?? 'support_chat.ask';
-        $context['mode_hint']  = $context['mode_hint'] ?? 'ai_with_db';
-        $context['kb_matches'] = $context['kb_matches'] ?? $matches;
-
-
-        try {
-            $answer = $this->span($trace, 'ai.call', function () use ($trimmedHistory, $kbContext, $provider, $model, $context) {
-                return $this->aiChat->chat(
-                    history: $trimmedHistory,
-                    kbContext: $kbContext,
-                    provider: $provider,
-                    model: $model,
-                    context: $context
-                );
-            }, [
-                'provider' => $provider,
-                'model' => $model,
-                'history_msgs' => count($trimmedHistory),
-                'kb_chars' => strlen($kbContext),
-            ]);
-        } catch (\Throwable $e) {
-
-            $this->supportSolutionLogger->error('chat_execute_failed', [
-                'sessionId' => $sessionId,
-                'message' => $message,
-                'error' => $e->getMessage(),
-                'class' => $e::class,
-                'provider' => $provider,
-                'model' => $model,
-                'prev_class' => $e->getPrevious() ? $e->getPrevious()::class : null,
-                'prev_error' => $e->getPrevious() ? $e->getPrevious()->getMessage() : null,
-            ]);
-
-            if ($this->isDev) {
-                $this->supportSolutionLogger->debug('chat_execute_failed_trace', [
-                    'sessionId' => $sessionId,
-                    'trace' => $e->getTraceAsString(),
-                ]);
-            }
-
-            $msg = $this->isDev
-                ? ('Fehler beim Erzeugen der Antwort (DEV): ' . $e->getMessage())
-                : 'Fehler beim Erzeugen der Antwort. Bitte später erneut versuchen.';
-
-            return [
-                'answer' => $msg,
-                'matches' => $sops,
-                'choices' => $formChoices,
-                'modeHint' => 'ai_with_db',
-                'model' => $model,
-                '_meta' => [
-                    'ai_used' => true,
-                ],
-            ];
-
-        }
-
-        // save history
         $history[] = ['role' => 'assistant', 'content' => $answer];
         $this->span($trace, 'cache.history_save', function () use ($sessionId, $history) {
             $this->saveHistory($sessionId, $history);
             return null;
         });
 
-        $this->supportSolutionLogger->info('chat_response', [
-            'sessionId' => $sessionId,
-            'answerChars' => strlen($answer),
-            'provider' => $provider,
-            'model' => $model,
-        ]);
-
-        // store numeric-selection choices: forms + sops
-        $kbChoices = $this->buildKbChoices($matches);
-
-        $storedChoices = [];
-        if ($formChoices !== []) {
-            $storedChoices = array_merge($storedChoices, $formChoices);
-        }
-        if ($kbChoices !== []) {
-            $storedChoices = array_merge($storedChoices, $kbChoices);
-        }
-        if ($storedChoices !== []) {
-            $this->storeChoices($sessionId, $storedChoices);
-        }
-
         return [
-            'answer' => $answer,
+            'anaswer' => $answer,
             'matches' => $sops,
             'modeHint' => 'ai_with_db',
-            'choices' => $formChoices, // only forms in UI
+            'choices' => $formChoices,
             'model' => $model,
             '_meta' => [
                 'ai_used' => true,
             ],
         ];
-
     }
+
+
+
 
     // ---------------------------------------------------------------------
     // Newsletter Create (delegiert)
@@ -1043,7 +768,11 @@ final class SupportChatService
             return [];
         }
 
-        $raw = $this->solutions->findBestMatches($message, 5);
+        // Blacklist IMMER (vor jeder DB-Nutzung)
+        $message = $this->applyKeywordBlacklist($message);
+
+        // 1) Primär: Scoring-Matcher
+        $raw = $this->solutions->findBestMatches($message, 8);
 
         $mapped = [];
         foreach ($raw as $m) {
@@ -1054,6 +783,52 @@ final class SupportChatService
             $mapped[] = $this->mapMatch($s, (int)($m['score'] ?? 0));
         }
 
+        // 2) Fallback: direkter Keyword-LIKE Match (damit Keywords garantiert greifen)
+        if ($mapped === []) {
+            $needle = mb_strtolower($message);
+
+            $parts = preg_split('/[^\p{L}\p{N}]+/u', $needle) ?: [];
+            $parts = array_values(array_filter($parts, static fn($p) => $p !== ''));
+
+            // Fallback nutzt erstes sinnvolles Token
+            $q = '';
+            foreach ($parts as $p) {
+                if (mb_strlen($p) >= 3 && preg_match('/\p{L}/u', $p)) {
+                    $q = $p;
+                    break;
+                }
+            }
+
+            if ($q !== '') {
+                // Query: alle SupportSolutions, die ein Keyword haben, das mit Token beginnt
+                // (du kannst %...% nehmen, aber Prefix ist meist besser)
+                $qb = $this->solutions->createQueryBuilder('s')
+                    ->join('s.keywords', 'k')
+                    ->andWhere('s.active = true')
+                    ->andWhere('LOWER(k.keyword) LIKE :q')
+                    ->setParameter('q', $q . '%')
+                    ->addOrderBy('s.priority', 'DESC')
+                    ->setMaxResults(8);
+
+                $solutions = $qb->getQuery()->getResult();
+
+                foreach ($solutions as $sol) {
+                    if ($sol instanceof SupportSolution) {
+                        $mapped[] = $this->mapMatch($sol, 1);
+                    }
+                }
+            }
+
+            $mapped = $this->dedupeMatchesById($mapped);
+
+            $this->supportSolutionLogger->debug('db_matches_fallback_like', [
+                'message' => $message,
+                'fallbackToken' => $q,
+                'matchCount' => count($mapped),
+                'matchIds' => array_map(static fn($x) => $x['id'] ?? null, $mapped),
+            ]);
+        }
+
         $this->supportSolutionLogger->debug('db_matches', [
             'message' => $message,
             'matchCount' => count($mapped),
@@ -1062,6 +837,8 @@ final class SupportChatService
 
         return $mapped;
     }
+
+
 
     /**
      * Maps SupportSolution entity to match payload consumed by UI/AI context builder.
@@ -1647,28 +1424,7 @@ final class SupportChatService
      *
      * @return array<string,mixed>|null Resolver payload or null if resolver returns null
      */
-    private function safeResolveNewsletter(string $sessionId, string $query): ?array
-    {
-        try {
-            return $this->newsletterResolver->resolve($query);
-        } catch (\Throwable $e) {
-            $this->supportSolutionLogger->error('newsletter_execute_failed', [
-                'sessionId' => $sessionId,
-                'query' => $query,
-                'error' => $e->getMessage(),
-                'class' => $e::class,
-            ]);
 
-            return [
-                'answer' => $this->isDev
-                    ? ('Newsletter-Resolver Fehler (DEV): ' . $e->getMessage())
-                    : 'Newsletter-Suche ist gerade fehlgeschlagen. Bitte dev.log prüfen.',
-                'matches' => [],
-                'choices' => [],
-                'modeHint' => 'newsletter_failed',
-            ];
-        }
-    }
 
     // ---------------------------------------------------------------------
     // Document Create (delegiert)
@@ -1928,5 +1684,169 @@ final class SupportChatService
     {
         return $this->matchSolutions($message);
     }
+
+    /**
+     * Minimal-Implementierung: entfernt Blacklist-Tokens aus dem Text.
+     * Best practice wäre: eigener Service, der TKFashionPolicyKeywords nutzt.
+     */
+    private function applyKeywordBlacklist(string $message): string
+    {
+        // TODO: Langfristig sauber an App\Validator\TKFashionPolicyKeywords anbinden.
+        // Quick-Win: Datei laden, Tokens als "Wort"-Blacklist anwenden, ohne Satzzeichen zu zerstören.
+        $path = dirname(__DIR__) . '/Service/Prompts/TKFashionPolicyKeywords.config';
+        if (!is_file($path)) {
+            return $message;
+        }
+
+        $raw = (string)@file_get_contents($path);
+        if (trim($raw) === '') {
+            return $message;
+        }
+
+        $blacklist = [];
+        foreach (preg_split('/\R/u', $raw) ?: [] as $line) {
+            $line = trim($line);
+            if ($line === '' || str_starts_with($line, '#')) {
+                continue;
+            }
+            $blacklist[] = $line;
+        }
+
+        if ($blacklist === []) {
+            return $message;
+        }
+
+        // Ersetze nur ganze Wörter (word boundaries), case-insensitive, Unicode.
+        // Wichtig: Wir lassen Interpunktion (z.B. 01.01.2026) intakt.
+        $clean = $message;
+        foreach ($blacklist as $term) {
+            $t = preg_quote($term, '/');
+            $clean = preg_replace('/(?<![\p{L}\p{N}_])' . $t . '(?![\p{L}\p{N}_])/iu', ' ', $clean) ?? $clean;
+        }
+
+        // Whitespace normalisieren
+        $clean = preg_replace('/\s+/u', ' ', $clean) ?? $clean;
+        return trim($clean);
+    }
+
+    private function extractKeywordTokens(string $message, array $removeWords = []): array
+    {
+        $m = mb_strtolower($message);
+
+        // rauswerfen: entfernte Steuerwörter (newsletter/form etc.)
+        foreach ($removeWords as $w) {
+            $w = mb_strtolower((string)$w);
+            if ($w === '') {
+                continue;
+            }
+            $m = preg_replace('/(?<![\p{L}\p{N}_])' . preg_quote($w, '/') . '(?![\p{L}\p{N}_])/iu', ' ', $m) ?? $m;
+        }
+
+        // Datum-/Zahlenmuster raus (01.01.2026, 2026-01-01, qtl, monate)
+        $m = preg_replace('/\b\d{1,2}\.\d{1,2}\.\d{2,4}\b/u', ' ', $m) ?? $m;
+        $m = preg_replace('/\b\d{4}-\d{2}-\d{2}\b/u', ' ', $m) ?? $m;
+        $m = preg_replace('/\b[1-4]\s*qtl\b/u', ' ', $m) ?? $m;
+        $m = preg_replace('/\b[1-4]\s*quartal\b/u', ' ', $m) ?? $m;
+
+        // Tokenisierung
+        $parts = preg_split('/[^\p{L}\p{N}]+/u', $m) ?: [];
+        $parts = array_values(array_filter($parts, static fn($p) => $p !== ''));
+
+        $stop = [
+            'in','im','am','an','auf','zu','zum','zur','von','vom','ab','seit','bis','und','oder',
+            'der','die','das','des','den','dem','ein','eine','einen','einem','einer',
+            'bitte','danke',
+        ];
+
+        $out = [];
+        foreach ($parts as $p) {
+            if (in_array($p, $stop, true)) {
+                continue;
+            }
+            if (mb_strlen($p) < 3) {
+                continue;
+            }
+            // muss Buchstaben enthalten (keine reinen Zahlen)
+            if (!preg_match('/\p{L}/u', $p)) {
+                continue;
+            }
+            $out[] = $p;
+        }
+
+        $out = array_values(array_unique($out));
+        return $out;
+    }
+
+    private function parseNewsletterDateRange(string $message): ?array
+    {
+        $m = mb_strtolower($message);
+
+        // dd.mm.yyyy oder yyyy-mm-dd => from = dieser Tag, to = +10 Jahre (praktisch "ab")
+        if (preg_match('/\b(\d{2})\.(\d{2})\.(\d{4})\b/u', $message, $x)) {
+            $from = \DateTimeImmutable::createFromFormat('d.m.Y', "{$x[1]}.{$x[2]}.{$x[3]}");
+            if ($from instanceof \DateTimeImmutable) {
+                return [
+                    'from' => $from->setTime(0, 0, 0),
+                    'to' => (new \DateTimeImmutable('now'))->modify('+10 years'),
+                ];
+            }
+        }
+
+        if (preg_match('/\b(\d{4})-(\d{2})-(\d{2})\b/u', $message, $x)) {
+            $from = \DateTimeImmutable::createFromFormat('Y-m-d', "{$x[1]}-{$x[2]}-{$x[3]}");
+            if ($from instanceof \DateTimeImmutable) {
+                return [
+                    'from' => $from->setTime(0, 0, 0),
+                    'to' => (new \DateTimeImmutable('now'))->modify('+10 years'),
+                ];
+            }
+        }
+
+        // "1Qtl 26" / "1 Quartal 26"
+        if (preg_match('/\b([1-4])\s*(qtl|quartal)\s*(\d{2})\b/u', $m, $x)) {
+            $q = (int)$x[1];
+            $yy = (int)$x[3];
+            $year = 2000 + $yy;
+            $startMonth = ($q - 1) * 3 + 1;
+
+            $from = new \DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $startMonth));
+            $to = $from->modify('+3 months')->modify('-1 day')->setTime(23, 59, 59);
+
+            return ['from' => $from, 'to' => $to];
+        }
+
+        // "Mai 26" etc.
+        $months = [
+            'januar' => 1, 'jan' => 1,
+            'februar' => 2, 'feb' => 2,
+            'märz' => 3, 'maerz' => 3, 'mrz' => 3,
+            'april' => 4, 'apr' => 4,
+            'mai' => 5,
+            'juni' => 6, 'jun' => 6,
+            'juli' => 7, 'jul' => 7,
+            'august' => 8, 'aug' => 8,
+            'september' => 9, 'sep' => 9,
+            'oktober' => 10, 'okt' => 10,
+            'november' => 11, 'nov' => 11,
+            'dezember' => 12, 'dez' => 12,
+        ];
+
+        if (preg_match('/\b(' . implode('|', array_keys($months)) . ')\s*(\d{2})\b/u', $m, $x)) {
+            $month = $months[$x[1]] ?? null;
+            $yy = (int)$x[2];
+            $year = 2000 + $yy;
+
+            if ($month) {
+                $from = new \DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $month));
+                $to = $from->modify('+1 month')->modify('-1 day')->setTime(23, 59, 59);
+                return ['from' => $from, 'to' => $to];
+            }
+        }
+
+        return null;
+    }
+
+
+
 
 }
