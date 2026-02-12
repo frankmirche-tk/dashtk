@@ -110,6 +110,7 @@ services:
     App\Service\DocumentCreateResolver: ~
     App\Service\NewsletterResolver: ~
     App\Service\NewsletterCreateResolver: ~
+    App\Service\OcrPdfService: ~
 
     App\Command\PromptsValidateCommand:
         arguments:
