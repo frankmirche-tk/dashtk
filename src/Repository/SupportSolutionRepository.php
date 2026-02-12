@@ -423,7 +423,4 @@ final class SupportSolutionRepository extends ServiceEntityRepository
         return $qb->getQuery()->getOneOrNullResult() !== null;
     }
 
-
-
-
 }

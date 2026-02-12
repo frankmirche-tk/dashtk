@@ -239,45 +239,41 @@ final class SupportChatService
         $rawMessage = trim($message);
         $provider = strtolower(trim($provider));
 
+        $this->span($trace, 'usage.increment', function () {
+            $this->usageTracker->increment(self::USAGE_KEY_ASK);
+            return null;
+        }, ['usage_key' => self::USAGE_KEY_ASK]);
+
         if ($sessionId === '') {
-            $sessionId = $this->newSessionIdFallback();
+            $sessionId = $this->span($trace, 'session.fallback_id', fn() => $this->newSessionIdFallback());
         }
 
-        // 0) Numeric selection ("1", "2", "3")
-        $selection = $this->resolveNumericSelection($sessionId, $rawMessage);
+        // 0) Numeric selection
+        $selection = $this->span($trace, 'choice.try_resolve', fn() => $this->resolveNumericSelection($sessionId, $rawMessage));
         if (is_array($selection)) {
             return $selection;
         }
 
-        // A) DB-only (explicit click from UI)
+        // A) DB-only
         if ($dbOnlySolutionId !== null) {
-            return $this->answerDbOnly($sessionId, $dbOnlySolutionId);
+            return $this->span($trace, 'db_only.answer', fn() => $this->answerDbOnly($sessionId, $dbOnlySolutionId), [
+                'solution_id' => $dbOnlySolutionId,
+            ]);
         }
 
-        // ✅ INTENT MUSS AUF RAW PASSIEREN (Blacklist entfernt "newsletter")
-        $rawLower = mb_strtolower($rawMessage);
-        $newsletterIntent = (bool)preg_match('/\bnews\s*letter\b|\bnewsletter\b/u', $rawLower);
-        $formIntent = (bool)preg_match('/\b(form|formular|dokument|antrag|vertrag)(e|en|er)?\b/u', $rawLower);
-
-        // Blacklist immer vor Keyword-Matching/DB
+        // Blacklist immer vor Routing/Matching
         $cleanMessage = $this->applyKeywordBlacklist($rawMessage);
-        $cleanLower = mb_strtolower($cleanMessage);
+        $mLower = mb_strtolower($cleanMessage);
 
-        // ✅ Debug: zeigt genau den Effekt
-        $this->supportSolutionLogger->debug('ask.input_debug', [
-            'sessionId' => $sessionId,
-            'rawMessage' => $rawMessage,
-            'cleanMessage' => $cleanMessage,
-            'containsNewsletter_raw' => $newsletterIntent,
-            'containsNewsletter_clean' => (bool)preg_match('/\bnews\s*letter\b|\bnewsletter\b/u', $cleanLower),
-            'containsForm_raw' => $formIntent,
-            'containsForm_clean' => (bool)preg_match('/\b(form|formular|dokument|antrag|vertrag)(e|en|er)?\b/u', $cleanLower),
+        // 1.1 / 1.2 Kontakt + Filiale – Early Exit
+        $contactResult = $this->span($trace, 'contact.resolve', function () use ($cleanMessage, $trace) {
+            return $this->contactResolver->resolve($cleanMessage, 5, $trace);
+        }, [
+            'policy' => 'local_only',
+            'send_to_ai' => false,
+            'source' => 'var/data/kontakt_*.json',
         ]);
 
-        /**
-         * 1.1 / 1.2 Kontakt + Filiale (JSON) – Early Exit (keine KI, keine Keywords)
-         */
-        $contactResult = $this->contactResolver->resolve($cleanMessage, 5, $trace);
         if (is_array($contactResult) && !empty($contactResult['matches'])) {
             $choices = [];
             $lines = [];
@@ -311,65 +307,56 @@ final class SupportChatService
                 'matches' => [],
                 'choices' => $choices,
                 'modeHint' => 'contact_local',
+                'contact' => $contactResult,
             ];
         }
 
-        /**
-         * 1) Sonderfall: Tipps/Hilfe
-         */
+        // 1) Tipps/Hilfe
         $isHelp =
             in_array(mb_strtolower($rawMessage), ['tipps', 'hilfe', 'help'], true)
-            || str_contains($cleanLower, 'wie nutze ich den chatbot')
-            || str_contains($cleanLower, 'was kann der bot')
-            || str_contains($cleanLower, 'wie funktioniert das');
+            || str_contains($mLower, 'wie nutze ich den chatbot')
+            || str_contains($mLower, 'was kann der bot')
+            || str_contains($mLower, 'wie funktioniert das');
 
         if ($isHelp) {
+            $answer =
+                "💡 So nutzt du diesen ChatBot effektiv\n\n" .
+                "1) Filialinfos: Filialkürzel eingeben (z.B. COSU)\n" .
+                "2) Kontakte: Vor- oder Nachname eingeben (z.B. Alina)\n" .
+                "3) SOPs: kurzes Stichwort (z.B. Warteschlange)\n" .
+                "4) Newsletter/Formulare: mit „Newsletter …“ oder „Formular …“ arbeiten\n\n" .
+                "Tipp: Du kannst sehr kurz schreiben – oft reicht ein Stichwort.";
+
             return [
-                'answer' => "💡 Tipp: Für Newsletter bitte „<Keyword> Newsletter seit 01.01.2026“ schreiben. Für Formulare: „Formular <Keyword>“.",
+                'answer' => $answer,
                 'matches' => [],
                 'choices' => [],
                 'modeHint' => 'help',
             ];
         }
 
-        /**
-         * 2) Newsletter Intent – NUR HIER Datum/Zeitraum
-         */
+        // 2) Newsletter Intent? (Nur hier Datumslogik!)
+        $newsletterIntent = (bool)preg_match('/\bnews\s*letter\b|\bnewsletter\b/u', $mLower);
         if ($newsletterIntent) {
             $range = $this->parseNewsletterDateRange($rawMessage);
+
+            // Wenn Datum erkannt wurde: from/to setzen – sonst "alle"
             $from = $range['from'] ?? new \DateTimeImmutable('2000-01-01 00:00:00');
             $to   = $range['to']   ?? (new \DateTimeImmutable('now'))->modify('+10 years');
 
-            // Keywords aus cleanMessage extrahieren (Blacklist gilt!)
             $tokens = $this->extractKeywordTokens($cleanMessage, ['newsletter', 'news', 'letter']);
 
             if ($tokens === []) {
                 return [
-                    'answer' => "Für Newsletter brauche ich mindestens **1 Keyword** (z.B. „Reduzierungen“). Optional mit Datum („seit 01.01.2026“).",
+                    'answer' => "Für Newsletter brauche ich mindestens **1 Keyword** (z.B. „Reduzierungen“, „Filialperformance“). Optional mit Datum („seit 01.01.2026“).",
                     'matches' => [],
                     'choices' => [],
                     'modeHint' => 'newsletter_need_keyword',
                 ];
             }
 
-            // ✅ strictPublished, sobald Datum erkannt wurde
-            $strictPublished = ($range !== null);
-
-            $rows = $this->solutions->findNewsletterMatches($tokens, $from, $to, 0, self::MAX_CHOICES, $strictPublished);
-
-            // Debug: was kam aus dem Repo?
-            $this->supportSolutionLogger->debug('newsletter.repo_result', [
-                'rawMessage' => $rawMessage,
-                'tokens' => $tokens,
-                'strictPublished' => $strictPublished,
-                'from' => $from->format('Y-m-d'),
-                'to' => $to->format('Y-m-d'),
-                'rowCount' => count($rows),
-                'ids' => array_values(array_filter(array_map(static function ($r) {
-                    $s = $r['solution'] ?? null;
-                    return ($s instanceof SupportSolution) ? $s->getId() : null;
-                }, $rows))),
-            ]);
+            // Repo liefert Kandidaten (wie gehabt)
+            $rows = $this->solutions->findNewsletterMatches($tokens, $from, $to, 0, self::MAX_CHOICES);
 
             $matches = [];
             foreach ($rows as $r) {
@@ -377,6 +364,20 @@ final class SupportChatService
                 if ($sol instanceof SupportSolution) {
                     $matches[] = $this->mapMatch($sol, 100);
                 }
+            }
+
+            // ✅ FIX: Wenn Datum im Request -> STRICT nach publishedAt filtern (und NUR im Newsletter-Intent)
+            if ($range !== null) {
+                $before = count($matches);
+                $matches = $this->filterNewsletterMatchesStrictByPublishedAt($matches, $from, $to);
+
+                $this->supportSolutionLogger->debug('newsletter.strict_published_filter', [
+                    'query_raw' => $rawMessage,
+                    'from' => $from->format('Y-m-d'),
+                    'to' => $to->format('Y-m-d'),
+                    'before' => $before,
+                    'after' => count($matches),
+                ]);
             }
 
             if ($matches === []) {
@@ -415,9 +416,8 @@ final class SupportChatService
             ];
         }
 
-        /**
-         * 3) Form Intent – keine Datumslogik
-         */
+        // 3) Form Intent?
+        $formIntent = (bool)preg_match('/\b(form|formular|dokument|antrag|vertrag)(e|en|er)?\b/u', $mLower);
         if ($formIntent) {
             $tokens = $this->extractKeywordTokens($cleanMessage, ['form', 'formular', 'dokument', 'antrag', 'vertrag']);
 
@@ -484,23 +484,29 @@ final class SupportChatService
             ];
         }
 
-        /**
-         * 4) ELSE: klassisch KI (+ optional SOP Treffer, wenn echte Keywords existieren)
-         * (deine Regel: keine DB Treffer, wenn keine Keywords in Tabelle)
-         */
+        // 4) ELSE: Klassisch KI (hier KEINE Datumslogik für Newsletter!)
         $tokens = $this->extractKeywordTokens($cleanMessage, []);
-        $hasKeyword = ($tokens !== [] && method_exists($this->solutions, 'hasAnyKeywordMatch'))
-            ? (bool)$this->solutions->hasAnyKeywordMatch($tokens)
-            : false;
+        $hasKeyword = false;
 
-        $dbMatches = [];
-        if ($hasKeyword) {
-            $dbMatches = $this->findMatches($cleanMessage);
-            $dbMatches = $this->dedupeMatchesById($dbMatches);
+        if ($tokens !== [] && method_exists($this->solutions, 'hasAnyKeywordMatch')) {
+            $hasKeyword = (bool)$this->solutions->hasAnyKeywordMatch($tokens);
         }
 
-        $sops = array_values(array_filter($dbMatches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
-        $forms = array_values(array_filter($dbMatches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
+        $matches = [];
+        if ($hasKeyword) {
+            $matches = $this->span($trace, 'kb.match', fn() => $this->findMatches($cleanMessage), [
+                'query_len' => mb_strlen($cleanMessage),
+            ]);
+            $matches = $this->dedupeMatchesById($matches);
+        } else {
+            $this->supportSolutionLogger->debug('kb.skip_no_keyword_hit', [
+                'message' => $cleanMessage,
+                'tokens' => $tokens,
+            ]);
+        }
+
+        $forms = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) === 'FORM'));
+        $sops  = array_values(array_filter($matches, static fn(array $m) => ($m['type'] ?? null) !== 'FORM'));
 
         $formChoices = [];
         if ($forms !== []) {
@@ -517,39 +523,74 @@ final class SupportChatService
             $this->storeChoices($sessionId, $formChoices);
         }
 
-        // KI immer erlaubt in Case 4
-        $history = $this->loadHistory($sessionId);
+        $context['usage_key'] ??= self::USAGE_KEY_ASK;
+
+        $history = $this->span($trace, 'cache.history_load', fn() => $this->loadHistory($sessionId), [
+            'session_hash' => sha1($sessionId),
+        ]);
+
+        $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
+            $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
+            $today = (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d');
+            $expectedSystem = $this->promptLoader->render($tpl['system'], ['today' => $today]);
+
+            $systemIndex = null;
+            foreach ($history as $i => $msg) {
+                if (($msg['role'] ?? null) === 'system') { $systemIndex = $i; break; }
+            }
+            if ($systemIndex === null) {
+                array_unshift($history, ['role' => 'system', 'content' => $expectedSystem]);
+                return $history;
+            }
+
+            $history[$systemIndex]['content'] = $expectedSystem;
+            if ($systemIndex !== 0) {
+                $sys = $history[$systemIndex];
+                unset($history[$systemIndex]);
+                array_unshift($history, $sys);
+                $history = array_values($history);
+            }
+            return $history;
+        });
+
         $history[] = ['role' => 'user', 'content' => $rawMessage];
 
-        $kbContext = $dbMatches !== [] ? $this->buildKbContext($dbMatches) : '';
+        $kbContext = $matches !== [] ? $this->buildKbContext($matches) : '';
 
-        $answer = $this->aiChat->chat(
-            history: $this->trimHistory($history),
-            kbContext: $kbContext,
-            provider: $provider,
-            model: $model,
-            context: $context
-        );
+        $trimmedHistory = $this->span($trace, 'history.trim', fn() => $this->trimHistory($history), [
+            'history_count_in' => count($history),
+            'max' => self::MAX_HISTORY_MESSAGES,
+        ]);
+
+        $answer = $this->span($trace, 'ai.call', function () use ($trimmedHistory, $kbContext, $provider, $model, $context) {
+            return $this->aiChat->chat(
+                history: $trimmedHistory,
+                kbContext: $kbContext,
+                provider: $provider,
+                model: $model,
+                context: $context
+            );
+        });
 
         $history[] = ['role' => 'assistant', 'content' => $answer];
-        $this->saveHistory($sessionId, $history);
+        $this->span($trace, 'cache.history_save', function () use ($sessionId, $history) {
+            $this->saveHistory($sessionId, $history);
+            return null;
+        });
 
         return [
             'answer' => $answer,
             'matches' => $sops,
-            'choices' => $formChoices,
             'modeHint' => $hasKeyword ? 'ai_with_db' : 'ai_only',
+            'choices' => $formChoices,
+            'provider' => $provider,
+            'model' => $model,
             '_meta' => [
+                'ai_used' => true,
                 'kb_used' => $hasKeyword,
             ],
         ];
     }
-
-
-
-
-
-
 
 
     // ---------------------------------------------------------------------
@@ -1744,17 +1785,32 @@ final class SupportChatService
         $startOfDay = static fn(\DateTimeImmutable $d) => $d->setTime(0, 0, 0);
         $endOfDay = static fn(\DateTimeImmutable $d) => $d->setTime(23, 59, 59);
 
-        // 4) Von-Bis / Range: "01.01.2026 - 28.02.2026" (auch mit "bis", "von ... bis ...")
-        // dd.mm.yyyy - dd.mm.yyyy
-        if (preg_match('/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\s*(?:\-|–|—|bis)\s*(\d{1,2})\.(\d{1,2})\.(\d{4})\b/u', $message, $x)) {
-            $from = \DateTimeImmutable::createFromFormat(
-                'd.m.Y',
-                sprintf('%02d.%02d.%04d', (int)$x[1], (int)$x[2], (int)$x[3])
-            );
-            $to = \DateTimeImmutable::createFromFormat(
-                'd.m.Y',
-                sprintf('%02d.%02d.%04d', (int)$x[4], (int)$x[5], (int)$x[6])
-            );
+        // dd.mm.yy OR dd.mm.yyyy -> DateTimeImmutable
+        $parseDotDate = static function (string $dd, string $mm, string $yyOrYyyy): ?\DateTimeImmutable {
+            $day = (int)$dd;
+            $mon = (int)$mm;
+            $yRaw = trim($yyOrYyyy);
+
+            if (strlen($yRaw) === 2) {
+                // 00-99 => 2000-2099 (für euren Usecase Newsletter vollkommen ok)
+                $year = 2000 + (int)$yRaw;
+            } elseif (strlen($yRaw) === 4) {
+                $year = (int)$yRaw;
+            } else {
+                return null;
+            }
+
+            $dt = \DateTimeImmutable::createFromFormat('d.m.Y', sprintf('%02d.%02d.%04d', $day, $mon, $year));
+            return ($dt instanceof \DateTimeImmutable) ? $dt : null;
+        };
+
+        /**
+         * 4) Von-Bis / Range: "01.01.2026 - 28.02.2026" / "01.01.26 - 28.02.26" / "... bis ..."
+         * dd.mm.(yy|yyyy) - dd.mm.(yy|yyyy)
+         */
+        if (preg_match('/\b(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\s*(?:\-|–|—|bis)\s*(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\b/u', $message, $x)) {
+            $from = $parseDotDate($x[1], $x[2], $x[3]);
+            $to   = $parseDotDate($x[4], $x[5], $x[6]);
 
             if ($from instanceof \DateTimeImmutable && $to instanceof \DateTimeImmutable) {
                 $from = $startOfDay($from);
@@ -1785,7 +1841,9 @@ final class SupportChatService
             }
         }
 
-        // 3) Quartal: "1Qtl 26" / "1 Qtl 26" / "1 Quartal 26"
+        /**
+         * 3) Quartal: "1Qtl 26" / "1 Qtl 26" / "1 Quartal 26"
+         */
         if (preg_match('/\b([1-4])\s*(qtl|quartal)\s*(\d{2})\b/u', $m, $x)) {
             $q = (int)$x[1];
             $yy = (int)$x[3];
@@ -1799,26 +1857,22 @@ final class SupportChatService
             return ['from' => $startOfDay($from), 'to' => $endOfDay($to)];
         }
 
-        // 2) "seit 01.01.2026" oder "ab 01.01.2026"
-        if (preg_match('/\b(seit|ab)\s+(\d{1,2})\.(\d{1,2})\.(\d{4})\b/u', $m, $x)) {
-            $from = \DateTimeImmutable::createFromFormat(
-                'd.m.Y',
-                sprintf('%02d.%02d.%04d', (int)$x[2], (int)$x[3], (int)$x[4])
-            );
-
+        /**
+         * 2) "seit 01.01.2026" oder "ab 01.01.26"
+         */
+        if (preg_match('/\b(seit|ab)\s+(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\b/u', $m, $x)) {
+            $from = $parseDotDate($x[2], $x[3], $x[4]);
             if ($from instanceof \DateTimeImmutable) {
                 return ['from' => $startOfDay($from), 'to' => $endOfDay($nowPlus('+10 years'))];
             }
         }
 
-        // 1) "Keyword Newsletter 01.01.2026" (ohne 'seit') => ab Datum bis "heute/weit in Zukunft"
-        // dd.mm.yyyy
-        if (preg_match('/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/u', $message, $x)) {
-            $from = \DateTimeImmutable::createFromFormat(
-                'd.m.Y',
-                sprintf('%02d.%02d.%04d', (int)$x[1], (int)$x[2], (int)$x[3])
-            );
-
+        /**
+         * 1) "Keyword Newsletter 01.01.2026" (ohne 'seit') => ab Datum bis "weit in Zukunft"
+         * dd.mm.(yy|yyyy)
+         */
+        if (preg_match('/\b(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\b/u', $message, $x)) {
+            $from = $parseDotDate($x[1], $x[2], $x[3]);
             if ($from instanceof \DateTimeImmutable) {
                 return ['from' => $startOfDay($from), 'to' => $endOfDay($nowPlus('+10 years'))];
             }
@@ -1827,7 +1881,6 @@ final class SupportChatService
         // yyyy-mm-dd
         if (preg_match('/\b(\d{4})-(\d{2})-(\d{2})\b/u', $message, $x)) {
             $from = \DateTimeImmutable::createFromFormat('Y-m-d', "{$x[1]}-{$x[2]}-{$x[3]}");
-
             if ($from instanceof \DateTimeImmutable) {
                 return ['from' => $startOfDay($from), 'to' => $endOfDay($nowPlus('+10 years'))];
             }
@@ -1835,6 +1888,9 @@ final class SupportChatService
 
         return null;
     }
+
+
+
 
     private function logNewsletterDiagnostics(
         string $sessionId,
@@ -1891,6 +1947,78 @@ final class SupportChatService
             'items' => $items,
         ]);
     }
+
+
+    private function filterMatchesByNewsletterPublishedRange(array $matches, \DateTimeImmutable $from, \DateTimeImmutable $to): array
+    {
+        $out = [];
+
+        foreach ($matches as $m) {
+            $category = (string)($m['category'] ?? '');
+
+            // Nur Newsletter filtern – SOP/FORM/GENERAL nicht anfassen
+            if ($category !== 'NEWSLETTER') {
+                $out[] = $m;
+                continue;
+            }
+
+            // strict: publishedAt MUSS vorhanden sein
+            $pubRaw = $m['publishedAt'] ?? null;
+            if (!is_string($pubRaw) || trim($pubRaw) === '') {
+                continue;
+            }
+
+            try {
+                $pub = new \DateTimeImmutable($pubRaw);
+            } catch (\Throwable $e) {
+                // wenn publishedAt nicht parsebar -> raus
+                continue;
+            }
+
+            if ($pub >= $from && $pub <= $to) {
+                $out[] = $m;
+            }
+        }
+
+        return $out;
+    }
+    private function filterNewsletterMatchesStrictByPublishedAt(array $matches, \DateTimeImmutable $from, ?\DateTimeImmutable $to = null): array
+    {
+        $out = [];
+
+        foreach ($matches as $m) {
+            // Nur Newsletter-Einträge filtern
+            if (($m['category'] ?? null) !== 'NEWSLETTER') {
+                $out[] = $m;
+                continue;
+            }
+
+            $publishedRaw = $m['publishedAt'] ?? null;
+            if (!is_string($publishedRaw) || trim($publishedRaw) === '') {
+                // Wenn publishedAt fehlt -> bei Datumsfilter: raus
+                continue;
+            }
+
+            try {
+                $publishedAt = new \DateTimeImmutable($publishedRaw);
+            } catch (\Throwable $e) {
+                continue;
+            }
+
+            if ($publishedAt < $from) {
+                continue;
+            }
+            if ($to instanceof \DateTimeImmutable && $publishedAt > $to) {
+                continue;
+            }
+
+            $out[] = $m;
+        }
+
+        return $out;
+    }
+
+
 
 
 }
