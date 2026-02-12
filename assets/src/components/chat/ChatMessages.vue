@@ -563,9 +563,17 @@ function newsletterRank(choice) {
 function sortedSops(m) {
     const out = []
 
-    // 1) matches (DB)
+    // 1) matches (DB) -> NUR echte SOPs anzeigen
     const matches = Array.isArray(m?.matches) ? m.matches : []
     for (const hit of matches) {
+        const t = String(hit?.type || '').toUpperCase()
+        const cat = String(hit?.category || '').toUpperCase()
+
+        // ✅ Newsletter/Form raus (Newsletter = category NEWSLETTER, Form = type FORM)
+        // ✅ SOP rein nur wenn type explizit SOP
+        if (t !== 'SOP') continue
+        if (cat === 'NEWSLETTER') continue
+
         out.push({
             _key: 'm-' + String(hit.id ?? hit.url ?? Math.random()),
             id: hit.id ?? null,
@@ -614,6 +622,7 @@ function sortedSops(m) {
 
     return out
 }
+
 
 function sortedForms(m) {
     const gc = groupedChoices(m)

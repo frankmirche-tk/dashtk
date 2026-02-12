@@ -305,19 +305,40 @@ final class SupportSolutionRepository extends ServiceEntityRepository
 
     // neuer Code
 
-    public function findNewsletterMatches(array $tokens, \DateTimeImmutable $from, \DateTimeImmutable $to, int $offset = 0, int $limit = 25): array
-    {
+    public function findNewsletterMatches(
+        array $tokens,
+        \DateTimeImmutable $from,
+        \DateTimeImmutable $to,
+        int $offset = 0,
+        int $limit = 25,
+        bool $strictPublished = false
+    ): array {
         $qb = $this->createQueryBuilder('s');
 
         $qb
             ->andWhere('s.active = true')
             ->andWhere('s.type = :type')
             ->andWhere('s.category = :category')
-            ->andWhere('(s.publishedAt BETWEEN :from AND :to OR (s.publishedAt IS NULL AND s.createdAt BETWEEN :from AND :to))')
             ->setParameter('type', 'FORM')
-            ->setParameter('category', 'NEWSLETTER')
-            ->setParameter('from', $from)
-            ->setParameter('to', $to);
+            ->setParameter('category', 'NEWSLETTER');
+
+        /**
+         * Newsletter-Datum-Regel:
+         * - strictPublished=true  => Zeitraum gilt NUR für publishedAt (kein createdAt-Fallback!)
+         * - strictPublished=false => publishedAt ODER (wenn publishedAt NULL) createdAt
+         */
+        if ($strictPublished) {
+            $qb
+                ->andWhere('s.publishedAt IS NOT NULL')
+                ->andWhere('s.publishedAt BETWEEN :from AND :to')
+                ->setParameter('from', $from)
+                ->setParameter('to', $to);
+        } else {
+            $qb
+                ->andWhere('(s.publishedAt BETWEEN :from AND :to OR (s.publishedAt IS NULL AND s.createdAt BETWEEN :from AND :to))')
+                ->setParameter('from', $from)
+                ->setParameter('to', $to);
+        }
 
         if (!empty($tokens)) {
             $qb
@@ -326,7 +347,7 @@ final class SupportSolutionRepository extends ServiceEntityRepository
                 ->setParameter('tokens', array_map('mb_strtolower', $tokens));
         }
 
-
+        // Bewährtes Ranking beibehalten
         $qb
             ->addSelect(
                 "CASE
@@ -338,6 +359,8 @@ final class SupportSolutionRepository extends ServiceEntityRepository
             )
             ->orderBy('s.publishedAt', 'DESC')
             ->addOrderBy('editionRank', 'DESC')
+            // Optional: hilft nur bei NULL publishedAt (default mode), schadet strict nicht
+            ->addOrderBy('s.createdAt', 'DESC')
             ->setFirstResult($offset)
             ->setMaxResults($limit);
 
@@ -348,6 +371,8 @@ final class SupportSolutionRepository extends ServiceEntityRepository
             'score' => 0,
         ], $solutions);
     }
+
+
 
     /**
      * Case A: "Newsletter seit ...": alle Newsletter im Zeitraum (ohne Keyword-Matching)
@@ -377,6 +402,27 @@ final class SupportSolutionRepository extends ServiceEntityRepository
             'score' => 0,
         ], $solutions);
     }
+
+    public function hasAnyKeywordMatch(array $tokens): bool
+    {
+        $tokens = array_values(array_filter(array_map(static fn($t) => mb_strtolower(trim((string)$t)), $tokens), static fn($t) => $t !== ''));
+
+        if ($tokens === []) {
+            return false;
+        }
+
+        // Schnellster Check: existiert mindestens ein SupportSolution mit einem Keyword aus tokens?
+        $qb = $this->createQueryBuilder('s')
+            ->select('1')
+            ->join('s.keywords', 'k')
+            ->andWhere('s.active = true')
+            ->andWhere('LOWER(k.keyword) IN (:tokens)')
+            ->setParameter('tokens', $tokens)
+            ->setMaxResults(1);
+
+        return $qb->getQuery()->getOneOrNullResult() !== null;
+    }
+
 
 
 
