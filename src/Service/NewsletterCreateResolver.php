@@ -241,33 +241,6 @@ final class NewsletterCreateResolver
             $keywords = $this->normalizeKeywords($obj['keywords'] ?? []);
             $keywords = $this->keywordPolicy->filterKeywordObjects($keywords, 20);
 
-            // Zusätzliche Keyword-Regeln (entspricht eurer Policy grob; endgültig am besten via TKFashionPolicyKeywords im Service)
-            $keywords = array_values(array_filter($keywords, static function ($k) {
-                if (!is_array($k)) return false;
-                $kw = (string)($k['keyword'] ?? '');
-                $kw = mb_strtolower(trim($kw));
-                if ($kw === '') return false;
-
-                // harte Pattern (wie Validator)
-                if (mb_strlen($kw) < 3) return false;
-                if (preg_match('/^\d+$/', $kw)) return false;
-                if (preg_match('/^[a-z0-9]{4,5}$/i', $kw)) return false;
-                if (preg_match('/^kw[\s\-_]?\d{1,2}$/i', $kw)) return false;
-
-                // häufige Unsinn-Keywords aus eurer Config (minimal, damit ihr sofort Ruhe habt)
-                $block = [
-                    'problem','probleme','fehler','status',
-                    'hilfe','support','anleitung','thema','info','information','beschreibung','meldung',
-                    'deutschland','dokument','newsletter','formular',
-                    'montag','dienstag','mittwoch','donnerstag','freitag','samstag','sonntag',
-                    'system','software','hardware','gerät','drucker','service','filiale','filialen',
-                    'test','ok','ja','nein','neu','alt',
-                ];
-                if (in_array($kw, $block, true)) return false;
-
-                return true;
-            }));
-
             if (count($keywords) > 20) {
                 $keywords = array_slice($keywords, 0, 20);
             }
