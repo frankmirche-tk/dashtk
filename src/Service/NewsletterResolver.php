@@ -33,78 +33,74 @@ final class NewsletterResolver
             return null;
         }
 
-        $range = $this->extractDateRange($message);
+        // Zeitraum optional: wenn keiner angegeben ist -> "alle"
+        $range = $this->parseNewsletterDateRange($message);
+        $explicitRange = $range !== null;
 
-        // Zeitraum ist "first-class": ohne Zeitraum -> aktiv nachfordern
-        if ($range === null) {
+        $from = $range['from'] ?? new \DateTimeImmutable('2000-01-01 00:00:00');
+        $to   = $range['to']   ?? (new \DateTimeImmutable('now'))->modify('+10 years')->setTime(23, 59, 59);
+
+        // Keywords (ohne Steuerwörter wie "newsletter")
+        $tokens = $this->extractKeywordTokens($message, ['newsletter', 'news', 'letter', 'kw', 'kalenderwoche']);
+        $tokens = $this->normalizeNewsletterTokens($tokens);
+
+        if ($tokens === []) {
             return [
-                'answer' => "Ich kann Newsletter sehr gut finden – mir fehlt nur der **Zeitraum**.\n\n"
-                    . "Bitte gib mir z.B.:\n"
-                    . "- „seit Oktober 2025“\n"
-                    . "- „01.01.2025 - 31.03.2025“\n"
-                    . "- „Frühjahr 2025“\n\n"
-                    . "Welchen Zeitraum soll ich durchsuchen?",
+                'answer' => "Für Newsletter brauche ich mindestens **1 Keyword** (z.B. „Reduzierungen“, „Filialperformance“, „Sale“, „Rabatt“).\n"
+                    . "Optional kannst du zusätzlich einen Zeitraum angeben (z.B. „seit 01.01.2026“ oder „01.01.2025 - 31.03.2025“).",
                 'matches' => [],
                 'choices' => [],
-                'modeHint' => 'newsletter_need_range',
+                'modeHint' => 'newsletter_need_keyword',
             ];
         }
 
-        [$from, $to] = $range;
-
-        // 1) Kandidaten über bestehendes Matching holen (Keywords/Title/ContextNotes)
-        // Tipp an Redaktion: pro Newsletter Keywords wie "newsletter", "kw 5", "sale", "rabatt", "kampagne" pflegen
-
-
-        // "newsletter" ist ein Command, kein Keyword-Token (==> Sonderbehandlung)
-        $tokens = $this->tokenize($message);
-
-        // 1) newsletter als Command entfernen (vor Normalisierung + vor Query)
-        $tokens = array_values(array_filter($tokens, fn($t) => mb_strtolower((string)$t) !== 'newsletter'));
-
-        // 2) Normalisieren/expandieren (Singular/Plural etc.)
-        $tokens = $this->normalizeNewsletterTokens($tokens);
-
-        // Debug
-        $this->logger->info('newsletter.tokens', [
+        $this->logger->info('newsletter.resolve', [
             'tokens' => $tokens,
+            'explicitRange' => $explicitRange,
             'from' => $from->format('Y-m-d'),
             'to' => $to->format('Y-m-d'),
         ]);
 
-        // 3) Case A / B
-        if (count($tokens) === 0) {
-            $raw = $this->solutions->findNewslettersInRange($from, $to, 0, self::PAGE_SIZE);
-        } else {
-            $raw = $this->solutions->findNewsletterMatches($tokens, $from, $to, 0, self::PAGE_SIZE);
-        }
+        $rows = $this->solutions->findNewsletterMatches($tokens, $from, $to, 0, self::PAGE_SIZE);
 
         $mapped = [];
-        foreach ($raw as $m) {
-            $s = $m['solution'] ?? null;
+        foreach ($rows as $r) {
+            $s = $r['solution'] ?? null;
             if (!$s instanceof SupportSolution) {
                 continue;
             }
 
-            // wir behandeln Newsletter als FORM-Dokumente
+            // Newsletter/Formulare sind FORM-Dokumente
             if ($s->getType() !== 'FORM') {
                 continue;
             }
 
-            // Filter Zeitraum über createdAt (Montag der KW empfohlen)
-            // neuer Code: publishedAt bevorzugen, fallback auf createdAt
-            $dt = $s->getPublishedAt() ?? $s->getCreatedAt();
-            if ($dt < $from || $dt > $to) {
-                continue;
-            }
+            $publishedAt = $s->getPublishedAt();
 
+            // ✅ Wenn ein Zeitraum explizit angegeben wurde: STRICT nach publishedAt filtern (publishedAt ist Pflicht)
+            if ($explicitRange) {
+                if (!$publishedAt instanceof \DateTimeImmutable) {
+                    continue;
+                }
+                if ($publishedAt < $from || $publishedAt > $to) {
+                    continue;
+                }
+            } else {
+                // Fallback: createdAt/publishedAt in Range (Repo kann je nach Query auf createdAt matchen)
+                $dt = $publishedAt ?? $s->getCreatedAt();
+                if ($dt < $from || $dt > $to) {
+                    continue;
+                }
+            }
 
             $mapped[] = [
                 'id' => (int)$s->getId(),
                 'title' => (string)$s->getTitle(),
-                'score' => (int)($m['score'] ?? 0),
+                'score' => (int)($r['score'] ?? 0),
                 'url' => '/api/support_solutions/' . (int)$s->getId(),
                 'type' => 'FORM',
+                'category' => 'NEWSLETTER',
+                'publishedAt' => $publishedAt?->format('Y-m-d') ?? '',
                 'updatedAt' => $s->getUpdatedAt()->format('Y-m-d H:i'),
                 'symptoms' => (string)($s->getSymptoms() ?? ''),
 
@@ -112,72 +108,52 @@ final class NewsletterResolver
                 'externalMediaProvider' => $s->getExternalMediaProvider(),
                 'externalMediaUrl' => $s->getExternalMediaUrl(),
                 'externalMediaId' => $s->getExternalMediaId(),
-
-                // nice-to-have: Datum fürs Listing
-                'createdAt' => ($s->getPublishedAt() ?? $s->getCreatedAt())->format('Y-m-d'),
-
             ];
         }
 
-        // Desc nach createdAt
+        // Neueste zuerst: publishedAt, fallback createdAt über URL nicht verfügbar -> stabil über score + title
         usort($mapped, static function (array $a, array $b) {
-            return strcmp((string)($b['createdAt'] ?? ''), (string)($a['createdAt'] ?? ''));
+            return strcmp((string)($b['publishedAt'] ?? ''), (string)($a['publishedAt'] ?? ''));
         });
 
-        $total = count($mapped);
-        $page = array_slice($mapped, 0, self::PAGE_SIZE);
+        if ($mapped === []) {
+            $rangeHint = $explicitRange
+                ? (" (Zeitraum: " . $from->format('Y-m-d') . " bis " . $to->format('Y-m-d') . ")")
+                : '';
 
-        if ($page === []) {
             return [
-                'answer' => "Ich habe im Zeitraum **" . $from->format('d.m.Y') . " – " . $to->format('d.m.Y') . "** keine passenden Newsletter gefunden.\n"
-                    . "Gib mir bitte 1–2 zusätzliche Stichwörter (z.B. „sale“, „rabatt“, „kampagne“, „outlet“, „fs-ware“).",
+                'answer' => "Ich habe **keinen Newsletter** gefunden, der zu **" . implode(', ', $tokens) . "** passt{$rangeHint}.",
                 'matches' => [],
                 'choices' => [],
                 'modeHint' => 'newsletter_empty',
             ];
         }
 
-        $lines = [];
-        $lines[] = "Ich habe **{$total}** passende Newsletter im Zeitraum **" . $from->format('d.m.Y') . " – " . $to->format('d.m.Y') . "** gefunden.";
-        $lines[] = "Hier sind die neuesten Treffer (sortiert absteigend):";
-        $lines[] = "";
-
         $choices = [];
+        $lines = ["Gefundene **Newsletter**:"];
         $i = 1;
-        foreach ($page as $hit) {
-            $title = (string)($hit['title'] ?? '');
-            $date = (string)($hit['createdAt'] ?? '');
-            $lines[] = "{$i}) {$title}" . ($date !== '' ? " (Datum: {$date})" : '');
 
-            // Wir nutzen absichtlich kind=form -> bestehender Open-Flow funktioniert sofort.
+        foreach (array_slice($mapped, 0, self::PAGE_SIZE) as $hit) {
+            $title = (string)($hit['title'] ?? '');
+            $pub = (string)($hit['publishedAt'] ?? '');
+            $label = $title . ($pub !== '' ? " ({$pub})" : '');
+            $lines[] = "{$i}) {$label}";
             $choices[] = [
                 'kind' => 'form',
-                'label' => $title,
+                'label' => $label,
                 'payload' => $hit,
             ];
             $i++;
         }
 
         $lines[] = "";
-        $lines[] = "Antworte mit **1–" . count($choices) . "**, um den Newsletter zu öffnen.";
-
-        if ($total > self::PAGE_SIZE) {
-            $lines[] = "Wenn du mehr willst: schreibe **mehr** (dann kommen die nächsten " . self::PAGE_SIZE . ").";
-        }
+        $lines[] = "Antworte mit **1–" . count($choices) . "**, um einen Newsletter zu öffnen.";
 
         return [
             'answer' => implode("\n", $lines),
-            'matches' => [],
+            'matches' => $mapped,
             'choices' => $choices,
-            'modeHint' => 'newsletter_list',
-            'newsletterPaging' => [
-                'total' => $total,
-                'pageSize' => self::PAGE_SIZE,
-                'offset' => self::PAGE_SIZE,
-                'from' => $from->format('Y-m-d'),
-                'to' => $to->format('Y-m-d'),
-                'query' => $message,
-            ],
+            'modeHint' => 'newsletter_only',
         ];
     }
 
@@ -199,6 +175,167 @@ final class NewsletterResolver
         return false;
     }
 
+    private function extractKeywordTokens(string $message, array $removeWords = []): array
+    {
+        $m = mb_strtolower($message);
+
+        // rauswerfen: entfernte Steuerwörter (newsletter/form etc.)
+        foreach ($removeWords as $w) {
+            $w = mb_strtolower((string)$w);
+            if ($w === '') {
+                continue;
+            }
+            $m = preg_replace('/(?<![\p{L}\p{N}_])' . preg_quote($w, '/') . '(?![\p{L}\p{N}_])/iu', ' ', $m) ?? $m;
+        }
+
+        // Datum-/Zahlenmuster raus (01.01.2026, 2026-01-01, qtl, monate)
+        $m = preg_replace('/\b\d{1,2}\.\d{1,2}\.\d{2,4}\b/u', ' ', $m) ?? $m;
+        $m = preg_replace('/\b\d{4}-\d{2}-\d{2}\b/u', ' ', $m) ?? $m;
+        $m = preg_replace('/\b[1-4]\s*qtl\b/u', ' ', $m) ?? $m;
+        $m = preg_replace('/\b[1-4]\s*quartal\b/u', ' ', $m) ?? $m;
+
+        // Tokenisierung
+        $parts = preg_split('/[^\p{L}\p{N}]+/u', $m) ?: [];
+        $parts = array_values(array_filter($parts, static fn($p) => $p !== ''));
+
+        $stop = [
+            'in','im','am','an','auf','zu','zum','zur','von','vom','ab','seit','bis','und','oder',
+            'der','die','das','des','den','dem','ein','eine','einen','einem','einer',
+            'bitte','danke',
+        ];
+
+        $out = [];
+        foreach ($parts as $p) {
+            if (in_array($p, $stop, true)) {
+                continue;
+            }
+            if (mb_strlen($p) < 3) {
+                continue;
+            }
+            // muss Buchstaben enthalten (keine reinen Zahlen)
+            if (!preg_match('/\p{L}/u', $p)) {
+                continue;
+            }
+            $out[] = $p;
+        }
+
+        $out = array_values(array_unique($out));
+        return $out;
+    }
+
+    private function parseNewsletterDateRange(string $message): ?array
+    {
+        $m = mb_strtolower(trim($message));
+
+        // Helpers
+        $nowPlus = static fn(string $spec) => (new \DateTimeImmutable('now'))->modify($spec);
+        $startOfDay = static fn(\DateTimeImmutable $d) => $d->setTime(0, 0, 0);
+        $endOfDay = static fn(\DateTimeImmutable $d) => $d->setTime(23, 59, 59);
+
+        // dd.mm.yy OR dd.mm.yyyy -> DateTimeImmutable
+        $parseDotDate = static function (string $dd, string $mm, string $yyOrYyyy): ?\DateTimeImmutable {
+            $day = (int)$dd;
+            $mon = (int)$mm;
+            $yRaw = trim($yyOrYyyy);
+
+            if (strlen($yRaw) === 2) {
+                // 00-99 => 2000-2099 (für euren Usecase Newsletter vollkommen ok)
+                $year = 2000 + (int)$yRaw;
+            } elseif (strlen($yRaw) === 4) {
+                $year = (int)$yRaw;
+            } else {
+                return null;
+            }
+
+            $dt = \DateTimeImmutable::createFromFormat('d.m.Y', sprintf('%02d.%02d.%04d', $day, $mon, $year));
+            return ($dt instanceof \DateTimeImmutable) ? $dt : null;
+        };
+
+        /**
+         * 4) Von-Bis / Range: "01.01.2026 - 28.02.2026" / "01.01.26 - 28.02.26" / "... bis ..."
+         * dd.mm.(yy|yyyy) - dd.mm.(yy|yyyy)
+         */
+        if (preg_match('/\b(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\s*(?:\-|–|—|bis)\s*(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\b/u', $message, $x)) {
+            $from = $parseDotDate($x[1], $x[2], $x[3]);
+            $to   = $parseDotDate($x[4], $x[5], $x[6]);
+
+            if ($from instanceof \DateTimeImmutable && $to instanceof \DateTimeImmutable) {
+                $from = $startOfDay($from);
+                $to   = $endOfDay($to);
+
+                if ($to < $from) {
+                    [$from, $to] = [$to, $from];
+                }
+
+                return ['from' => $from, 'to' => $to];
+            }
+        }
+
+        // yyyy-mm-dd - yyyy-mm-dd
+        if (preg_match('/\b(\d{4})-(\d{2})-(\d{2})\s*(?:\-|–|—|bis)\s*(\d{4})-(\d{2})-(\d{2})\b/u', $message, $x)) {
+            $from = \DateTimeImmutable::createFromFormat('Y-m-d', "{$x[1]}-{$x[2]}-{$x[3]}");
+            $to   = \DateTimeImmutable::createFromFormat('Y-m-d', "{$x[4]}-{$x[5]}-{$x[6]}");
+
+            if ($from instanceof \DateTimeImmutable && $to instanceof \DateTimeImmutable) {
+                $from = $startOfDay($from);
+                $to   = $endOfDay($to);
+
+                if ($to < $from) {
+                    [$from, $to] = [$to, $from];
+                }
+
+                return ['from' => $from, 'to' => $to];
+            }
+        }
+
+        /**
+         * 3) Quartal: "1Qtl 26" / "1 Qtl 26" / "1 Quartal 26"
+         */
+        if (preg_match('/\b([1-4])\s*(qtl|quartal)\s*(\d{2})\b/u', $m, $x)) {
+            $q = (int)$x[1];
+            $yy = (int)$x[3];
+            $year = 2000 + $yy;
+
+            $startMonth = ($q - 1) * 3 + 1;
+
+            $from = new \DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $startMonth));
+            $to = $from->modify('+3 months')->modify('-1 day');
+
+            return ['from' => $startOfDay($from), 'to' => $endOfDay($to)];
+        }
+
+        /**
+         * 2) "seit 01.01.2026" oder "ab 01.01.26"
+         */
+        if (preg_match('/\b(seit|ab)\s+(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\b/u', $m, $x)) {
+            $from = $parseDotDate($x[2], $x[3], $x[4]);
+            if ($from instanceof \DateTimeImmutable) {
+                return ['from' => $startOfDay($from), 'to' => $endOfDay($nowPlus('+10 years'))];
+            }
+        }
+
+        /**
+         * 1) "Keyword Newsletter 01.01.2026" (ohne 'seit') => ab Datum bis "weit in Zukunft"
+         * dd.mm.(yy|yyyy)
+         */
+        if (preg_match('/\b(\d{1,2})\.(\d{1,2})\.(\d{2}|\d{4})\b/u', $message, $x)) {
+            $from = $parseDotDate($x[1], $x[2], $x[3]);
+            if ($from instanceof \DateTimeImmutable) {
+                return ['from' => $startOfDay($from), 'to' => $endOfDay($nowPlus('+10 years'))];
+            }
+        }
+
+        // yyyy-mm-dd
+        if (preg_match('/\b(\d{4})-(\d{2})-(\d{2})\b/u', $message, $x)) {
+            $from = \DateTimeImmutable::createFromFormat('Y-m-d', "{$x[1]}-{$x[2]}-{$x[3]}");
+            if ($from instanceof \DateTimeImmutable) {
+                return ['from' => $startOfDay($from), 'to' => $endOfDay($nowPlus('+10 years'))];
+            }
+        }
+
+        return null;
+    }
+
     /**
      * Extrahiert simple Zeiträume:
      * - dd.mm.yyyy - dd.mm.yyyy
@@ -208,113 +345,14 @@ final class NewsletterResolver
      *
      * @return array{0:\DateTimeImmutable,1:\DateTimeImmutable}|null
      */
-    private function extractDateRange(string $message): ?array
-    {
-        // neuer Code: "seit 01.01.2026"
-        if (preg_match('/seit\s+(\d{2})\.(\d{2})\.(\d{4})/u', $message, $mm)) {
-            $from = \DateTimeImmutable::createFromFormat('!d.m.Y', "{$mm[1]}.{$mm[2]}.{$mm[3]}");
-            if ($from) {
-                $to = (new \DateTimeImmutable('now'))->setTime(23, 59, 59);
-                return [$from, $to];
-            }
-        }
 
-        $m = mb_strtolower($message);
 
-        // 1) Explizite Spanne dd.mm.yyyy - dd.mm.yyyy
-        if (preg_match('/(\d{2})\.(\d{2})\.(\d{4})\s*[-–]\s*(\d{2})\.(\d{2})\.(\d{4})/u', $m, $mm)) {
-            $from = \DateTimeImmutable::createFromFormat('!d.m.Y', "{$mm[1]}.{$mm[2]}.{$mm[3]}");
-            $to   = \DateTimeImmutable::createFromFormat('!d.m.Y', "{$mm[4]}.{$mm[5]}.{$mm[6]}");
-            if ($from && $to) {
-                return [$from, $to->setTime(23, 59, 59)];
-            }
-        }
 
-        // 2) "seit <Monat> <Jahr>"
-        if (preg_match('/seit\s+([a-zäöü]+)\s+(\d{4})/u', $m, $mm)) {
-            $month = $this->monthToNumber($mm[1]);
-            $year = (int)$mm[2];
-            if ($month !== null) {
-                $from = new \DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $month));
-                $to = (new \DateTimeImmutable('now'))->setTime(23, 59, 59);
-                return [$from, $to];
-            }
-        }
-
-        // 3) "<Monat> <Jahr>"
-        if (preg_match('/\b(januar|februar|märz|maerz|april|mai|juni|juli|august|september|oktober|november|dezember)\s+(\d{4})\b/u', $m, $mm)) {
-            $month = $this->monthToNumber($mm[1]);
-            $year = (int)$mm[2];
-            if ($month !== null) {
-                $from = new \DateTimeImmutable(sprintf('%04d-%02d-01 00:00:00', $year, $month));
-                $to = $from->modify('last day of this month')->setTime(23, 59, 59);
-                return [$from, $to];
-            }
-        }
-
-        // 4) Jahreszeiten
-        if (preg_match('/\b(frühjahr|fruehjahr|sommer|herbst|winter)\s+(\d{4})\b/u', $m, $mm)) {
-            $season = $mm[1];
-            $year = (int)$mm[2];
-
-            return match ($season) {
-                'frühjahr', 'fruehjahr' => [new \DateTimeImmutable("$year-01-01 00:00:00"), new \DateTimeImmutable("$year-03-31 23:59:59")],
-                'sommer' => [new \DateTimeImmutable("$year-06-01 00:00:00"), new \DateTimeImmutable("$year-08-31 23:59:59")],
-                'herbst' => [new \DateTimeImmutable("$year-09-01 00:00:00"), new \DateTimeImmutable("$year-11-30 23:59:59")],
-                'winter' => [new \DateTimeImmutable("$year-12-01 00:00:00"), new \DateTimeImmutable(($year + 1) . "-02-28 23:59:59")],
-                default => null,
-            };
-        }
-
-        return null;
-    }
-
-    private function monthToNumber(string $month): ?int
-    {
-        $m = mb_strtolower($month);
-
-        return match ($m) {
-            'januar' => 1,
-            'februar' => 2,
-            'märz', 'maerz' => 3,
-            'april' => 4,
-            'mai' => 5,
-            'juni' => 6,
-            'juli' => 7,
-            'august' => 8,
-            'september' => 9,
-            'oktober' => 10,
-            'november' => 11,
-            'dezember' => 12,
-            default => null,
-        };
-    }
 
     /**
      * @return string[] lowercase tokens
      */
-    private function tokenize(string $message): array
-    {
-        $m = mb_strtolower($message);
 
-        // Datumsteile & Trennzeichen raus, Wörter behalten
-        $m = preg_replace('/[^\p{L}\p{N}\s]+/u', ' ', $m) ?? $m;
-
-        $parts = preg_split('/\s+/u', trim($m)) ?: [];
-
-        // stopwords (optional, klein anfangen)
-        $stop = ['seit','ab','von','bis','und','oder','die','der','das','im','in','am','zum','zur','für','mit'];
-
-        $out = [];
-        foreach ($parts as $p) {
-            if ($p === '') continue;
-            if (in_array($p, $stop, true)) continue;
-            // Datum-Token wie 01 01 2025 nicht als Suchwort nutzen
-            if (preg_match('/^\d{1,4}$/', $p)) continue;
-            $out[] = $p;
-        }
-        return array_values(array_unique($out));
-    }
 
     private function normalizeNewsletterTokens(array $tokens): array
     {
@@ -346,7 +384,6 @@ final class NewsletterResolver
         $out = array_values(array_unique($out));
         return $out;
     }
-
 
 
 }
