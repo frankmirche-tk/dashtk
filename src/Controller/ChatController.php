@@ -185,7 +185,6 @@ final class ChatController extends AbstractController
                 );
             }
 
-            // ✅ Drive-Link nur prüfen, wenn vorhanden
             // ✅ Drive-Link nur prüfen, wenn vorhanden (und kein Upload als Fallback)
             if (trim($driveUrl) !== '' && !$file instanceof UploadedFile) {
 
@@ -732,23 +731,25 @@ final class ChatController extends AbstractController
             return ['type' => 'empty', 'id' => null, 'download' => null, 'original' => ''];
         }
 
-        $u = ltrim($u);          // whitespace
-        $u = ltrim($u, '/');     // <-- wichtig: führenden Slash entfernen
+        // Whitespace + leading slashes entfernen
+        $u = ltrim($u);
+        $u = ltrim($u, '/');
+
+        // Schema ergänzen falls fehlt
         if (!str_starts_with($u, 'http://') && !str_starts_with($u, 'https://')) {
-            $u = 'https://' . $u; // <-- falls UI ohne Schema liefert
+            $u = 'https://' . $u;
         }
 
-
-
+        // Fragment entfernen
         $u = preg_replace('~#.*$~', '', $u) ?? $u;
 
-        // Folder link: /drive/u/0/folders/<ID> or /drive/folders/<ID>
-        if (preg_match('~/(?:drive/)?folders/([a-zA-Z0-9_-]+)~', $u, $m)) {
+        // 1) Folder link: /drive/folders/<ID>
+        if (preg_match('~/(?:drive/)?folders/([a-zA-Z0-9_-]{10,})~', $u, $m)) {
             return ['type' => 'folder', 'id' => $m[1], 'download' => null, 'original' => $u];
         }
 
-        // File link: /file/d/<ID>/
-        if (preg_match('~/file/d/([a-zA-Z0-9_-]+)~', $u, $m)) {
+        // 2) Drive File link: /file/d/<ID>
+        if (preg_match('~/file/d/([a-zA-Z0-9_-]{10,})~', $u, $m)) {
             $id = $m[1];
             return [
                 'type' => 'file',
@@ -758,11 +759,44 @@ final class ChatController extends AbstractController
             ];
         }
 
-        // Alternate: ?id=<ID>
+        // 3) Google Docs Document: /document/d/<ID>
+        if (preg_match('~docs\.google\.com/document/d/([a-zA-Z0-9_-]{10,})~', $u, $m)) {
+            $id = $m[1];
+            return [
+                'type' => 'file',
+                'id' => $id,
+                'download' => 'https://drive.google.com/uc?export=download&id=' . $id,
+                'original' => $u,
+            ];
+        }
+
+        // 4) Google Sheets: /spreadsheets/d/<ID>
+        if (preg_match('~docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]{10,})~', $u, $m)) {
+            $id = $m[1];
+            return [
+                'type' => 'file',
+                'id' => $id,
+                'download' => 'https://drive.google.com/uc?export=download&id=' . $id,
+                'original' => $u,
+            ];
+        }
+
+        // 5) Google Slides: /presentation/d/<ID>
+        if (preg_match('~docs\.google\.com/presentation/d/([a-zA-Z0-9_-]{10,})~', $u, $m)) {
+            $id = $m[1];
+            return [
+                'type' => 'file',
+                'id' => $id,
+                'download' => 'https://drive.google.com/uc?export=download&id=' . $id,
+                'original' => $u,
+            ];
+        }
+
+        // 6) Alternate: ?id=<ID>
         $parts = parse_url($u);
         if (is_array($parts) && isset($parts['query'])) {
             parse_str($parts['query'], $q);
-            if (isset($q['id']) && is_string($q['id']) && $q['id'] !== '') {
+            if (isset($q['id']) && is_string($q['id']) && $q['id'] !== '' && preg_match('/^[a-zA-Z0-9_-]{10,}$/', $q['id'])) {
                 $id = $q['id'];
                 return [
                     'type' => 'file',
@@ -773,8 +807,20 @@ final class ChatController extends AbstractController
             }
         }
 
+        // 7) Fallback: irgendein /d/<id>
+        if (preg_match('~/d/([a-zA-Z0-9_-]{10,})~', $u, $m)) {
+            $id = $m[1];
+            return [
+                'type' => 'file',
+                'id' => $id,
+                'download' => 'https://drive.google.com/uc?export=download&id=' . $id,
+                'original' => $u,
+            ];
+        }
+
         return ['type' => 'unknown', 'id' => null, 'download' => null, 'original' => $u];
     }
+
 
     private function normalizeDriveUrl(string $driveUrl): array
     {

@@ -69,8 +69,6 @@ final class NewsletterCreateResolver
             );
         }
 
-        $doc = null;
-
         $normalizedName = '';
         $warnings = [];
         $pdfText = '';
@@ -79,275 +77,232 @@ final class NewsletterCreateResolver
         // Newsletter-Metadaten (Resolver entscheidet!)
         $year = 0;
         $kw = 0;
-        $edition = 'STANDARD'; // string enum: STANDARD | TEIL_1 | TEIL_2 | SPECIAL ...
-        $publishedAt = null; // \DateTimeImmutable|null
+        $edition = 'STANDARD'; // STANDARD | TEIL_1 | TEIL_2 | SPECIAL ...
+        $publishedAt = null;   // \DateTimeImmutable|null
 
+        // 1) PDF laden + Text extrahieren (Upload bevorzugt, sonst Drive)
         try {
-            // 1) PDF laden: Drive preferred, sonst Upload
-            if ($driveId !== '') {
-                $doc = $this->documentLoader->loadPdf($driveId, $file);
-                $path = (string)($doc['pdfPath'] ?? '');
-                if ($path === '' || !is_file($path)) {
-                    return $this->errorResponse(
-                        traceId: $traceId,
-                        code: 'drive_url_unreachable',
-                        message: 'Der Google-Drive-Link ist nicht abrufbar (Berechtigung/kein Direktdownload). Bitte Freigabe prüfen oder eine Datei hochladen.',
-                    );
-                }
-                $normalizedName = $this->normalizeFilename((string)($doc['originalName'] ?? 'Newsletter.pdf'));
-            } else {
-                // Upload-only
-                if (!$file instanceof UploadedFile) {
-                    return $this->errorResponse(
-                        traceId: $traceId,
-                        code: 'need_input',
-                        message: 'Bitte lade eine Datei hoch oder füge einen Google-Drive-Link ein.',
-                    );
-                }
-                $path = $file->getPathname();
+            if ($hasFile) {
                 $normalizedName = $this->normalizeFilename((string)$file->getClientOriginalName());
+                $warnings = $this->filenameWarnings($normalizedName);
+
+                $doc = $this->documentLoader->extractFromUploadedFile($file);
+            } else {
+                $doc = $this->documentLoader->extractFromDrive($driveId);
+
+                $normalizedName = $this->normalizeFilename((string)($doc->filename ?? 'Newsletter.pdf'));
+                $warnings = array_values(array_unique(array_merge(
+                    $this->filenameWarnings($normalizedName),
+                    $doc->warnings
+                )));
             }
 
-            $warnings = $this->filenameWarnings($normalizedName);
-
-            // 2) PDF Magic Bytes (echtes PDF)
-            $fh = @fopen($path, 'rb');
-            $head = $fh ? fread($fh, 8) : '';
-            if (is_resource($fh)) { fclose($fh); }
-            $head = is_string($head) ? $head : '';
-
-            if (!str_starts_with($head, '%PDF-')) {
+            // Newsletter ist PDF-only
+            $ext = strtolower((string)($doc->extension ?? ''));
+            if ($ext !== 'pdf') {
                 return $this->errorResponse(
                     traceId: $traceId,
                     code: 'invalid_filetype',
-                    message: 'Die Datei ist kein echtes PDF. Bitte nutze ein gültiges PDF.',
+                    message: 'Für Newsletter wird nur PDF unterstützt. Bitte nutze ein PDF (Drive oder Upload).',
                 );
             }
 
-            // 3) Text extrahieren + Scan-Hinweis
-            try {
-                // wenn docLoader vorhanden und Drive genutzt wurde: nutzen, sonst fallback pdftotext
-                if ($driveId !== '' && method_exists($this->documentLoader, 'extractTextOrThrowScanned')) {
-                    $pdfText = $this->documentLoader->extractTextOrThrowScanned($path);
-                } else {
-                    $pdfText = $this->extractPdfTextWithPdftotext($path);
-                    if (mb_strlen(trim($pdfText)) < 120) {
-                        throw new \RuntimeException('PDF_SCANNED_NEEDS_OCR');
-                    }
-                }
-            } catch (\RuntimeException $e) {
-                if ($e->getMessage() === 'PDF_SCANNED_NEEDS_OCR') {
-                    $isScannedHint = true;
-                    $warnings[] = 'PDF wirkt gescannt (wenig Text extrahierbar). OCR kann später die Qualität verbessern.';
-                    $pdfText = '';
-                } else {
-                    throw $e;
-                }
-            }
-
-            // 4) Year/KW/Edition ermitteln (Resolver!)
-            [$yFromFn, $kwFromFn] = $this->parseYearKwFromFilename($normalizedName);
-            $year = $yFromFn;
-            $kw   = $kwFromFn;
-
-            // Optional: aus Text ziehen, falls Dateiname nicht hilft
-            if (($year <= 0 || $kw <= 0) && $pdfText !== '') {
-                $t = mb_strtolower($pdfText);
-                // Beispiele: "KW 07/2026", "KW07 2026", "Kalenderwoche 7 2026"
-                if (preg_match('/\bkw\s*0?([1-9]|[1-4]\d|5[0-3])\b.*?\b([12]\d{3})\b/u', $t, $m)) {
-                    $kw = (int)$m[1];
-                    $year = (int)$m[2];
-                } elseif (preg_match('/\b([12]\d{3})\b.*?\bkw\s*0?([1-9]|[1-4]\d|5[0-3])\b/u', $t, $m)) {
-                    $year = (int)$m[1];
-                    $kw = (int)$m[2];
-                }
-            }
-
-            // Fallback: aktuelle ISO-Woche/Jahr (nur wenn sonst nichts)
-            if ($year <= 0 || $kw <= 0) {
-                $now = new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin'));
-                $year = (int)$now->format('o'); // ISO year
-                $kw   = (int)$now->format('W');
-                $warnings[] = 'Jahr/KW konnten nicht sicher aus Dateiname/Text erkannt werden. Fallback: aktuelle KW verwendet.';
-            }
-
-            // Edition immer als String/Enum, Default STANDARD.
-            // Quelle: erst (ggf.) GUI, dann Dateiname, dann Titel, dann PDF-Text.
-            $edition = $this->resolveNewsletterEdition(
-                guiEdition: null, // aktuell habt ihr im Analyze-Flow kein GUI-Feld; später ggf. $obj['newsletter_edition'] ?? null
-                filename: $normalizedName,
-                title: $message,  // falls ihr den "Titel" im Message-Text habt; sonst '' lassen
-                pdfText: $pdfText
-            );
-
-
-            // published_at = Montag der ISO-KW
-            $publishedAt = $this->mondayOfIsoWeek($year, $kw);
-
-            $title = "Newsletter KW {$kw}/{$year}";
-            if (is_string($edition) && preg_match('/^TEIL_(\d+)$/', $edition, $m)) {
-                $title .= " – Teil " . (int)$m[1];
-            } elseif ($edition === 'SPECIAL') {
-                $title .= " – Special";
-            }
-
-
-            // 5) Prompt bauen (KI liefert NUR symptoms/context_notes/keywords)
-            $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
-
-            $system = $this->promptLoader->render((string)($tpl['system'] ?? ''), [
-                'today' => (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d'),
-            ]);
-
-            $user = $this->promptLoader->render((string)($tpl['user'] ?? ''), [
-                'filename' => ($normalizedName !== '' ? $normalizedName : 'Newsletter.pdf'),
-                'year' => $year,
-                'kw' => $kw,
-                'driveUrl' => $driveUrl !== '' ? $driveUrl : '#',
-                'pdfText' => trim($pdfText),
-            ]);
-
-            $history = [
-                ['role' => 'system', 'content' => $system !== '' ? $system : 'Antworte ausschließlich als JSON. Keine Extras.'],
-                ['role' => 'user', 'content' => $user],
-            ];
-
-            $aiRaw = $this->aiChat->chat(
-                history: $history,
-                kbContext: '',
-                provider: $provider,
-                model: $model,
-                context: [
-                    'usage_key' => 'support_chat.newsletter_create.analyze',
-                    'mode_hint' => 'newsletter_create',
-                    'trace_id' => $traceId,
-                    'scan_hint' => $isScannedHint,
-                ]
-            );
-
-            $obj = $this->decodeJsonObject($aiRaw);
-            if (!is_array($obj)) {
-                return $this->errorResponse(
-                    traceId: $traceId,
-                    code: 'ai_invalid_response',
-                    message: 'Ich konnte die Newsletter-Analyse nicht zuverlässig auswerten. Bitte versuche es erneut.',
-                    extra: ['provider' => $provider, 'model' => $model],
-                );
-            }
-
-            // 6) KI-Felder übernehmen (NUR diese!)
-            $symptomsRaw = is_string($obj['symptoms'] ?? null) ? (string)$obj['symptoms'] : '';
-            $contextNotes = is_string($obj['context_notes'] ?? null) ? (string)$obj['context_notes'] : '';
-            $keywords = $this->normalizeKeywords($obj['keywords'] ?? []);
-            $keywords = $this->keywordPolicy->filterKeywordObjects($keywords, 20);
-
-            if (count($keywords) > 20) {
-                $keywords = array_slice($keywords, 0, 20);
-            }
-
-            // symptoms normalisieren + finaler Newsletter-Link (genau 1x)
-            $symptoms = trim($symptomsRaw);
-            $symptoms = preg_replace('/\r\n?/', "\n", $symptoms) ?? $symptoms;
-
-            // nur *-Zeilen behalten, leere raus
-            $lines = $symptoms === '' ? [] : explode("\n", $symptoms);
-            $clean = [];
-            foreach ($lines as $ln) {
-                $ln = trim($ln);
-                if ($ln === '') continue;
-                // entferne alte Drive/Newsletter-Links aus KI-Antwort (wird unten neu gesetzt)
-                if (stripos($ln, 'drive.google.com') !== false) continue;
-                if (preg_match('/^\*\s*\[newsletter\s*kw/i', $ln)) continue;
-
-                // erzwinge "* "
-                $ln = preg_replace('/^\*\s*/u', '* ', $ln) ?? $ln;
-                if (!str_starts_with($ln, '* ')) {
-                    $ln = '* ' . ltrim($ln, "-•\t ");
-                }
-                $clean[] = $ln;
-            }
-
-            $kwLabel = (string)$kw; // ohne 0-padding im Link-Text war bei euch ok
-            $linkUrl = $driveUrl !== '' ? $driveUrl : '#';
-            $clean[] = "* [Newsletter KW{$kwLabel} ({$year}) (Drive-Ordner)]({$linkUrl})";
-
-            $symptoms = trim(implode("\n", $clean));
-
-            // 7) Draft bauen (Resolver entscheidet ALLES außer symptoms/context/keywords)
-            $draftId = 'doc_' . str_replace('-', '', (string)Uuid::uuid4());
-            $now = $this->nowMidnight();
-
-            $draft = [
-                // Business-Regel: Newsletter sind in support_solution immer type="FORM"
-                'type' => 'FORM',
-                'title' => $title,
-                'symptoms' => $symptoms,
-                'context_notes' => $contextNotes,
-                'keywords' => $keywords,
-
-
-                // Media: Drive wenn vorhanden, sonst Upload
-                'media_type' => $driveUrl !== '' ? 'external' : 'upload',
-                'external_media_provider' => $driveUrl !== '' ? 'gdrive' : null,
-                'external_media_url' => $driveUrl !== '' ? $driveUrl : null,
-                'external_media_id' => $driveUrl !== '' ? $driveId : null,
-
-                'created_at' => $now->format('Y-m-d H:i:s'),
-                'updated_at' => $now->format('Y-m-d H:i:s'),
-                'published_at' => $publishedAt?->format('Y-m-d H:i:s'),
-                'newsletter_year' => $year,
-                'newsletter_kw' => $kw,
-                'newsletter_edition' => $edition, // nie NULL, immer STANDARD/TEIL_X/SPECIAL
-                'category' => 'NEWSLETTER',
-                'drive_url' => $driveUrl,
-                'filename' => $normalizedName,
-            ];
-
-            $this->storeDraft($draftId, $draft);
-
-            $headerTitle = "Newsletter {$year} • KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
-            $headerSubtitle = ($driveUrl !== '')
-                ? ($normalizedName !== '' ? "Quelle: Google Drive • {$normalizedName}" : "Quelle: Google Drive")
-                : ($normalizedName !== '' ? "Quelle: Upload • {$normalizedName}" : "Quelle: Upload");
-
-            $answerLines = [];
-            $answerLines[] = "Bitte prüfen und bestätigen:";
-            $answerLines[] = "- Titel: {$title}";
-            $answerLines[] = "- Ausgabe: {$year} / KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
-            if (is_string($edition) && preg_match('/^TEIL_(\d+)$/', $edition, $m)) {
-                $answerLines[] = "- Edition: Teil " . (int)$m[1];
-            } elseif ($edition === 'SPECIAL') {
-                $answerLines[] = "- Edition: Special";
-            } else {
-                $answerLines[] = "- Edition: STANDARD";
-            }
-
-            $answerLines[] = "- Kategorie: NEWSLETTER";
-            $answer = implode("\n", $answerLines);
-
-            return $this->confirmResponse(
+            $pdfText = $this->truncateForPrompt(trim($doc->text), 12000);
+            $isScannedHint = (bool)$doc->needsOcr;
+            $warnings = array_values(array_unique(array_merge($warnings, $doc->warnings)));
+        } catch (\Throwable $e) {
+            return $this->errorResponse(
                 traceId: $traceId,
-                code: 'needs_confirmation',
-                answer: $answer,
-                draftId: $draftId,
-                confirmCard: $this->buildConfirmCard(
-                    kind: 'newsletter',
-                    draftId: $draftId,
-                    category: 'NEWSLETTER',
-                    headerTitle: $headerTitle,
-                    headerSubtitle: $headerSubtitle,
-                    fields: $draft,
-                    warnings: $warnings,
-                ),
-                extra: ['provider' => $provider, 'model' => $model]
+                code: 'extract_failed',
+                message: $this->isDev ? ('Extraktion fehlgeschlagen (DEV): ' . $e->getMessage()) : 'Dokument konnte nicht verarbeitet werden.',
             );
-        } finally {
-            // Drive-Download cleanup (nur wenn documentLoader genutzt wurde)
-            if (is_array($doc) && !empty($doc['pdfPath'])) {
-                $this->documentLoader->cleanup((string)$doc['pdfPath']);
+        }
+
+        // 2) Year/KW/Edition ermitteln (Resolver!)
+        [$yFromFn, $kwFromFn] = $this->parseYearKwFromFilename($normalizedName);
+        $year = $yFromFn;
+        $kw   = $kwFromFn;
+
+        // Optional: aus Text ziehen, falls Dateiname nicht hilft
+        if (($year <= 0 || $kw <= 0) && $pdfText !== '') {
+            $t = mb_strtolower($pdfText);
+            if (preg_match('/\bkw\s*0?([1-9]|[1-4]\d|5[0-3])\b.*?\b([12]\d{3})\b/u', $t, $m)) {
+                $kw = (int)$m[1];
+                $year = (int)$m[2];
+            } elseif (preg_match('/\b([12]\d{3})\b.*?\bkw\s*0?([1-9]|[1-4]\d|5[0-3])\b/u', $t, $m)) {
+                $year = (int)$m[1];
+                $kw = (int)$m[2];
             }
         }
+
+        // Fallback: aktuelle ISO-Woche/Jahr (nur wenn sonst nichts)
+        if ($year <= 0 || $kw <= 0) {
+            $now = new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin'));
+            $year = (int)$now->format('o'); // ISO year
+            $kw   = (int)$now->format('W');
+            $warnings[] = 'Jahr/KW konnten nicht sicher aus Dateiname/Text erkannt werden. Fallback: aktuelle KW verwendet.';
+        }
+
+        $edition = $this->resolveNewsletterEdition(
+            guiEdition: null,
+            filename: $normalizedName,
+            title: $message,
+            pdfText: $pdfText
+        );
+
+        // published_at = Montag der ISO-KW
+        $publishedAt = $this->mondayOfIsoWeek($year, $kw);
+
+        $title = "Newsletter KW {$kw}/{$year}";
+        if (is_string($edition) && preg_match('/^TEIL_(\d+)$/', $edition, $m)) {
+            $title .= " – Teil " . (int)$m[1];
+        } elseif ($edition === 'SPECIAL') {
+            $title .= " – Special";
+        }
+
+        // 3) Prompt bauen (KI liefert NUR symptoms/context_notes/keywords)
+        $tpl = $this->promptLoader->load('NewsletterCreatePrompt.config');
+
+        $system = $this->promptLoader->render((string)($tpl['system'] ?? ''), [
+            'today' => (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d'),
+        ]);
+
+        $user = $this->promptLoader->render((string)($tpl['user'] ?? ''), [
+            'filename' => ($normalizedName !== '' ? $normalizedName : 'Newsletter.pdf'),
+            'year' => $year,
+            'kw' => $kw,
+            'driveUrl' => $driveUrl !== '' ? $driveUrl : '#',
+            'pdfText' => trim($pdfText),
+        ]);
+
+        $history = [
+            ['role' => 'system', 'content' => $system !== '' ? $system : 'Antworte ausschließlich als JSON. Keine Extras.'],
+            ['role' => 'user', 'content' => $user],
+        ];
+
+        $aiRaw = $this->aiChat->chat(
+            history: $history,
+            kbContext: '',
+            provider: $provider,
+            model: $model,
+            context: [
+                'usage_key' => 'support_chat.newsletter_create.analyze',
+                'mode_hint' => 'newsletter_create',
+                'trace_id' => $traceId,
+                'scan_hint' => $isScannedHint,
+            ]
+        );
+
+        $obj = $this->decodeJsonObject($aiRaw);
+        if (!is_array($obj)) {
+            return $this->errorResponse(
+                traceId: $traceId,
+                code: 'ai_invalid_response',
+                message: 'Ich konnte die Newsletter-Analyse nicht zuverlässig auswerten. Bitte versuche es erneut.',
+                extra: ['provider' => $provider, 'model' => $model],
+            );
+        }
+
+        // 4) KI-Felder übernehmen (NUR diese!)
+        $symptomsRaw = is_string($obj['symptoms'] ?? null) ? (string)$obj['symptoms'] : '';
+        $contextNotes = is_string($obj['context_notes'] ?? null) ? (string)$obj['context_notes'] : '';
+        $keywords = $this->normalizeKeywords($obj['keywords'] ?? []);
+        $keywords = $this->keywordPolicy->filterKeywordObjects($keywords, 20);
+
+        if (count($keywords) > 20) {
+            $keywords = array_slice($keywords, 0, 20);
+        }
+
+        // symptoms normalisieren + finaler Newsletter-Link (genau 1x)
+        $symptoms = trim($symptomsRaw);
+        $symptoms = preg_replace('/\r\n?/', "\n", $symptoms) ?? $symptoms;
+
+        $lines = $symptoms === '' ? [] : explode("\n", $symptoms);
+        $clean = [];
+        foreach ($lines as $ln) {
+            $ln = trim($ln);
+            if ($ln === '') continue;
+            if (stripos($ln, 'drive.google.com') !== false) continue;
+            if (preg_match('/^\*\s*\[newsletter\s*kw/i', $ln)) continue;
+
+            $ln = preg_replace('/^\*\s*/u', '* ', $ln) ?? $ln;
+            if (!str_starts_with($ln, '* ')) {
+                $ln = '* ' . ltrim($ln, "-•\t ");
+            }
+            $clean[] = $ln;
+        }
+
+        $kwLabel = (string)$kw;
+        $linkUrl = $driveUrl !== '' ? $driveUrl : '#';
+        $clean[] = "* [Newsletter KW{$kwLabel} ({$year}) (Drive-Ordner)]({$linkUrl})";
+        $symptoms = trim(implode("\n", $clean));
+
+        // 5) Draft bauen
+        $draftId = 'doc_' . str_replace('-', '', (string)Uuid::uuid4());
+        $now = $this->nowMidnight();
+
+        $draft = [
+            'type' => 'FORM',
+            'title' => $title,
+            'symptoms' => $symptoms,
+            'context_notes' => $contextNotes,
+            'keywords' => $keywords,
+
+            'media_type' => $driveUrl !== '' ? 'external' : 'upload',
+            'external_media_provider' => $driveUrl !== '' ? 'gdrive' : null,
+            'external_media_url' => $driveUrl !== '' ? $driveUrl : null,
+            'external_media_id' => $driveUrl !== '' ? $driveId : null,
+
+            'created_at' => $now->format('Y-m-d H:i:s'),
+            'updated_at' => $now->format('Y-m-d H:i:s'),
+            'published_at' => $publishedAt?->format('Y-m-d H:i:s'),
+            'newsletter_year' => $year,
+            'newsletter_kw' => $kw,
+            'newsletter_edition' => $edition,
+            'category' => 'NEWSLETTER',
+            'drive_url' => $driveUrl,
+            'filename' => $normalizedName,
+        ];
+
+        $this->storeDraft($draftId, $draft);
+
+        $headerTitle = "Newsletter {$year} • KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
+        $headerSubtitle = ($driveUrl !== '')
+            ? ($normalizedName !== '' ? "Quelle: Google Drive • {$normalizedName}" : "Quelle: Google Drive")
+            : ($normalizedName !== '' ? "Quelle: Upload • {$normalizedName}" : "Quelle: Upload");
+
+        $answerLines = [];
+        $answerLines[] = "Bitte prüfen und bestätigen:";
+        $answerLines[] = "- Titel: {$title}";
+        $answerLines[] = "- Ausgabe: {$year} / KW" . str_pad((string)$kw, 2, '0', STR_PAD_LEFT);
+        if (is_string($edition) && preg_match('/^TEIL_(\d+)$/', $edition, $m)) {
+            $answerLines[] = "- Edition: Teil " . (int)$m[1];
+        } elseif ($edition === 'SPECIAL') {
+            $answerLines[] = "- Edition: Special";
+        } else {
+            $answerLines[] = "- Edition: STANDARD";
+        }
+        $answerLines[] = "- Kategorie: NEWSLETTER";
+        $answer = implode("\n", $answerLines);
+
+        return $this->confirmResponse(
+            traceId: $traceId,
+            code: 'needs_confirmation',
+            answer: $answer,
+            draftId: $draftId,
+            confirmCard: $this->buildConfirmCard(
+                kind: 'newsletter',
+                draftId: $draftId,
+                category: 'NEWSLETTER',
+                headerTitle: $headerTitle,
+                headerSubtitle: $headerSubtitle,
+                fields: $draft,
+                warnings: $warnings,
+            ),
+            extra: ['provider' => $provider, 'model' => $model]
+        );
     }
+
 
 
 
@@ -736,10 +691,42 @@ final class NewsletterCreateResolver
     private function extractDriveId(string $url): string
     {
         $url = trim($url);
-        if ($url === '') { return ''; }
-        if (preg_match('~drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
-        if (preg_match('~drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
-        if (preg_match('~drive\.google\.com\/drive\/folders\/([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
+        if ($url === '') {
+            return '';
+        }
+
+        // 1) Query-Parameter id=... (open?id=..., uc?id=..., usw.)
+        $parts = @parse_url($url);
+        if (is_array($parts) && isset($parts['query'])) {
+            parse_str((string)$parts['query'], $q);
+            if (isset($q['id']) && is_string($q['id']) && $q['id'] !== '') {
+                return $q['id'];
+            }
+        }
+
+        // 2) Standard Drive File URL: /file/d/<id>
+        if (preg_match('~drive\.google\.com/(?:file|uc)/d/([a-zA-Z0-9_-]{10,})~', $url, $m)) {
+            return (string) $m[1];
+        }
+        if (preg_match('~drive\.google\.com/file/d/([a-zA-Z0-9_-]{10,})~', $url, $m)) {
+            return (string) $m[1];
+        }
+
+        // 3) Google Docs/Sheets/Slides: docs.google.com/<type>/d/<id>
+        if (preg_match('~docs\.google\.com/(?:document|spreadsheets|presentation)/d/([a-zA-Z0-9_-]{10,})~', $url, $m)) {
+            return (string) $m[1];
+        }
+
+        // 4) Folder URLs (falls mal jemand Ordner einfügt)
+        if (preg_match('~drive\.google\.com/drive/folders/([a-zA-Z0-9_-]{10,})~', $url, $m)) {
+            return (string) $m[1];
+        }
+
+        // 5) Fallback: irgendein "/d/<id>" Muster (kommt bei manchen Share-Varianten vor)
+        if (preg_match('~/d/([a-zA-Z0-9_-]{10,})~', $url, $m)) {
+            return (string) $m[1];
+        }
+
         return '';
     }
 

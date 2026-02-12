@@ -6,13 +6,13 @@ namespace App\Service;
 
 use App\AI\AiChatGateway;
 use App\Tracing\Trace;
+use App\Service\Document\DocumentExtractionException;
 use Doctrine\DBAL\Connection;
 use Psr\Log\LoggerInterface;
 use Ramsey\Uuid\Uuid;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Cache\CacheInterface;
-use Symfony\Contracts\Cache\ItemInterface;
 use App\Validator\TKFashionPolicyKeywords;
 
 final class FormCreateResolver
@@ -42,10 +42,10 @@ final class FormCreateResolver
         ?string $provider = null,
         ?string $traceId = null,
     ): array {
-        $traceId = $this->ensureTraceId($traceId);
+        $traceId  = $this->ensureTraceId($traceId);
         $provider = $this->normalizeProvider($provider);
 
-        $driveUrl = trim($driveUrl);
+        $driveUrl = trim((string)$driveUrl);
         $driveId  = $driveUrl !== '' ? $this->extractDriveId($driveUrl) : '';
 
         $hasFile  = $file instanceof UploadedFile;
@@ -59,8 +59,14 @@ final class FormCreateResolver
             );
         }
 
-        // Wenn Drive-Link angegeben wurde, dann muss er auch gültig sein
+        // Drive-Link vorhanden, aber ID nicht extrahierbar => invalid
         if ($hasDrive && $driveId === '') {
+            $this->supportSolutionLogger->warning('form.analyze.drive_url_invalid', [
+                'trace_id' => $traceId,
+                'drive_url' => mb_substr($driveUrl, 0, 120),
+                'drive_url_len' => mb_strlen($driveUrl),
+            ]);
+
             return $this->errorResponse(
                 traceId: $traceId,
                 code: 'need_drive',
@@ -68,36 +74,53 @@ final class FormCreateResolver
             );
         }
 
+        // Debug (hilft dir sofort im Log zu sehen, was wirklich ankommt)
+        $this->supportSolutionLogger->info('form.analyze.drive_debug', [
+            'trace_id' => $traceId,
+            'drive_url' => mb_substr($driveUrl, 0, 120),
+            'drive_url_len' => mb_strlen($driveUrl),
+            'drive_id' => $driveId,
+            'has_file' => $hasFile,
+        ]);
+
         $normalizedName = '';
         $warnings = [];
-        $pdfText = '';
-        $isScannedHint = false;
+        $documentText = '';
+        $needsOcrHint = false;
 
-        if ($file instanceof UploadedFile) {
-            $normalizedName = $this->normalizeFilename((string)$file->getClientOriginalName());
-            $warnings = $this->filenameWarnings($normalizedName);
+        try {
+            if ($hasFile) {
+                $normalizedName = $this->normalizeFilename((string)$file->getClientOriginalName());
+                $warnings = $this->filenameWarnings($normalizedName);
 
-            // PDF Magic Bytes
-            $path = $file->getPathname();
-            $fh = @fopen($path, 'rb');
-            $head = $fh ? fread($fh, 8) : '';
-            if (is_resource($fh)) { fclose($fh); }
-            $head = is_string($head) ? $head : '';
-
-            if (!str_starts_with($head, '%PDF-')) {
-                return $this->errorResponse(
-                    traceId: $traceId,
-                    code: 'invalid_filetype',
-                    message: 'Die hochgeladene Datei ist kein echtes PDF. Bitte lade ein gültiges PDF hoch oder nutze nur den Drive-Link.',
-                );
+                $doc = $this->documentLoader->extractFromUploadedFile($file);
+                $documentText = (string)$doc->text;
+                $needsOcrHint = (bool)$doc->needsOcr;
+                $warnings = array_values(array_unique(array_merge($warnings, (array)$doc->warnings)));
+            } else {
+                // Drive-only
+                $doc = $this->documentLoader->extractFromDrive($driveId);
+                $normalizedName = $this->normalizeFilename((string)($doc->filename ?? 'Dokument'));
+                $warnings = array_values(array_unique(array_merge(
+                    $this->filenameWarnings($normalizedName),
+                    (array)$doc->warnings
+                )));
+                $documentText = (string)$doc->text;
+                $needsOcrHint = (bool)$doc->needsOcr;
             }
+        } catch (\Throwable $e) {
+            $this->supportSolutionLogger->warning('form.analyze.extract_failed', [
+                'trace_id' => $traceId,
+                'drive_id' => $driveId,
+                'has_file' => $hasFile,
+                'error' => $e->getMessage(),
+            ]);
 
-            $pdfText = $this->extractPdfTextWithPdftotext($path);
-
-            if (mb_strlen(trim($pdfText)) < 120) {
-                $isScannedHint = true;
-                $warnings[] = 'PDF wirkt gescannt (wenig Text extrahierbar). OCR kann später die Qualität verbessern.';
-            }
+            return $this->errorResponse(
+                traceId: $traceId,
+                code: 'extract_failed',
+                message: $this->isDev ? ('Extraktion fehlgeschlagen (DEV): '.$e->getMessage()) : 'Dokument konnte nicht verarbeitet werden.',
+            );
         }
 
         $filenameForPrompt = $normalizedName !== '' ? $normalizedName : 'Dokument';
@@ -110,9 +133,10 @@ final class FormCreateResolver
 
         $user = $this->promptLoader->render((string)($tpl['user'] ?? ''), [
             'filename' => $filenameForPrompt,
-            'driveUrl' => $driveUrl,          // leer ist ok
+            'driveUrl' => $driveUrl,
             'message'  => $message,
-            'pdfText'  => $this->truncateForPrompt(trim($pdfText), 12000),
+            'documentText' => $this->truncateForPrompt(trim($documentText), 12000),
+            'scan_hint' => $needsOcrHint,
         ]);
 
         $history = [
@@ -129,7 +153,7 @@ final class FormCreateResolver
                 'usage_key' => 'support_chat.form_create.analyze',
                 'mode_hint' => 'form_create',
                 'trace_id' => $traceId,
-                'scan_hint' => $isScannedHint,
+                'scan_hint' => $needsOcrHint,
             ]
         );
 
@@ -145,7 +169,7 @@ final class FormCreateResolver
 
         $title = trim((string)($obj['title'] ?? ''));
         if ($title === '') {
-            $title = $this->fallbackTitleFromFilename($normalizedName !== '' ? $normalizedName : 'Dokument');
+            $title = $this->fallbackTitleFromFilename($filenameForPrompt);
         }
 
         $category = trim((string)($obj['category'] ?? 'GENERAL'));
@@ -168,7 +192,7 @@ final class FormCreateResolver
             'context_notes' => (string)($obj['context_notes'] ?? ''),
             'keywords' => $keywords,
 
-            // Media: Drive wenn vorhanden, sonst Upload-only als "upload"
+            // Media: Drive wenn vorhanden, sonst Upload
             'media_type' => $driveUrl !== '' ? 'external' : 'upload',
             'external_media_provider' => $driveUrl !== '' ? 'gdrive' : null,
             'external_media_url' => $driveUrl !== '' ? $driveUrl : null,
@@ -179,20 +203,15 @@ final class FormCreateResolver
             'published_at' => null,
             'category' => $category,
 
-            'drive_url' => $driveUrl,
+            'drive_url' => mb_substr($driveUrl, 0, 120),
             'filename' => $normalizedName,
         ];
 
         $this->storeDraft($draftId, $draft);
 
-        // Subtitle korrekt je nach Quelle
-        if ($hasDrive && $hasFile) {
-            $headerSubtitle = $normalizedName !== '' ? "Quelle: Drive + Upload • {$normalizedName}" : "Quelle: Drive + Upload";
-        } elseif ($hasDrive) {
-            $headerSubtitle = $normalizedName !== '' ? "Quelle: Drive • {$normalizedName}" : "Quelle: Drive";
-        } else {
-            $headerSubtitle = $normalizedName !== '' ? "Quelle: Upload • {$normalizedName}" : "Quelle: Upload";
-        }
+        $headerSubtitle = $hasDrive
+            ? ($normalizedName !== '' ? "Quelle: Drive • {$normalizedName}" : "Quelle: Drive")
+            : ($normalizedName !== '' ? "Quelle: Upload • {$normalizedName}" : "Quelle: Upload");
 
         return $this->confirmResponse(
             traceId: $traceId,
@@ -213,6 +232,7 @@ final class FormCreateResolver
     }
 
 
+
     public function patch(
         string $sessionId,
         string $draftId,
@@ -230,7 +250,7 @@ final class FormCreateResolver
             return $this->errorResponse($traceId, 'draft_missing', 'Draft nicht gefunden/abgelaufen. Bitte Dokument erneut analysieren.');
         }
 
-        $tpl = $this->promptLoader->load('DocumentPatchPrompt.config');
+        $tpl = $this->promptLoader->load('FormPatchPrompt.config');
         $prompt = $this->promptLoader->render((string)$tpl['user'], [
             'draft' => json_encode($draft, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
             'message' => $message,
@@ -247,8 +267,8 @@ final class FormCreateResolver
             provider: $provider,
             model: $model,
             context: [
-                'usage_key' => 'support_chat.document_create.patch',
-                'mode_hint' => 'document_create_patch',
+                'usage_key' => 'support_chat.form_create.patch',
+                'mode_hint' => 'form_create_patch',
                 'trace_id' => $traceId,
             ]
         );
@@ -473,7 +493,7 @@ final class FormCreateResolver
         $lines = $s === '' ? [] : explode("\n", $s);
         $filtered = [];
         foreach ($lines as $line) {
-            if (stripos($line, 'drive.google.com') !== false) {
+            if (stripos($line, 'drive.google.com') !== false || stripos($line, 'docs.google.com') !== false) {
                 continue;
             }
             $filtered[] = $line;
@@ -544,14 +564,18 @@ final class FormCreateResolver
 
     private function draftCacheKey(string $draftId): string
     {
-        return 'support_chat.document_create.draft.' . sha1($draftId);
+        return 'support_chat.form_create.draft.' . sha1($draftId);
     }
+
 
     private function storeDraft(string $draftId, array $draft): void
     {
         $key = $this->draftCacheKey($draftId);
+
+        // optional: vorher löschen, damit alte Werte keine Rolle spielen
         $this->cache->delete($key);
-        $this->cache->get($key, function (ItemInterface $item) use ($draft) {
+
+        $this->cache->get($key, function (\Symfony\Contracts\Cache\ItemInterface $item) use ($draft) {
             $item->expiresAfter(3600);
             return $draft;
         });
@@ -560,9 +584,15 @@ final class FormCreateResolver
     private function loadDraft(string $draftId): ?array
     {
         $key = $this->draftCacheKey($draftId);
-        $val = $this->cache->get($key, static fn(ItemInterface $item) => null);
+
+        $val = $this->cache->get($key, static function (\Symfony\Contracts\Cache\ItemInterface $item) {
+            return null;
+        });
+
         return is_array($val) ? $val : null;
     }
+
+
 
     private function renderConfirmText(array $draft): string
     {
@@ -587,13 +617,75 @@ final class FormCreateResolver
 
     private function extractDriveId(string $url): string
     {
-        $url = trim($url);
-        if ($url === '') { return ''; }
-        if (preg_match('~drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
-        if (preg_match('~drive\.google\.com\/open\?id=([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
-        if (preg_match('~drive\.google\.com\/drive\/folders\/([a-zA-Z0-9_-]+)~', $url, $m)) { return (string)$m[1]; }
+        $raw = trim($url);
+        if ($raw === '') {
+            return '';
+        }
+
+        // 0) Falls UI nur eine reine ID liefert (oder mit Whitespace)
+        // Drive IDs sind typischerweise >= 10 Zeichen, erlaubte Charset: A-Z a-z 0-9 _ -
+        if (preg_match('/^[a-zA-Z0-9_-]{10,}$/', $raw)) {
+            return $raw;
+        }
+
+        // Normalisieren: manche UIs geben nur einen Pfad zurück wie "/<id>/edit?...".
+        // Wir versuchen zuerst parse_url, und falls das fehlschlägt, prefixen wir eine Dummy-Domain.
+        $u = $raw;
+        $parts = @parse_url($u);
+        if (!is_array($parts) || (!isset($parts['host']) && str_starts_with($u, '/'))) {
+            $u = 'https://dummy.local' . $u;
+            $parts = @parse_url($u);
+        }
+
+        // 1) Query: id=...
+        if (is_array($parts) && isset($parts['query'])) {
+            parse_str((string) $parts['query'], $q);
+            if (isset($q['id']) && is_string($q['id']) && $q['id'] !== '' && preg_match('/^[a-zA-Z0-9_-]{10,}$/', $q['id'])) {
+                return $q['id'];
+            }
+        }
+
+        $path = '';
+        if (is_array($parts) && isset($parts['path']) && is_string($parts['path'])) {
+            $path = $parts['path'];
+        } else {
+            $path = $raw;
+        }
+
+        // 2) Standard: /file/d/<id> /document/d/<id> /spreadsheets/d/<id> /presentation/d/<id>
+        if (preg_match('~/(?:file|document|spreadsheets|presentation)/d/([a-zA-Z0-9_-]{10,})~', $path, $m)) {
+            return (string) $m[1];
+        }
+
+        // 3) Folders: /drive/folders/<id>
+        if (preg_match('~/drive/folders/([a-zA-Z0-9_-]{10,})~', $path, $m)) {
+            return (string) $m[1];
+        }
+
+        // 4) Manche Links: /uc?export=download&id=<id> oder /uc?id=<id>
+        // (id=... hatten wir oben schon – aber falls parse_url kaputt war)
+        if (preg_match('~[?&]id=([a-zA-Z0-9_-]{10,})~', $raw, $m)) {
+            return (string) $m[1];
+        }
+
+        // 5) UI-Problemfall: "/<id>/edit" (ohne /d/)
+        if (preg_match('~^/([a-zA-Z0-9_-]{10,})/(?:edit|view|preview)(?:/|$)~', $path, $m)) {
+            return (string) $m[1];
+        }
+
+        // 6) Fallback: irgendein "/d/<id>" (kommt bei manchen Share-Varianten vor)
+        if (preg_match('~/d/([a-zA-Z0-9_-]{10,})~', $raw, $m)) {
+            return (string) $m[1];
+        }
+
         return '';
     }
+
+
+
+
+
+
 
     private function nowMidnight(): \DateTimeImmutable
     {

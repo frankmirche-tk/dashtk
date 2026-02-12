@@ -123,10 +123,18 @@ services:
         arguments:
             $configPath: '%kernel.project_dir%/Service/Prompts/TKFashionPolicyKeywords.config'
 
+    App\Service\Document\PdfExtractor:
+        tags: [ 'app.document_extractor' ]
+
+    App\Service\Document\DocxExtractor:
+        tags: [ 'app.document_extractor' ]
+
+    App\Service\Document\XlsxExtractor:
+        tags: [ 'app.document_extractor' ]
+
     App\Service\DocumentLoader:
         arguments:
-            $tmpDir: '%app.tmp_dir%'
-
+            $extractors: !tagged_iterator app.document_extractor
 
 
 
