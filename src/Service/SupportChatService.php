@@ -230,14 +230,14 @@ final class SupportChatService
         string  $sessionId,
         string  $message,
         ?int    $dbOnlySolutionId = null,
-        string  $provider = 'gemini',
+        string  $provider = 'auto',
         ?string $model = null,
         array   $context = [],
         ?Trace  $trace = null
     ): array {
-        $sessionId = trim($sessionId);
+        $sessionId  = trim($sessionId);
         $rawMessage = trim($message);
-        $provider = strtolower(trim($provider));
+        $provider   = strtolower(trim($provider));
 
         $this->span($trace, 'usage.increment', function () {
             $this->usageTracker->increment(self::USAGE_KEY_ASK);
@@ -251,19 +251,33 @@ final class SupportChatService
         // 0) Numeric selection
         $selection = $this->span($trace, 'choice.try_resolve', fn() => $this->resolveNumericSelection($sessionId, $rawMessage));
         if (is_array($selection)) {
+            $this->setSessionMode($sessionId, (string)($selection['modeHint'] ?? 'choice'));
             return $selection;
         }
 
         // A) DB-only
         if ($dbOnlySolutionId !== null) {
-            return $this->span($trace, 'db_only.answer', fn() => $this->answerDbOnly($sessionId, $dbOnlySolutionId), [
+            $out = $this->span($trace, 'db_only.answer', fn() => $this->answerDbOnly($sessionId, $dbOnlySolutionId), [
                 'solution_id' => $dbOnlySolutionId,
             ]);
+            $this->setSessionMode($sessionId, (string)($out['modeHint'] ?? 'db_only'));
+            return $out;
         }
 
         // Blacklist immer vor Routing/Matching
         $cleanMessage = $this->applyKeywordBlacklist($rawMessage);
         $mLower = mb_strtolower($cleanMessage);
+
+        // Sticky KI-Mode: kurze Folgefragen sollen im KI-Modus bleiben,
+        // außer es wird explizit Newsletter oder Formular angefragt.
+        $prevMode = $this->getSessionMode($sessionId);
+        $isExplicitNewsletter = (bool)preg_match('/\bnewsletter\b/u', $mLower);
+        $isFormIntent = (bool)preg_match('/\b(form|formular|dokument|antrag|vertrag)(e|en|er)?\b/u', $mLower);
+
+        $isShortFollowUp = mb_strlen($cleanMessage) <= 40
+            || (bool)preg_match('/^\s*(bitte|ok|okay|ja|nein|genau|weiter|mehr|p(unkt)?\s*\d+|den\s+p(unkt)?\s*\d+)\b/u', $mLower);
+
+        $stickyAiOnly = ($prevMode === 'ai_only') && $isShortFollowUp && !$isExplicitNewsletter && !$isFormIntent;
 
         // 1.1 / 1.2 Kontakt + Filiale – Early Exit
         $contactResult = $this->span($trace, 'contact.resolve', function () use ($cleanMessage, $trace) {
@@ -274,6 +288,9 @@ final class SupportChatService
             'source' => 'var/data/kontakt_*.json',
         ]);
 
+        // ----------------------------
+        // 1) Kontakte und Filialinfo
+        // ----------------------------
         if (is_array($contactResult) && !empty($contactResult['matches'])) {
             $choices = [];
             $lines = [];
@@ -302,16 +319,18 @@ final class SupportChatService
                 $this->storeChoices($sessionId, $choices);
             }
 
-            return [
+            $out = [
                 'answer' => implode("\n", $lines),
                 'matches' => [],
                 'choices' => $choices,
                 'modeHint' => 'contact_local',
                 'contact' => $contactResult,
             ];
+            $this->setSessionMode($sessionId, 'contact_local');
+            return $out;
         }
 
-        // 1) Tipps/Hilfe
+        // 2) Tipps/Hilfe
         $isHelp =
             in_array(mb_strtolower($rawMessage), ['tipps', 'hilfe', 'help'], true)
             || str_contains($mLower, 'wie nutze ich den chatbot')
@@ -327,35 +346,93 @@ final class SupportChatService
                 "4) Newsletter/Formulare: mit „Newsletter …“ oder „Formular …“ arbeiten\n\n" .
                 "Tipp: Du kannst sehr kurz schreiben – oft reicht ein Stichwort.";
 
-            return [
+            $out = [
                 'answer' => $answer,
                 'matches' => [],
                 'choices' => [],
                 'modeHint' => 'help',
             ];
+            $this->setSessionMode($sessionId, 'help');
+            return $out;
         }
 
-        // 2) Newsletter Intent? => komplett im NewsletterResolver (Intent + Zeitraum + Keyword + Listing)
+        // 3) Newsletter Intent? (deterministisch) + FIX: choices für Cards erzwingen
+        // ----------------------------
         $newsletterPayload = $this->newsletterResolver->resolve($rawMessage);
+
         if (is_array($newsletterPayload)) {
+            // ✅ FIX: Einige Resolver liefern nur "matches" (oder "newsletters"), aber keine "choices".
+            // ChatMessages.vue rendert die Treffer-Cards über "choices" – daher hier hart normalisieren.
+            $choices = [];
+
             if (!empty($newsletterPayload['choices']) && is_array($newsletterPayload['choices'])) {
-                $this->storeChoices($sessionId, $newsletterPayload['choices']);
+                $choices = $newsletterPayload['choices'];
+            } else {
+                // 1) Falls Resolver "matches" liefert: daraus "choices" bauen
+                $m = $newsletterPayload['matches'] ?? [];
+                if (is_array($m) && $m !== []) {
+                    foreach ($m as $hit) {
+                        if (!is_array($hit)) continue;
+                        $label = (string)($hit['title'] ?? $hit['label'] ?? '');
+                        if ($label === '') continue;
+                        $choices[] = [
+                            'kind' => 'newsletter',
+                            'label' => $label,
+                            'payload' => $hit,
+                        ];
+                    }
+                }
+
+                // 2) Optional: Falls Resolver "newsletters" liefert
+                $nl = $newsletterPayload['newsletters'] ?? [];
+                if ($choices === [] && is_array($nl) && $nl !== []) {
+                    foreach ($nl as $hit) {
+                        if (!is_array($hit)) continue;
+                        $label = (string)($hit['title'] ?? $hit['label'] ?? '');
+                        if ($label === '') continue;
+                        $choices[] = [
+                            'kind' => 'newsletter',
+                            'label' => $label,
+                            'payload' => $hit,
+                        ];
+                    }
+                }
             }
+
+            if ($choices !== []) {
+                $newsletterPayload['choices'] = $choices;
+                $this->storeChoices($sessionId, $choices);
+            } else {
+                // trotzdem konsistent halten
+                $newsletterPayload['choices'] ??= [];
+            }
+
+            // Logging (damit du im support_solution log sofort siehst, dass Newsletter-Mode aktiv war)
+            $this->supportSolutionLogger->info('chat_mode', [
+                'sessionId' => $sessionId,
+                'mode' => (string)($newsletterPayload['modeHint'] ?? 'newsletter'),
+                'message' => mb_substr($rawMessage, 0, 160),
+                'choiceCount' => is_array($newsletterPayload['choices'] ?? null) ? count($newsletterPayload['choices']) : 0,
+            ]);
+
             return $newsletterPayload;
         }
 
-        // 3) Form Intent?
-        $formIntent = (bool)preg_match('/\b(form|formular|dokument|antrag|vertrag)(e|en|er)?\b/u', $mLower);
-        if ($formIntent) {
+        // ----------------------------
+        // 4) Form Intent?
+        // ----------------------------
+        if ($isFormIntent) {
             $tokens = $this->extractKeywordTokens($cleanMessage, ['form', 'formular', 'dokument', 'antrag', 'vertrag']);
 
             if ($tokens === []) {
-                return [
+                $out = [
                     'answer' => "Für Formulare brauche ich mindestens **1 Keyword** (z.B. „Reisekosten“, „Urlaub“).",
                     'matches' => [],
                     'choices' => [],
                     'modeHint' => 'form_need_keyword',
                 ];
+                $this->setSessionMode($sessionId, 'form_need_keyword');
+                return $out;
             }
 
             $qb = $this->solutions->createQueryBuilder('s')
@@ -380,12 +457,14 @@ final class SupportChatService
             }
 
             if ($matches === []) {
-                return [
+                $out = [
                     'answer' => "Ich habe **kein Formular/Dokument** gefunden, das zu **" . implode(', ', $tokens) . "** passt.",
                     'matches' => [],
                     'choices' => [],
                     'modeHint' => 'form_empty',
                 ];
+                $this->setSessionMode($sessionId, 'form_empty');
+                return $out;
             }
 
             $choices = [];
@@ -404,15 +483,105 @@ final class SupportChatService
 
             $this->storeChoices($sessionId, $choices);
 
-            return [
+            $out = [
                 'answer' => implode("\n", $lines),
                 'matches' => $matches,
                 'choices' => $choices,
                 'modeHint' => 'form_only',
             ];
+            $this->setSessionMode($sessionId, 'form_only');
+            return $out;
         }
 
-        // 4) ELSE: Klassisch KI (hier KEINE Datumslogik für Newsletter!)
+        // ----------------------------
+        // 5) AI ONLY Intent (oder sticky KI-Mode) => nur KI, aber MIT History
+        // ----------------------------
+        if ($stickyAiOnly || $this->isAiOnlyIntent($rawMessage)) {
+            $this->supportSolutionLogger->info('chat_mode', [
+                'sessionId' => $sessionId,
+                'mode' => 'ai_only',
+                'sticky' => $stickyAiOnly,
+                'message' => mb_substr($rawMessage, 0, 160),
+            ]);
+
+            // History laden + System Prompt sicherstellen + User anhängen
+            $history = $this->span($trace, 'cache.history_load', fn() => $this->loadHistory($sessionId), [
+                'session_hash' => sha1($sessionId),
+            ]);
+
+            $history = $this->span($trace, 'history.ensure_system_prompt', function () use ($history) {
+                $tpl = $this->promptLoader->load('KiChatBotPrompt.config');
+                $today = (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d');
+                $expectedSystem = $this->promptLoader->render($tpl['system'], ['today' => $today]);
+
+                $systemIndex = null;
+                foreach ($history as $i => $msg) {
+                    if (($msg['role'] ?? null) === 'system') { $systemIndex = $i; break; }
+                }
+                if ($systemIndex === null) {
+                    array_unshift($history, ['role' => 'system', 'content' => $expectedSystem]);
+                    return $history;
+                }
+
+                $history[$systemIndex]['content'] = $expectedSystem;
+                if ($systemIndex !== 0) {
+                    $sys = $history[$systemIndex];
+                    unset($history[$systemIndex]);
+                    array_unshift($history, $sys);
+                    $history = array_values($history);
+                }
+                return $history;
+            });
+
+            $history[] = ['role' => 'user', 'content' => $rawMessage];
+
+            $trimmedHistory = $this->span($trace, 'history.trim', fn() => $this->trimHistory($history), [
+                'history_count_in' => count($history),
+                'max' => self::MAX_HISTORY_MESSAGES,
+            ]);
+
+            $aiContext = array_merge($context, [
+                'usage_key' => 'support_chat.ai_only',
+                'mode_hint' => 'ai_only',
+                'ai_only' => true,
+            ]);
+
+            $answer = $this->span($trace, 'ai.call', function () use ($trimmedHistory, $provider, $model, $aiContext) {
+                return $this->aiChat->chat(
+                    history: $trimmedHistory,
+                    kbContext: '', // << KI-only: KEIN DB Kontext
+                    provider: $provider === 'auto' ? null : $provider,
+                    model: $model,
+                    context: $aiContext
+                );
+            });
+
+            $history[] = ['role' => 'assistant', 'content' => $answer];
+            $this->span($trace, 'cache.history_save', function () use ($sessionId, $history) {
+                $this->saveHistory($sessionId, $history);
+                return null;
+            });
+
+            $out = [
+                'answer' => $answer,
+                'matches' => [],
+                'choices' => [],
+                'modeHint' => 'ai_only',
+                'provider' => $provider,
+                'model' => $model,
+                '_meta' => [
+                    'ai_used' => true,
+                    'kb_used' => false,
+                    'sticky' => $stickyAiOnly,
+                ],
+            ];
+            $this->setSessionMode($sessionId, 'ai_only');
+            return $out;
+        }
+
+        // ----------------------------
+        // 6) ELSE: Klassisch KI (SOP/KB + KI)
+        // ----------------------------
         $tokens = $this->extractKeywordTokens($cleanMessage, []);
         $hasKeyword = false;
 
@@ -494,7 +663,7 @@ final class SupportChatService
             return $this->aiChat->chat(
                 history: $trimmedHistory,
                 kbContext: $kbContext,
-                provider: $provider,
+                provider: $provider === 'auto' ? null : $provider,
                 model: $model,
                 context: $context
             );
@@ -506,7 +675,7 @@ final class SupportChatService
             return null;
         });
 
-        return [
+        $out = [
             'answer' => $answer,
             'matches' => $sops,
             'modeHint' => $hasKeyword ? 'ai_with_db' : 'ai_only',
@@ -518,7 +687,11 @@ final class SupportChatService
                 'kb_used' => $hasKeyword,
             ],
         ];
+        $this->setSessionMode($sessionId, (string)$out['modeHint']);
+        return $out;
     }
+
+
 
 
     // ---------------------------------------------------------------------
@@ -700,6 +873,7 @@ final class SupportChatService
         // 1) Primär: Scoring-Matcher
         $raw = $this->solutions->findBestMatches($message, 8);
 
+        $mode = 'scoring';
         $mapped = [];
         foreach ($raw as $m) {
             $s = $m['solution'] ?? null;
@@ -711,6 +885,7 @@ final class SupportChatService
 
         // 2) Fallback: direkter Keyword-LIKE Match (damit Keywords garantiert greifen)
         if ($mapped === []) {
+            $mode = 'fallback_like';
             $needle = mb_strtolower($message);
 
             $parts = preg_split('/[^\p{L}\p{N}]+/u', $needle) ?: [];
@@ -747,7 +922,7 @@ final class SupportChatService
 
             $mapped = $this->dedupeMatchesById($mapped);
 
-            $this->supportSolutionLogger->debug('db_matches_fallback_like', [
+            $this->supportSolutionLogger->info('db_matches_fallback_like', [
                 'message' => $message,
                 'fallbackToken' => $q,
                 'matchCount' => count($mapped),
@@ -759,7 +934,9 @@ final class SupportChatService
             'message' => $message,
             'matchCount' => count($mapped),
             'matchIds' => array_map(static fn($x) => $x['id'] ?? null, $mapped),
+            'mode' => $mapped !== [] ? 'scoring' : 'none', // optional, siehe unten
         ]);
+
 
         return $mapped;
     }
@@ -1508,6 +1685,25 @@ final class SupportChatService
         /** @var list<ChatMessage> $trimmedHistory */
         $trimmedHistory = $this->trimHistory($history);
 
+        if ($this->isDev) {
+            $systemCount = 0;
+            $firstRole = $trimmedHistory[0]['role'] ?? null;
+
+            foreach ($trimmedHistory as $msg) {
+                if (($msg['role'] ?? null) === 'system') {
+                    $systemCount++;
+                }
+            }
+
+            $this->supportSolutionLogger->debug('prompt_debug', [
+                'firstRole' => $firstRole,
+                'systemCount' => $systemCount,
+                'firstSystemPreview' => ($firstRole === 'system')
+                    ? mb_substr((string)($trimmedHistory[0]['content'] ?? ''), 0, 180)
+                    : null,
+            ]);
+        }
+
         // Match IDs als list<int> (sauber für JSON/Logs/CLI)
         $matchIds = [];
         foreach ($matches as $m) {
@@ -1579,13 +1775,45 @@ final class SupportChatService
         // 4) Execute
         $modelForGateway = ($provider === 'auto') ? null : ($preview['model'] ?? null);
 
-        $answer = $this->aiChat->chat(
-            history: $history,
-            kbContext: $kbContext,
-            provider: $providerForGateway,
-            model: $modelForGateway,
-            context: $context,
-        );
+        $this->supportSolutionLogger->info('chat_request', [
+            'sessionId' => $sessionId,
+            'message' => $message,
+            'matchCount' => (int)($preview['matchCount'] ?? 0),
+            'matchIds' => $preview['matchIds'] ?? [],
+            'kbContextChars' => strlen($kbContext),
+            'provider' => $provider,
+            'model' => $modelForGateway,
+            'usageKey' => $context['usage_key'] ?? self::USAGE_KEY_ASK,
+        ]);
+
+
+        try {
+            $answer = $this->aiChat->chat(
+                history: $history,
+                kbContext: $kbContext,
+                provider: $providerForGateway,
+                model: $modelForGateway,
+                context: $context,
+            );
+
+            $this->supportSolutionLogger->info('chat_response', [
+                'sessionId' => $sessionId,
+                'answerChars' => is_string($answer) ? mb_strlen($answer) : 0,
+                'provider' => $provider,
+                'model' => $modelForGateway,
+            ]);
+        } catch (\Throwable $e) {
+            $this->supportSolutionLogger->error('chat_execute_failed', [
+                'sessionId' => $sessionId,
+                'message' => $message,
+                'error' => $e->getMessage(),
+                'class' => $e::class,
+                'provider' => $provider,
+                'model' => $modelForGateway,
+            ]);
+            throw $e;
+        }
+
 
         // 5) Response
         $preview['provider_used'] = $providerForGateway ?? 'auto';
@@ -1703,5 +1931,83 @@ final class SupportChatService
         $out = array_values(array_unique($out));
         return $out;
     }
+
+    private function isAiOnlyIntent(string $message): bool
+    {
+        $m = mb_strtolower(trim($message));
+        if ($m === '') {
+            return false;
+        }
+
+        // harte Ausschlüsse: diese Modi dürfen NIE KI-Only werden
+        if (preg_match('/\b(newsletter|newsletterliste|newsletter\s+seit)\b/u', $m)) {
+            return false;
+        }
+
+        if (preg_match('/\b(form|formular|antrag|anträge|vertrag|verträge|dokument|dokumente)\b/u', $m)) {
+            return false;
+        }
+
+        if (preg_match('/\b(filiale|filialen|adresse|telefon|öffnungszeiten|kontakt)\b/u', $m)) {
+            return false;
+        }
+
+        // klare KI-Verben (Auftragsformulierung)
+        $hasVerb = (bool) preg_match(
+            '/\b(schreibe|erstelle|formuliere|generiere|mach|plane|entwirf|überarbeite|optimiere|korrigiere|verbessere)\b/u',
+            $m
+        );
+
+        if (!$hasVerb) {
+            return false;
+        }
+
+        // Wunschmarker / personalisierte Anfrage
+        $hasRequestMarker = (bool) preg_match(
+            '/\b(mir|für\s+mich|bitte|kannst\s+du|könntest\s+du|hilf\s+mir)\b/u',
+            $m
+        );
+
+        // Output-Ziel (ohne "kampagne" als trigger, weil das ein echtes Keyword sein kann)
+        $hasOutputTarget = (bool) preg_match(
+            '/\b(text|post|caption|beschreibung|ideen|konzept|slogan|whatsapp|instagram|facebook|tiktok|anzeige|flyer)\b/u',
+            $m
+        );
+
+        return $hasRequestMarker || $hasOutputTarget;
+    }
+
+    private function getSessionMode(string $sessionId): string
+    {
+        $key = 'support_chat.session_mode.' . sha1($sessionId);
+
+        $val = $this->cache->get($key, static function (\Symfony\Contracts\Cache\ItemInterface $item) {
+            $item->expiresAfter(3600);
+            return 'default';
+        });
+
+        return is_string($val) && $val !== '' ? $val : 'default';
+    }
+
+    private function setSessionMode(string $sessionId, string $mode): void
+    {
+        $mode = trim($mode);
+        if ($mode === '') {
+            $mode = 'default';
+        }
+
+        $key = 'support_chat.session_mode.' . sha1($sessionId);
+
+        // überschreiben (Cache->get ist write-once pro Item, deshalb delete+get)
+        $this->cache->delete($key);
+
+        $this->cache->get($key, function (\Symfony\Contracts\Cache\ItemInterface $item) use ($mode) {
+            $item->expiresAfter(3600);
+            return $mode;
+        });
+    }
+
+
+
 
 }

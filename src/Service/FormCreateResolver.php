@@ -200,7 +200,7 @@ final class FormCreateResolver
 
             'created_at' => $now->format('Y-m-d H:i:s'),
             'updated_at' => $now->format('Y-m-d H:i:s'),
-            'published_at' => null,
+            'published_at' => $now->format('Y-m-d H:i:s'),
             'category' => $category,
 
             'drive_url' => mb_substr($driveUrl, 0, 120),
@@ -378,7 +378,7 @@ final class FormCreateResolver
                 'external_media_id' => $draft['external_media_id'],
                 'created_at' => $draft['created_at'],
                 'updated_at' => $draft['updated_at'],
-                'published_at' => null,
+                'published_at' => $draft['created_at'],
                 'category' => $category,
             ]);
 
