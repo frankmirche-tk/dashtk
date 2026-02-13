@@ -330,30 +330,46 @@ final class SupportChatService
             return $out;
         }
 
-        // 2) Tipps/Hilfe
+        // ----------------------------
+        // 2) Tipps/Hilfe (NUR hier – Text kommt aus Prompt-Datei)
+        // ----------------------------
+
+        $rawLower = mb_strtolower(trim($rawMessage));
+
+        $isHelpMini = str_starts_with($rawLower, 'tipps mini')
+            || str_starts_with($rawLower, 'hilfe mini')
+            || str_starts_with($rawLower, 'help mini');
+
         $isHelp =
-            in_array(mb_strtolower($rawMessage), ['tipps', 'hilfe', 'help'], true)
+            in_array($rawLower, ['tipps', 'hilfe', 'help'], true)
             || str_contains($mLower, 'wie nutze ich den chatbot')
             || str_contains($mLower, 'was kann der bot')
             || str_contains($mLower, 'wie funktioniert das');
 
-        if ($isHelp) {
-            $answer =
-                "💡 So nutzt du diesen ChatBot effektiv\n\n" .
-                "1) Filialinfos: Filialkürzel eingeben (z.B. COSU)\n" .
-                "2) Kontakte: Vor- oder Nachname eingeben (z.B. Alina)\n" .
-                "3) SOPs: kurzes Stichwort (z.B. Warteschlange)\n" .
-                "4) Newsletter/Formulare: mit „Newsletter …“ oder „Formular …“ arbeiten\n\n" .
-                "Tipp: Du kannst sehr kurz schreiben – oft reicht ein Stichwort.";
+        if ($isHelpMini) {
+            return [
+                'answer' => $this->buildHelpMini(),
+                'matches' => [],
+                'choices' => [],
+                'modeHint' => 'help_mini',
+            ];
+        }
 
-            $out = [
+        if ($this->isHelpIntent($rawMessage, $mLower)) {
+            $answer = $this->renderHelpAnswer();
+
+            $this->supportSolutionLogger->info('chat_mode', [
+                'sessionId' => $sessionId,
+                'mode' => 'help',
+                'message' => mb_substr($rawMessage, 0, 160),
+            ]);
+
+            return [
                 'answer' => $answer,
                 'matches' => [],
                 'choices' => [],
                 'modeHint' => 'help',
             ];
-            $this->setSessionMode($sessionId, 'help');
-            return $out;
         }
 
         // 3) Newsletter Intent? (deterministisch) + FIX: choices für Cards erzwingen
@@ -2007,6 +2023,98 @@ final class SupportChatService
         });
     }
 
+    private function isHelpIntent(string $rawMessage, string $mLower): bool
+    {
+        $msg = trim($rawMessage);
+        if ($msg === '') {
+            return false;
+        }
+
+        // exakt
+        if (in_array(mb_strtolower($msg), ['tipps', 'hilfe', 'help'], true)) {
+            return true;
+        }
+
+        // explizite Fragen
+        if (str_contains($mLower, 'wie nutze ich den chatbot')) return true;
+        if (str_contains($mLower, 'was kann der bot')) return true;
+        if (str_contains($mLower, 'wie funktioniert das')) return true;
+        if (str_contains($mLower, 'wie funktioniert das hier')) return true;
+
+        return false;
+    }
+
+    private function renderHelpAnswer(): string
+    {
+        // Der Help-Text soll NICHT doppelt im Code gepflegt werden.
+        // Quelle: src/Service/Prompts/HelpAnswer.config (USER Block)
+        try {
+            $tpl = $this->promptLoader->load('HelpAnswer.config');
+            $text = (string)($tpl['user'] ?? '');
+            $text = $this->promptLoader->render($text, [
+                'today' => (new \DateTimeImmutable('now', new \DateTimeZone('Europe/Berlin')))->format('Y-m-d'),
+            ]);
+            $text = $this->normalizeHelpText($text);
+
+            if ($text !== '') {
+                return $text;
+            }
+        } catch (\Throwable $e) {
+            // fallback unten
+            $this->supportSolutionLogger->warning('help_prompt_missing', [
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        // Fallback (sollte im Alltag nie greifen)
+        return $this->normalizeHelpText(
+            "💡 So nutzt du diesen ChatBot effektiv\n\n" .
+            "1) Filialinformationen abrufen\n" .
+            "- Eingabe: nur das Filialkürzel\n" .
+            "- Beispiel: LASU, COLA\n" .
+            "- Ergebnis: Adresse, Kontaktdaten, EC-TerminalID\n\n" .
+            "2) Kontakte & Ansprechpartner finden\n" .
+            "- Eingabe: Vor- oder Nachname ODER Begriffe wie „Admin“, „Kontakt“, „Ansprechpartner“\n" .
+            "- Beispiel: Frank, Mirche, Admin\n" .
+            "- Ergebnis: passende Kontaktinformationen\n\n" .
+            "3) Hilfe bei technischen Problemen\n" .
+            "- Eingabe: kurze Beschreibung des Problems\n" .
+            "- Beispiel: „Kartenleser defekt“, „Bondrucker druckt nicht“, „E-Mail geht nicht“\n" .
+            "- Ergebnis: gezielte Rückfragen, Lösungsvorschläge oder Weiterleitung an Hotline/Support\n\n" .
+            "4) Schnelle Erklärung von Begriffen\n" .
+            "- Eingabe: Begriff oder Systemname\n" .
+            "- Beispiel: Advarics, Backend Advarics WebApp, WireGuard\n" .
+            "- Ergebnis: kurze, verständliche Erklärung\n\n" .
+            "Tipp: Du kannst sehr kurz schreiben – oft reicht ein Stichwort."
+        );
+    }
+
+
+    private function normalizeHelpText(string $text): string
+    {
+        $t = trim($text);
+        if ($t === '') return '';
+
+        $t = preg_replace('/\r\n?/', "\n", $t) ?? $t;
+        $t = preg_replace("/\n{3,}/", "\n\n", $t) ?? $t;
+
+        return trim($t);
+    }
+
+    private function buildHelpMini(): string
+    {
+        return
+            "💡 **Mini-Guide – ChatBot Nutzung**\n\n" .
+
+            "🏬 **Filiale:** Filialkürzel eingeben (z.B. COSU)\n" .
+            "👤 **Kontakt:** Name oder Vorname (z.B. Frank, Advarics)\n" .
+            "📰 **Newsletter:** „Newsletter Osterkampagne“ (+ optional Zeitraum)\n" .
+            "📄 **Formulare:** „Formular Urlaub“ / „Dokument Reisekosten“\n" .
+            "📚 **SOPs:** Stichwort eingeben (z.B. Bondrucker, Etikettendruck)\n" .
+            "🤖 **KI-Modus:** „Bitte erstelle mir …“ / „Schreibe mir …“\n\n" .
+
+            "✅ Tipp: Kurz schreiben reicht meistens.";
+    }
 
 
 
